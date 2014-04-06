@@ -101,6 +101,7 @@ lpc_spi_attach(device_t dev)
 {
 	struct lpc_spi_softc *sc = device_get_softc(dev);
 	int rid;
+	bus_space_handle_t bsh;
 
 	sc->ls_dev = dev;
 
@@ -123,7 +124,9 @@ lpc_spi_attach(device_t dev)
 		return (ENXIO);
 	}
 
-	bus_space_write_4(sc->ls_bst, 0xd0028100, 0, (1<<12)|(1<<10)|(1<<9)|(1<<8)|(1<<6)|(1<<5)); 
+	bus_space_map(sc->ls_bst, LPC_DEV_PHYS_BASE + 0x28100, 0x4, 0, &bsh);
+	bus_space_write_4(sc->ls_bst, bsh, 0, (1<<12)|(1<<10)|(1<<9)|(1<<8)|(1<<6)|(1<<5)); 
+	bus_space_unmap(sc->ls_bst, bsh, 0x4);
 	lpc_pwr_write(dev, LPC_CLKPWR_SSP_CTRL, LPC_CLKPWR_SSP_CTRL_SSP0EN);
 	lpc_spi_write_4(sc, LPC_SSP_CR0, LPC_SSP_CR0_DSS(8));
 	lpc_spi_write_4(sc, LPC_SSP_CR1, LPC_SSP_CR1_SSE);
