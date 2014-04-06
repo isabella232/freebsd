@@ -49,11 +49,11 @@ options 	BREAK_TO_DEBUGGER
 
 options 	NFSCL
 options 	NFS_ROOT		# NFS usable as /, requires NFSCLIENT
-#options 	BOOTP_NFSROOT
-#options 	BOOTP_COMPAT
-#options 	BOOTP
-#options 	BOOTP_NFSV3
-#options 	BOOTP_WIRED_TO=ue0
+options 	BOOTP_NFSROOT
+options 	BOOTP_COMPAT
+options 	BOOTP
+options 	BOOTP_NFSV3
+options 	BOOTP_WIRED_TO=ue0
 options 	GEOM_PART_BSD		# BSD partition scheme
 options 	GEOM_PART_MBR		# MBR partition scheme
 options 	TMPFS			# Efficient memory filesystem
@@ -70,6 +70,8 @@ options 	SYSVSEM			# SYSV-style semaphores
 options 	_KPOSIX_PRIORITY_SCHEDULING # Posix P1003_1B real-time extensions
 options 	KBD_INSTALL_CDEV	# install a CDEV entry in /dev
 options 	FREEBSD_BOOT_LOADER
+options		ARM_INTRNG
+options		SMP
 
 options 	PREEMPTION
 
