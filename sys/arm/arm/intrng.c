@@ -113,6 +113,14 @@ arm_dispatch_irq(device_t dev, struct trapframe *tf, int irq)
 
 	debugf("pic %s, tf %p, irq %d\n", device_get_nameunit(dev), tf, irq);
 
+	/*
+	 * If we got null trapframe argument, that probably means
+	 * a call from non-root interrupt controller. In that case,
+	 * we'll just use the saved one.
+	 */
+	if (tf == NULL)
+		tf = PCPU_GET(curthread)->td_intr_frame;
+
 	for (i = 0; arm_intrs[i].ih_dev != NULL; i++) {
 		if (arm_intrs[i].ih_pic->ic_dev == dev &&
 		    arm_intrs[i].ih_irq == irq) {
@@ -188,7 +196,18 @@ arm_describe_irq(int irq)
 	static char buffer[32];
 
 	pic = &arm_pics[IRQ_PIC_IDX(irq)];
-	sprintf(buffer, "%s:%d", device_get_nameunit(pic->ic_dev),
+
+	if (pic->ic_dev == NULL)
+		/*
+		 * Interrupt controller not attached yet, so we'll use it's
+		 * FDT "name" property instead
+		 */
+		snprintf(buffer, "%s.%d", ofw_bus_get_name(pic->ic_node),
+		    IRQ_VECTOR_IDX(irq));
+		return (buffer);
+	}
+
+	sprintf(buffer, "%s.%d", device_get_nameunit(pic->ic_dev),
 	    IRQ_VECTOR_IDX(irq));
 
 	return (buffer);

@@ -1422,12 +1422,7 @@ intr_event_handle(struct intr_event *ie, struct trapframe *frame)
 	ret = 0;
 	critical_enter();
 	oldframe = td->td_intr_frame;
-	
-	if (frame)
-		td->td_intr_frame = frame;
-	else
-		frame = td->td_intr_frame;
-	
+	td->td_intr_frame = frame;
 	TAILQ_FOREACH(ih, &ie->ie_handlers, ih_next) {
 		if (ih->ih_filter == NULL) {
 			thread = 1;
