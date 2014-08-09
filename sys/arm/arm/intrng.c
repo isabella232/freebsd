@@ -194,16 +194,17 @@ arm_describe_irq(int irq)
 {
 	struct arm_intr_controller *pic;
 	static char buffer[32];
+	static char name[32];
 
 	pic = &arm_pics[IRQ_PIC_IDX(irq)];
 
-	if (pic->ic_dev == NULL)
+	if (pic->ic_dev == NULL) {
 		/*
 		 * Interrupt controller not attached yet, so we'll use it's
 		 * FDT "name" property instead
 		 */
-		snprintf(buffer, "%s.%d", ofw_bus_get_name(pic->ic_node),
-		    IRQ_VECTOR_IDX(irq));
+		OF_getprop(pic->ic_node, "name", name, sizeof(name));
+		sprintf(buffer, "%s.%d", name, IRQ_VECTOR_IDX(irq));
 		return (buffer);
 	}
 
