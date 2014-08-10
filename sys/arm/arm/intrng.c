@@ -52,6 +52,8 @@ __FBSDID("$FreeBSD$");
 
 #include "pic_if.h"
 
+#define	INTRNAME_LEN	(MAXCOMLEN + 1)
+
 #define	IRQ_PIC_IDX(_irq)	((_irq >> 8) & 0xff)
 #define	IRQ_VECTOR_IDX(_irq)	((_irq) & 0xff)
 #define	IRQ_GEN(_pic, _irq)	(((_pic) << 8) | ((_irq) & 0xff))
@@ -91,7 +93,6 @@ static int intrcnt_index = 0;
 static int last_printed = 0;
 
 /* Data for statistics reporting. */
-#define	INTRNAME_LEN	(MAXCOMLEN + 1)
 u_long intrcnt[NIRQ];
 char intrnames[NIRQ * INTRNAME_LEN];
 size_t sintrcnt = sizeof(intrcnt);
@@ -193,8 +194,8 @@ const char *
 arm_describe_irq(int irq)
 {
 	struct arm_intr_controller *pic;
-	static char buffer[32];
-	static char name[32];
+	static char buffer[INTRNAME_LEN];
+	static char name[INTRNAME_LEN];
 
 	pic = &arm_pics[IRQ_PIC_IDX(irq)];
 
@@ -204,12 +205,13 @@ arm_describe_irq(int irq)
 		 * FDT "name" property instead
 		 */
 		OF_getprop(pic->ic_node, "name", name, sizeof(name));
-		sprintf(buffer, "%s.%d", name, IRQ_VECTOR_IDX(irq));
+		snprintf(buffer, sizeof(buffer), "%s.%d", name,
+		    IRQ_VECTOR_IDX(irq));
 		return (buffer);
 	}
 
-	sprintf(buffer, "%s.%d", device_get_nameunit(pic->ic_dev),
-	    IRQ_VECTOR_IDX(irq));
+	snprintf(buffer, sizeof(buffer), "%s.%d",
+	    device_get_nameunit(pic->ic_dev), IRQ_VECTOR_IDX(irq));
 
 	return (buffer);
 }
@@ -302,7 +304,7 @@ arm_setup_irqhandler(device_t dev, driver_filter_t *filt,
 
 		last_printed += 
 		    snprintf(intrnames + last_printed,
-		    MAXCOMLEN + 1, "%s:%d: %s",
+		    INTRNAME_LEN, "%s:%d: %s",
 		    device_get_nameunit(pic->ic_dev),
 		    ih->ih_irq, name);
 		
