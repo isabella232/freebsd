@@ -130,20 +130,24 @@ bcm_intc_attach(device_t dev)
 	    RF_ACTIVE);
 	if (sc->intc_irq_res == NULL) {
 		device_printf(dev, "could not alloc interrupt resource\n");
-		return (ENXIO); 
+		bus_release_resource(dev, SYS_RES_MEMORY, 0, sc->intc_mem_res);
+		return (ENXIO);
 	}
 
 	sc->intc_bst = rman_get_bustag(sc->intc_mem_res);
 	sc->intc_bsh = rman_get_bushandle(sc->intc_mem_res);
 
-	arm_register_pic(dev, 0);
 
 	if (bus_setup_intr(dev, sc->intc_irq_res,
 	    INTR_TYPE_MISC | INTR_CONTROLLER, bcm_intc_intr, NULL, sc, 
 	    &sc->intc_intrhand)) {
 		device_printf(dev, "could not setup interrupt handler\n");
+		bus_release_resource(dev, SYS_RES_MEMORY, 0, sc->intc_mem_res);
+		bus_release_resource(dev, SYS_RES_IRQ, 0, sc->intc_irq_res);
 		return (ENXIO);
 	}
+
+	arm_register_pic(dev, 0);
 
 	return (0);
 }

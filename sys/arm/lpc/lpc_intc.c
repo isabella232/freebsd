@@ -105,19 +105,22 @@ lpc_intc_attach(device_t dev)
 	    RF_ACTIVE | RF_SHAREABLE);
 	if (!sc->li_irq_res) {
 		device_printf(dev, "could not alloc interrupt resource\n");
-		return (ENXIO); // XXX
+		bus_release_resource(dev, SYS_RES_MEMORY, 0, sc->li_mem_res);
+		return (ENXIO);
 	}
 
 	sc->li_bst = rman_get_bustag(sc->li_mem_res);
 	sc->li_bsh = rman_get_bushandle(sc->li_mem_res);
 
-	arm_register_pic(dev, 0);
-
 	if (bus_setup_intr(dev, sc->li_irq_res, INTR_TYPE_MISC | INTR_CONTROLLER,
 	    lpc_intc_intr, NULL, sc, &sc->li_intrhand)) {
 		device_printf(dev, "could not setup interrupt handler\n");
-		return (ENXIO); // XXX
+		bus_release_resource(dev, SYS_RES_MEMORY, 0, sc->li_mem_res);
+		bus_release_resource(dev, SYS_RES_IRQ, 0, sc->li_irq_res);
+		return (ENXIO);
 	}
+
+	arm_register_pic(dev, 0);
 
 	/* Clear interrupt status registers and disable all interrupts */
 	intc_write_4(sc, LPC_INTC_ER, 0);
