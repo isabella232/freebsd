@@ -24,6 +24,7 @@ SRCS=	\
 	fwctl.c			\
 	inout.c			\
 	ioapic.c		\
+	ipc.c			\
 	mem.c			\
 	mevent.c		\
 	mptbl.c			\
@@ -51,7 +52,7 @@ SRCS=	\
 .PATH:  ${BHYVE_SYSDIR}/sys/amd64/vmm
 SRCS+=	vmm_instruction_emul.c
 
-LIBADD=	vmmapi md pthread 9p
+LIBADD=	vmmapi md pthread 9p nv
 
 WARNS?=	2
 

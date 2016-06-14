@@ -68,6 +68,7 @@ __FBSDID("$FreeBSD$");
 #include "xmsr.h"
 #include "spinup_ap.h"
 #include "rtc.h"
+#include "ipc.h"
 
 #define GUEST_NIO_PORT		0x488	/* guest upcalls via i/o port */
 
@@ -765,6 +766,7 @@ main(int argc, char *argv[])
 	uint64_t rip;
 	size_t memsize;
 	char *optstr;
+	char *ipc_opts;
 
 	bvmcons = 0;
 	progname = basename(argv[0]);
@@ -774,8 +776,9 @@ main(int argc, char *argv[])
 	mptgen = 1;
 	rtc_localtime = 1;
 	memflags = 0;
+	ipc_opts = NULL;
 
-	optstr = "abehuwxACHIPSWYp:g:c:s:m:l:U:";
+	optstr = "abehuwxACHIPSWYp:g:i:c:s:m:l:U:";
 	while ((c = getopt(argc, argv, optstr)) != -1) {
 		switch (c) {
 		case 'a':
@@ -832,6 +835,9 @@ main(int argc, char *argv[])
 			 * An ioapic is now provided unconditionally for each
 			 * virtual machine and this option is now deprecated.
 			 */
+			break;
+		case 'i':
+			ipc_opts = strdup(optarg);
 			break;
 		case 'P':
 			guest_vmexit_on_pause = 1;
@@ -897,6 +903,15 @@ main(int argc, char *argv[])
 	if (error) {
 		fprintf(stderr, "init_msr error %d", error);
 		exit(1);
+	}
+
+	if (ipc_opts != NULL) {
+		error = ipc_init(ipc_opts);
+		if (error) {
+			fprintf(stderr, "Unable to setup IPC: %s\n",
+			    strerror(errno));
+			exit(1);
+		}
 	}
 
 	init_mem();
