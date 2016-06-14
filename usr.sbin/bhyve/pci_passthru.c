@@ -34,6 +34,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/mman.h>
 #include <sys/pciio.h>
 #include <sys/ioctl.h>
+#include <sys/nv.h>
 
 #include <dev/io/iodev.h>
 #include <dev/pci/pcireg.h>
@@ -635,7 +636,8 @@ done:
 }
 
 static int
-passthru_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
+passthru_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts,
+    const nvlist_t *nvl)
 {
 	int bus, slot, func, error, memflags;
 	struct passthru_softc *sc;

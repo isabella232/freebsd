@@ -34,9 +34,13 @@
 #include <sys/kernel.h>
 #include <sys/_pthreadtypes.h>
 
+#include <sys/nv.h>
+
 #include <dev/pci/pcireg.h>
 
 #include <assert.h>
+
+#include "ipc.h"
 
 #define	PCI_BARMAX	PCIR_MAX_BAR_0	/* BAR registers in a Type 0 header */
 
@@ -49,7 +53,7 @@ struct pci_devemu {
 
 	/* instance creation */
 	int       (*pe_init)(struct vmctx *, struct pci_devinst *,
-			     char *opts);
+			     char *opts, const nvlist_t *nvl);
 
 	/* ACPI DSDT enumeration */
 	void	(*pe_write_dsdt)(struct pci_devinst *);
@@ -229,6 +233,7 @@ int	pci_msix_table_bar(struct pci_devinst *pi);
 int	pci_msix_pba_bar(struct pci_devinst *pi);
 int	pci_msi_msgnum(struct pci_devinst *pi);
 int	pci_parse_slot(char *opt);
+int	pci_add_slot(struct ipc_service *svc, void *id, const nvlist_t *nvl);
 void	pci_populate_msicap(struct msicap *cap, int msgs, int nextptr);
 int	pci_emul_add_msixcap(struct pci_devinst *pi, int msgnum, int barnum);
 int	pci_emul_msix_twrite(struct pci_devinst *pi, uint64_t offset, int size,

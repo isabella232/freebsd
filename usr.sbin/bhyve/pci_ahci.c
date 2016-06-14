@@ -37,6 +37,8 @@ __FBSDID("$FreeBSD$");
 #include <sys/disk.h>
 #include <sys/ata.h>
 #include <sys/endian.h>
+#include <sys/nv.h>
+#include <sys/dnv.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -2213,18 +2215,26 @@ pci_ahci_read(struct vmctx *ctx, int vcpu, struct pci_devinst *pi, int baridx,
 }
 
 static int
-pci_ahci_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts, int atapi)
+pci_ahci_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts,
+    const nvlist_t *nvl, int atapi)
 {
 	char bident[sizeof("XX:X:X")];
 	struct blockif_ctxt *bctxt;
 	struct pci_ahci_softc *sc;
+	const char *filename;
 	int ret, slots;
 	MD5_CTX mdctx;
 	u_char digest[16];
 
 	ret = 0;
 
-	if (opts == NULL) {
+	if (opts != NULL)
+		filename = opts;
+
+	if (nvl != NULL)
+		filename = dnvlist_get_string(nvl, "filename", NULL);
+
+	if (filename == NULL) {
 		fprintf(stderr, "pci_ahci: backing device required\n");
 		return (1);
 	}
@@ -2249,8 +2259,8 @@ pci_ahci_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts, int atapi)
 	 * slot/func for the identifier string.
 	 */
 	snprintf(bident, sizeof(bident), "%d:%d", pi->pi_slot, pi->pi_func);
-	bctxt = blockif_open(opts, bident);
-	if (bctxt == NULL) {       	
+	bctxt = blockif_open(filename, bident);
+	if (bctxt == NULL) {
 		ret = 1;
 		goto open_fail;
 	}	
@@ -2262,7 +2272,7 @@ pci_ahci_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts, int atapi)
 	 * md5 sum of the filename
 	 */
 	MD5Init(&mdctx);
-	MD5Update(&mdctx, opts, strlen(opts));
+	MD5Update(&mdctx, filename, strlen(filename));
 	MD5Final(digest, &mdctx);	
 	sprintf(sc->port[0].ident, "BHYVE-%02X%02X-%02X%02X-%02X%02X",
 	    digest[0], digest[1], digest[2], digest[3], digest[4], digest[5]);
@@ -2314,17 +2324,19 @@ open_fail:
 }
 
 static int
-pci_ahci_hd_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
+pci_ahci_hd_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts,
+    const nvlist_t *nvl)
 {
 
-	return (pci_ahci_init(ctx, pi, opts, 0));
+	return (pci_ahci_init(ctx, pi, opts, nvl, 0));
 }
 
 static int
-pci_ahci_atapi_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
+pci_ahci_atapi_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts,
+    const nvlist_t *nvl)
 {
 
-	return (pci_ahci_init(ctx, pi, opts, 1));
+	return (pci_ahci_init(ctx, pi, opts, nvl, 1));
 }
 
 /*

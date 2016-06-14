@@ -39,8 +39,10 @@
 #include <stdbool.h>
 #include <string.h>
 #include <pthread.h>
+#include <pthread_np.h>
 
 #include <sys/nv.h>
+#include "pci_emul.h"
 #include "ipc.h"
 
 #define	WPRINTF(params)	printf params
@@ -185,6 +187,19 @@ ipc_respond_err(void *id, int errnum, const char *errstr)
 	ipc_send(nvl);
 }
 
+void
+ipc_respond_errf(void *id, int errnum, const char *fmt, ...)
+{
+	va_list ap;
+	char *msg;
+
+	va_start(ap, fmt);
+	vasprintf(&msg, fmt, ap);
+	ipc_respond_err(id, errnum, (const char *)msg);
+	va_end(ap);
+	free(msg);
+}
+
 static void
 ipc_handle_call(int cfd)
 {
@@ -319,6 +334,7 @@ ipc_register_system()
 
 	svc = ipc_add_service("system", NULL);
 	ipc_add_method(svc, "continue", ipc_handle_continue);
+	ipc_add_method(svc, "pci_add_slot", pci_add_slot);
 }
 
 int
@@ -358,6 +374,8 @@ ipc_init(char *opts)
 
 	if (pthread_create(&ipc.ipc_thread, NULL, ipc_handle, NULL) < 0)
 		goto out;
+
+	pthread_set_name_np(ipc.ipc_thread, "ipc");
 
 	ipc_register_system();
 

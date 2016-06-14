@@ -201,7 +201,8 @@ pci_vt9p_notify(void *vsc, struct vqueue_info *vq)
 
 
 static int
-pci_vt9p_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
+pci_vt9p_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts,
+    const nvlist_t *nvl)
 {
 	struct pci_vt9p_softc *sc;
 	char *opt;

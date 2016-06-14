@@ -379,7 +379,8 @@ pci_lpc_read(struct vmctx *ctx, int vcpu, struct pci_devinst *pi,
 #define	LPC_VENDOR	0x8086
 
 static int
-pci_lpc_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
+pci_lpc_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts,
+    const nvlist_t *nvl)
 {
 
 	/*

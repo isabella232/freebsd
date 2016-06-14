@@ -43,6 +43,7 @@ void ipc_send_event(struct ipc_service *service, const char *name,
     nvlist_t *payload);
 void ipc_respond_ok(void *id,nvlist_t *response);
 void ipc_respond_err(void *id, int errnum, const char *errstr);
+void ipc_respond_errf(void *id, int errnum, const char *fmt, ...);
 int ipc_init(char *opts);
 
 #endif	/* _IPC_H_ */

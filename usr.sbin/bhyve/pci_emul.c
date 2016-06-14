@@ -32,6 +32,8 @@ __FBSDID("$FreeBSD$");
 #include <sys/param.h>
 #include <sys/linker_set.h>
 #include <sys/errno.h>
+#include <sys/nv.h>
+#include <sys/dnv.h>
 
 #include <ctype.h>
 #include <pthread.h>
@@ -64,8 +66,9 @@ __FBSDID("$FreeBSD$");
 #define	MAXFUNCS	(PCI_FUNCMAX + 1)
 
 struct funcinfo {
-	char	*fi_name;
-	char	*fi_param;
+	const char	*fi_name;
+	char		*fi_param;
+	const nvlist_t 	*fi_nvl;
 	struct pci_devinst *fi_devi;
 };
 
@@ -107,7 +110,7 @@ SYSRES_MEM(PCI_EMUL_ECFG_BASE, PCI_EMUL_ECFG_SIZE);
 #define	PCI_EMUL_MEMBASE64	0xD000000000UL
 #define	PCI_EMUL_MEMLIMIT64	0xFD00000000UL
 
-static struct pci_devemu *pci_emul_finddev(char *name);
+static struct pci_devemu *pci_emul_finddev(const char *name);
 static void pci_lintr_route(struct pci_devinst *pi);
 static void pci_lintr_update(struct pci_devinst *pi);
 static void pci_cfgrw(struct vmctx *ctx, int vcpu, int in, int bus, int slot,
@@ -227,12 +230,66 @@ pci_parse_slot(char *opt)
 	error = 0;
 	si->si_funcs[fnum].fi_name = emul;
 	si->si_funcs[fnum].fi_param = config;
+	si->si_funcs[fnum].fi_nvl = NULL;
 
 done:
 	if (error)
 		free(str);
 
 	return (error);
+}
+
+int
+pci_add_slot(struct ipc_service *svc, void *id, const nvlist_t *nvl)
+{
+	struct businfo *bi;
+	struct slotinfo *si;
+	int bnum, snum, fnum;
+	const char *emul;
+	const nvlist_t *config_nvl;
+
+	bnum = dnvlist_get_number(nvl, "bus", 0);
+	snum = dnvlist_get_number(nvl, "slot", -1);
+	fnum = dnvlist_get_number(nvl, "func", 0);
+	emul = dnvlist_get_string(nvl, "emul", NULL);
+	config_nvl = dnvlist_get_nvlist(nvl, "config", NULL);
+
+	if (bnum < 0 || bnum >= MAXBUSES || snum < 0 || snum >= MAXSLOTS ||
+	    fnum < 0 || fnum >= MAXFUNCS) {
+		ipc_respond_err(id, EINVAL,
+		    "invalid bus, slot or function number");
+		return (-1);
+	}
+
+	if (emul == NULL) {
+		ipc_respond_err(id, EINVAL, "emul not provided");
+		return (-1);
+	}
+
+	if (pci_businfo[bnum] == NULL)
+		pci_businfo[bnum] = calloc(1, sizeof(struct businfo));
+
+	bi = pci_businfo[bnum];
+	si = &bi->slotinfo[snum];
+
+	if (si->si_funcs[fnum].fi_name != NULL) {
+		ipc_respond_errf(id, EBUSY, "pci slot %d:%d already occupied",
+		    snum, fnum);
+		return (-1);
+	}
+
+	if (pci_emul_finddev(emul) == NULL) {
+		ipc_respond_errf(id, ENXIO,
+		    "pci slot %d:%d: unknown device \"%s\"",
+		    snum, fnum, emul);
+		return (-1);
+	}
+
+	si->si_funcs[fnum].fi_name = emul;
+	si->si_funcs[fnum].fi_param = NULL;
+	si->si_funcs[fnum].fi_nvl = config_nvl;
+	ipc_respond_ok(id, NULL);
+	return (0);
 }
 
 static int
@@ -704,7 +761,7 @@ pci_emul_add_capability(struct pci_devinst *pi, u_char *capdata, int caplen)
 }
 
 static struct pci_devemu *
-pci_emul_finddev(char *name)
+pci_emul_finddev(const char *name)
 {
 	struct pci_devemu **pdpp, *pdp;
 
@@ -746,7 +803,7 @@ pci_emul_init(struct vmctx *ctx, struct pci_devemu *pde, int bus, int slot,
 	pci_set_cfgdata8(pdi, PCIR_COMMAND,
 		    PCIM_CMD_PORTEN | PCIM_CMD_MEMEN | PCIM_CMD_BUSMASTEREN);
 
-	err = (*pde->pe_init)(ctx, pdi, fi->fi_param);
+	err = (*pde->pe_init)(ctx, pdi, fi->fi_param, fi->fi_nvl);
 	if (err == 0)
 		fi->fi_devi = pdi;
 	else
@@ -1944,7 +2001,8 @@ struct pci_emul_dsoftc {
 #define	PCI_EMUL_MSIX_MSGS	16
 
 static int
-pci_emul_dinit(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
+pci_emul_dinit(struct vmctx *ctx, struct pci_devinst *pi, char *opts,
+    const nvlist_t *nvl)
 {
 	int error;
 	struct pci_emul_dsoftc *sc;

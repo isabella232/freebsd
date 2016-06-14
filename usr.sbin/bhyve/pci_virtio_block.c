@@ -35,6 +35,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/uio.h>
 #include <sys/ioctl.h>
 #include <sys/disk.h>
+#include <sys/nv.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -287,7 +288,8 @@ pci_vtblk_notify(void *vsc, struct vqueue_info *vq)
 }
 
 static int
-pci_vtblk_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
+pci_vtblk_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts,
+    const nvlist_t *nvl)
 {
 	char bident[sizeof("XX:X:X")];
 	struct blockif_ctxt *bctxt;

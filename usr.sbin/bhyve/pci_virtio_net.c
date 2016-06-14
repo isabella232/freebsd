@@ -34,6 +34,9 @@ __FBSDID("$FreeBSD$");
 #include <sys/select.h>
 #include <sys/uio.h>
 #include <sys/ioctl.h>
+#include <sys/nv.h>
+#include <sys/dnv.h>
+
 #include <machine/atomic.h>
 #include <net/ethernet.h>
 #ifndef NETMAP_WITH_LIBS
@@ -802,7 +805,8 @@ pci_vtnet_netmap_setup(struct pci_vtnet_softc *sc, char *ifname)
 }
 
 static int
-pci_vtnet_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
+pci_vtnet_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts,
+    const nvlist_t *nvl)
 {
 	MD5_CTX mdctx;
 	unsigned char digest[16];
@@ -812,6 +816,7 @@ pci_vtnet_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
 	char *devname;
 	char *vtopts;
 	int mac_provided;
+	int err;
 
 	sc = calloc(1, sizeof(struct pci_vtnet_softc));
 
@@ -836,29 +841,33 @@ pci_vtnet_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
 	mac_provided = 0;
 	sc->vsc_tapfd = -1;
 	sc->vsc_nmd = NULL;
-	if (opts != NULL) {
-		int err;
 
+	if (opts != NULL) {
 		devname = vtopts = strdup(opts);
 		(void) strsep(&vtopts, ",");
-
-		if (vtopts != NULL) {
-			err = pci_vtnet_parsemac(vtopts, sc->vsc_config.mac);
-			if (err != 0) {
-				free(devname);
-				return (err);
-			}
-			mac_provided = 1;
-		}
-
-		if (strncmp(devname, "vale", 4) == 0)
-			pci_vtnet_netmap_setup(sc, devname);
-		if (strncmp(devname, "tap", 3) == 0 ||
-		    strncmp(devname, "vmnet", 5) == 0)
-			pci_vtnet_tap_setup(sc, devname);
-
-		free(devname);
 	}
+
+	if (nvl != NULL) {
+		devname = strdup(dnvlist_get_string(nvl, "devname", "tap"));
+		vtopts = (char *)dnvlist_get_string(nvl, "mac", NULL);
+	}
+
+	if (vtopts != NULL) {
+		err = pci_vtnet_parsemac(vtopts, sc->vsc_config.mac);
+		if (err != 0) {
+			free(devname);
+			return (err);
+		}
+		mac_provided = 1;
+	}
+
+	if (strncmp(devname, "vale", 4) == 0)
+		pci_vtnet_netmap_setup(sc, devname);
+	if (strncmp(devname, "tap", 3) == 0 ||
+	    strncmp(devname, "vmnet", 5) == 0)
+		pci_vtnet_tap_setup(sc, devname);
+
+	free(devname);
 
 	/*
 	 * The default MAC address is the standard NetApp OUI of 00-a0-98,

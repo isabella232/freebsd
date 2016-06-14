@@ -86,7 +86,8 @@ pci_uart_read(struct vmctx *ctx, int vcpu, struct pci_devinst *pi,
 }
 
 static int
-pci_uart_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
+pci_uart_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts,
+    const nvlist_t *nvl)
 {
 	struct uart_softc *sc;
 
