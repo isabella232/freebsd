@@ -36,6 +36,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/ioctl.h>
 #include <sys/disk.h>
 #include <sys/nv.h>
+#include <sys/dnv.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -298,8 +299,15 @@ pci_vtblk_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts,
 	struct pci_vtblk_softc *sc;
 	off_t size;
 	int i, sectsz, sts, sto;
+	const char *filename = NULL;
 
-	if (opts == NULL) {
+	if (opts != NULL)
+		filename = opts;
+
+	if (nvl != NULL)
+		filename = dnvlist_get_string(nvl, "filename", NULL);
+
+	if (filename == NULL) {
 		printf("virtio-block: backing device required\n");
 		return (1);
 	}

@@ -35,6 +35,8 @@ __FBSDID("$FreeBSD: head/usr.sbin/bhyve/pci_virtio_rnd.c 282865 2015-05-13 17:38
 #include <sys/param.h>
 #include <sys/linker_set.h>
 #include <sys/uio.h>
+#include <sys/nv.h>
+#include <sys/dnv.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -206,10 +208,33 @@ pci_vt9p_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts,
 {
 	struct pci_vt9p_softc *sc;
 	char *opt;
-	char *sharename = NULL;
-	char *rootpath = NULL;
+	const char *sharename = NULL;
+	const char *rootpath = NULL;
+	bool ro = false;
 
-	if (opts == NULL) {
+	if (opts != NULL) {
+		while ((opt = strsep(&opts, ",")) != NULL) {
+			if (sharename == NULL) {
+				sharename = strsep(&opt, "=");
+				rootpath = strdup(opt);
+				continue;
+			}
+
+			if (strcmp(opt, "ro") == 0)
+				ro = true;
+		}
+	}
+
+	if (nvl != NULL) {
+		sharename = dnvlist_get_string(nvl, "devname", NULL);
+		rootpath = dnvlist_get_string(nvl, "rootpath", NULL);
+		ro = dnvlist_get_bool(nvl, "readonly", false);
+	}
+
+	if (ro)
+		DPRINTF(("read-only mount requested\r\n"));
+
+	if (sharename == NULL || rootpath == NULL) {
 		printf("virtio-9p: share name and path required\n");
 		return (1);
 	}
@@ -218,16 +243,6 @@ pci_vt9p_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts,
 	sc->vsc_config = calloc(1, sizeof(struct pci_vt9p_config) +
 	    VT9P_MAXTAGSZ);
 
-	while ((opt = strsep(&opts, ",")) != NULL) {
-		if (sharename == NULL) {
-			sharename = strsep(&opt, "=");
-			rootpath = strdup(opt);
-			continue;
-		}
-
-		if (strcmp(opt, "ro") == 0)
-			DPRINTF(("read-only mount requested\r\n"));
-	}
 
 	sc->vsc_config->tag_len = (uint16_t)strlen(sharename);
 	strncpy(sc->vsc_config->tag, sharename, strlen(sharename));

@@ -2221,7 +2221,7 @@ pci_ahci_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts,
 	char bident[sizeof("XX:X:X")];
 	struct blockif_ctxt *bctxt;
 	struct pci_ahci_softc *sc;
-	const char *filename;
+	const char *filename = NULL;
 	int ret, slots;
 	MD5_CTX mdctx;
 	u_char digest[16];
