@@ -1,9 +1,8 @@
 //===-- DYLDRendezvous.cpp --------------------------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -243,7 +242,7 @@ bool DYLDRendezvous::FillSOEntryFromModuleInfo(
   entry.base_addr = base_addr;
   entry.dyn_addr = dyn_addr;
 
-  entry.file_spec.SetFile(name, false, FileSpec::Style::native);
+  entry.file_spec.SetFile(name, FileSpec::Style::native);
 
   UpdateBaseAddrIfNecessary(entry, name);
 
@@ -455,14 +454,10 @@ static bool isLoadBiasIncorrect(Target &target, const std::string &file_path) {
   // On Android L (API 21, 22) the load address of the "/system/bin/linker"
   // isn't filled in correctly.
   unsigned os_major = target.GetPlatform()->GetOSVersion().getMajor();
-  if (target.GetArchitecture().GetTriple().isAndroid() &&
-      (os_major == 21 || os_major == 22) &&
-      (file_path == "/system/bin/linker" ||
-       file_path == "/system/bin/linker64")) {
-    return true;
-  }
-
-  return false;
+  return target.GetArchitecture().GetTriple().isAndroid() &&
+         (os_major == 21 || os_major == 22) &&
+         (file_path == "/system/bin/linker" ||
+          file_path == "/system/bin/linker64");
 }
 
 void DYLDRendezvous::UpdateBaseAddrIfNecessary(SOEntry &entry,
@@ -493,10 +488,7 @@ bool DYLDRendezvous::ReadSOEntryFromMemory(lldb::addr_t addr, SOEntry &entry) {
   const ArchSpec &arch = m_process->GetTarget().GetArchitecture();
   if ((arch.GetTriple().getOS() == llvm::Triple::FreeBSD ||
        arch.GetTriple().getOS() == llvm::Triple::NetBSD) &&
-      (arch.GetMachine() == llvm::Triple::mips ||
-       arch.GetMachine() == llvm::Triple::mipsel ||
-       arch.GetMachine() == llvm::Triple::mips64 ||
-       arch.GetMachine() == llvm::Triple::mips64el)) {
+      arch.IsMIPS()) {
     addr_t mips_l_offs;
     if (!(addr = ReadPointer(addr, &mips_l_offs)))
       return false;
@@ -517,7 +509,7 @@ bool DYLDRendezvous::ReadSOEntryFromMemory(lldb::addr_t addr, SOEntry &entry) {
     return false;
 
   std::string file_path = ReadStringFromMemory(entry.path_addr);
-  entry.file_spec.SetFile(file_path, false, FileSpec::Style::native);
+  entry.file_spec.SetFile(file_path, FileSpec::Style::native);
 
   UpdateBaseAddrIfNecessary(entry, file_path);
 

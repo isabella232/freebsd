@@ -64,6 +64,9 @@ __FBSDID("$FreeBSD$");
 #include <cam/cam_ccb.h>
 #include <cam/cam_periph.h>
 #include <cam/cam_xpt_periph.h>
+#ifdef _KERNEL
+#include <cam/cam_xpt_internal.h>
+#endif /* _KERNEL */
 #include <cam/cam_sim.h>
 #include <cam/cam_iosched.h>
 
@@ -130,7 +133,8 @@ typedef enum {
 	DA_Q_NO_UNMAP		= 0x20,
 	DA_Q_RETRY_BUSY		= 0x40,
 	DA_Q_SMR_DM		= 0x80,
-	DA_Q_STRICT_UNMAP	= 0x100
+	DA_Q_STRICT_UNMAP	= 0x100,
+	DA_Q_128KB		= 0x200
 } da_quirks;
 
 #define DA_Q_BIT_STRING		\
@@ -143,7 +147,8 @@ typedef enum {
 	"\006NO_UNMAP"		\
 	"\007RETRY_BUSY"	\
 	"\010SMR_DM"		\
-	"\011STRICT_UNMAP"
+	"\011STRICT_UNMAP"	\
+	"\012128KB"
 
 typedef enum {
 	DA_CCB_PROBE_RC		= 0x01,
@@ -342,6 +347,7 @@ struct da_softc {
 	da_delete_func_t	*delete_func;
 	int			unmappedio;
 	int			rotating;
+	int			p_type;
 	struct	 disk_params params;
 	struct	 disk *disk;
 	union	 ccb saved_ccb;
@@ -861,7 +867,21 @@ static struct da_quirk_entry da_quirk_table[] =
 		{T_DIRECT, SIP_MEDIA_REMOVABLE, "I-O DATA", "USB Flash Disk*",
 		 "*"}, /*quirks*/ DA_Q_NO_RC16
 	},
+	{
+		/*
+		 * SLC CHIPFANCIER USB drives
+		 * PR: usb/234503 (RC10 right, RC16 wrong)
+		 * 16GB, 32GB and 128GB confirmed to have same issue
+		 */
+		{T_DIRECT, SIP_MEDIA_REMOVABLE, "*SLC", "CHIPFANCIER",
+		 "*"}, /*quirks*/ DA_Q_NO_RC16
+       },
 	/* ATA/SATA devices over SAS/USB/... */
+	{
+		/* Sandisk X400 */
+		{ T_DIRECT, SIP_MEDIA_FIXED, "ATA", "SanDisk SD8SB8U1*", "*" },
+		/*quirks*/DA_Q_128KB
+	},
 	{
 		/* Hitachi Advanced Format (4k) drives */
 		{ T_DIRECT, SIP_MEDIA_FIXED, "Hitachi", "H??????????E3*", "*" },
@@ -1084,9 +1104,41 @@ static struct da_quirk_entry da_quirk_table[] =
 	},
 	{
 		/*
+		 * Olympus digital cameras (C-3040ZOOM, C-2040ZOOM, C-1)
+		 * PR: usb/97472
+		 */
+		{ T_DIRECT, SIP_MEDIA_REMOVABLE, "OLYMPUS", "C*", "*"},
+		/*quirks*/ DA_Q_NO_6_BYTE | DA_Q_NO_SYNC_CACHE
+	},
+	{
+		/*
+		 * Olympus digital cameras (D-370)
+		 * PR: usb/97472
+		 */
+		{ T_DIRECT, SIP_MEDIA_REMOVABLE, "OLYMPUS", "D*", "*"},
+		/*quirks*/ DA_Q_NO_6_BYTE
+	},
+	{
+		/*
+		 * Olympus digital cameras (E-100RS, E-10).
+		 * PR: usb/97472
+		 */
+		{ T_DIRECT, SIP_MEDIA_REMOVABLE, "OLYMPUS", "E*", "*"},
+		/*quirks*/ DA_Q_NO_6_BYTE | DA_Q_NO_SYNC_CACHE
+	},
+	{
+		/*
 		 * Olympus FE-210 camera
 		 */
 		{T_DIRECT, SIP_MEDIA_REMOVABLE, "OLYMPUS", "FE210*",
+		"*"}, /*quirks*/ DA_Q_NO_SYNC_CACHE
+	},
+	{
+		/*
+		* Pentax Digital Camera
+		* PR: usb/93389
+		*/
+		{T_DIRECT, SIP_MEDIA_REMOVABLE, "PENTAX", "DIGITAL CAMERA",
 		"*"}, /*quirks*/ DA_Q_NO_SYNC_CACHE
 	},
 	{
@@ -1440,9 +1492,9 @@ static void		dasetgeom(struct cam_periph *periph, uint32_t block_len,
 				  uint64_t maxsector,
 				  struct scsi_read_capacity_data_long *rcaplong,
 				  size_t rcap_size);
-static timeout_t	dasendorderedtag;
+static callout_func_t	dasendorderedtag;
 static void		dashutdown(void *arg, int howto);
-static timeout_t	damediapoll;
+static callout_func_t	damediapoll;
 
 #ifndef	DA_DEFAULT_POLL_PERIOD
 #define	DA_DEFAULT_POLL_PERIOD	3
@@ -1634,7 +1686,7 @@ da_periph_release_locked(struct cam_periph *periph, da_ref_token token)
 	    da_ref_text[token], token);
 	cnt = atomic_fetchadd_int(&softc->ref_flags[token], -1);
 	if (cnt != 1)
-		panic("Unholding %d with cnt = %d", token, cnt);
+		panic("releasing (locked) %d with cnt = %d", token, cnt);
 	cam_periph_release_locked(periph);
 }
 
@@ -2081,8 +2133,8 @@ daasync(void *callback_arg, u_int32_t code,
 				    "Capacity data has changed\n");
 				cam_periph_lock(periph);
 				softc->flags &= ~DA_FLAG_PROBED;
-				cam_periph_unlock(periph);
 				dareprobe(periph);
+				cam_periph_unlock(periph);
 			} else if (asc == 0x28 && ascq == 0x00) {
 				cam_periph_lock(periph);
 				softc->flags &= ~DA_FLAG_PROBED;
@@ -2093,8 +2145,8 @@ daasync(void *callback_arg, u_int32_t code,
 				    "INQUIRY data has changed\n");
 				cam_periph_lock(periph);
 				softc->flags &= ~DA_FLAG_PROBED;
-				cam_periph_unlock(periph);
 				dareprobe(periph);
+				cam_periph_unlock(periph);
 			}
 		}
 		break;
@@ -2244,7 +2296,7 @@ dasysctlinit(void *context, int pending)
 		       CTLFLAG_RD,
 		       &softc->unmappedio,
 		       0,
-		       "Unmapped I/O leaf");
+		       "Unmapped I/O support");
 
 	SYSCTL_ADD_INT(&softc->sysctl_ctx,
 		       SYSCTL_CHILDREN(softc->sysctl_tree),
@@ -2254,6 +2306,15 @@ dasysctlinit(void *context, int pending)
 		       &softc->rotating,
 		       0,
 		       "Rotating media");
+
+	SYSCTL_ADD_INT(&softc->sysctl_ctx,
+		       SYSCTL_CHILDREN(softc->sysctl_tree),
+		       OID_AUTO,
+		       "p_type",
+		       CTLFLAG_RD,
+		       &softc->p_type,
+		       0,
+		       "DIF protection type");
 
 #ifdef CAM_TEST_FAILURE
 	SYSCTL_ADD_PROC(&softc->sysctl_ctx, SYSCTL_CHILDREN(softc->sysctl_tree),
@@ -2633,6 +2694,7 @@ daregister(struct cam_periph *periph, void *arg)
 	struct ccb_getdev *cgd;
 	char tmpstr[80];
 	caddr_t match;
+	int quirks;
 
 	cgd = (struct ccb_getdev *)arg;
 	if (cgd == NULL) {
@@ -2688,6 +2750,13 @@ daregister(struct cam_periph *periph, void *arg)
 	xpt_path_inq(&cpi, periph->path);
 	if (cpi.ccb_h.status == CAM_REQ_CMP && (cpi.hba_misc & PIM_NO_6_BYTE))
 		softc->quirks |= DA_Q_NO_6_BYTE;
+
+	/* Override quirks if tunable is set */
+	snprintf(tmpstr, sizeof(tmpstr), "kern.cam.da.%d.quirks",
+		 periph->unit_number);
+	quirks = softc->quirks;
+	TUNABLE_INT_FETCH(tmpstr, &quirks);
+	softc->quirks = quirks;
 
 	if (SID_TYPE(&cgd->inq_data) == T_ZBC_HM)
 		softc->zone_mode = DA_ZONE_HOST_MANAGED;
@@ -2785,6 +2854,8 @@ daregister(struct cam_periph *periph, void *arg)
 		softc->maxio = MAXPHYS;		/* for safety */
 	else
 		softc->maxio = cpi.maxio;
+	if (softc->quirks & DA_Q_128KB)
+		softc->maxio = min(softc->maxio, 128 * 1024);
 	softc->disk->d_maxsize = softc->maxio;
 	softc->disk->d_unit = periph->unit_number;
 	softc->disk->d_flags = DISKFLAG_DIRECT_COMPLETION | DISKFLAG_CANZONE;
@@ -2804,6 +2875,8 @@ daregister(struct cam_periph *periph, void *arg)
 	softc->disk->d_hba_device = cpi.hba_device;
 	softc->disk->d_hba_subvendor = cpi.hba_subvendor;
 	softc->disk->d_hba_subdevice = cpi.hba_subdevice;
+	snprintf(softc->disk->d_attachment, sizeof(softc->disk->d_attachment),
+	    "%s%d", cpi.dev_name, cpi.unit_number);
 
 	/*
 	 * Acquire a reference to the periph before we register with GEOM.
@@ -3274,14 +3347,12 @@ more:
 			/*
 			 * BIO_FLUSH doesn't currently communicate
 			 * range data, so we synchronize the cache
-			 * over the whole disk.  We also force
-			 * ordered tag semantics the flush applies
-			 * to all previously queued I/O.
+			 * over the whole disk.
 			 */
 			scsi_synchronize_cache(&start_ccb->csio,
 					       /*retries*/1,
 					       /*cbfcnp*/dadone,
-					       MSG_ORDERED_Q_TAG,
+					       /*tag_action*/tag_code,
 					       /*begin_lba*/0,
 					       /*lb_count*/0,
 					       SSD_FULL_SIZE,
@@ -3555,15 +3626,7 @@ out:
 			break;
 		}
 
-		ata_params = (struct ata_params*)
-			malloc(sizeof(*ata_params), M_SCSIDA,M_NOWAIT|M_ZERO);
-
-		if (ata_params == NULL) {
-			xpt_print(periph->path, "Couldn't malloc ata_params "
-			    "data\n");
-			/* da_free_periph??? */
-			break;
-		}
+		ata_params = &periph->path->device->ident_data;
 
 		scsi_ata_identify(&start_ccb->csio,
 				  /*retries*/da_retry_count,
@@ -4550,6 +4613,14 @@ dadone_probewp(struct cam_periph *periph, union ccb *done_ccb)
 
 	cam_periph_assert(periph, MA_OWNED);
 
+	KASSERT(softc->state == DA_STATE_PROBE_WP,
+	    ("State (%d) not PROBE_WP in dadone_probewp, periph %p ccb %p",
+		softc->state, periph, done_ccb));
+        KASSERT((csio->ccb_h.ccb_state & DA_CCB_TYPE_MASK) == DA_CCB_PROBE_WP,
+	    ("CCB State (%lu) not PROBE_WP in dadone_probewp, periph %p ccb %p",
+		(unsigned long)csio->ccb_h.ccb_state & DA_CCB_TYPE_MASK, periph,
+		done_ccb));
+
 	if (softc->minimum_cmd_size > 6) {
 		mode_hdr10 = (struct scsi_mode_header_10 *)csio->data_ptr;
 		dev_spec = mode_hdr10->dev_spec;
@@ -4582,11 +4653,11 @@ dadone_probewp(struct cam_periph *periph, union ccb *done_ccb)
 	}
 
 	free(csio->data_ptr, M_SCSIDA);
-	xpt_release_ccb(done_ccb);
 	if ((softc->flags & DA_FLAG_CAN_RC16) != 0)
 		softc->state = DA_STATE_PROBE_RC16;
 	else
 		softc->state = DA_STATE_PROBE_RC;
+	xpt_release_ccb(done_ccb);
 	xpt_schedule(periph, priority);
 	return;
 }
@@ -4601,7 +4672,7 @@ dadone_proberc(struct cam_periph *periph, union ccb *done_ccb)
 	da_ccb_state state;
 	char *announce_buf;
 	u_int32_t  priority;
-	int lbp;
+	int lbp, n;
 
 	CAM_DEBUG(periph->path, CAM_DEBUG_TRACE, ("dadone_proberc\n"));
 
@@ -4609,6 +4680,13 @@ dadone_proberc(struct cam_periph *periph, union ccb *done_ccb)
 	priority = done_ccb->ccb_h.pinfo.priority;
 	csio = &done_ccb->csio;
 	state = csio->ccb_h.ccb_state & DA_CCB_TYPE_MASK;
+
+	KASSERT(softc->state == DA_STATE_PROBE_RC || softc->state == DA_STATE_PROBE_RC16,
+	    ("State (%d) not PROBE_RC* in dadone_proberc, periph %p ccb %p",
+		softc->state, periph, done_ccb));
+	KASSERT(state == DA_CCB_PROBE_RC || state == DA_CCB_PROBE_RC16,
+	    ("CCB State (%lu) not PROBE_RC* in dadone_probewp, periph %p ccb %p",
+		(unsigned long)state, periph, done_ccb));
 
 	lbp = 0;
 	rdcap = NULL;
@@ -4646,8 +4724,8 @@ dadone_proberc(struct cam_periph *periph, union ccb *done_ccb)
 			 */
 			if (maxsector == 0xffffffff) {
 				free(rdcap, M_SCSIDA);
-				xpt_release_ccb(done_ccb);
 				softc->state = DA_STATE_PROBE_RC16;
+				xpt_release_ccb(done_ccb);
 				xpt_schedule(periph, priority);
 				return;
 			}
@@ -4683,11 +4761,17 @@ dadone_proberc(struct cam_periph *periph, union ccb *done_ccb)
 				  rcaplong, sizeof(*rcaplong));
 			lbp = (lalba & SRC16_LBPME_A);
 			dp = &softc->params;
-			snprintf(announce_buf, DA_ANNOUNCETMP_SZ,
-			    "%juMB (%ju %u byte sectors)",
+			n = snprintf(announce_buf, DA_ANNOUNCETMP_SZ,
+			    "%juMB (%ju %u byte sectors",
 			    ((uintmax_t)dp->secsize * dp->sectors) /
 			     (1024 * 1024),
 			    (uintmax_t)dp->sectors, dp->secsize);
+			if (softc->p_type != 0) {
+				n += snprintf(announce_buf + n,
+				    DA_ANNOUNCETMP_SZ - n,
+				    ", DIF type %d", softc->p_type);
+			}
+			snprintf(announce_buf + n, DA_ANNOUNCETMP_SZ - n, ")");
 		}
 	} else {
 		int error;
@@ -4747,8 +4831,8 @@ dadone_proberc(struct cam_periph *periph, union ccb *done_ccb)
 				cam_periph_assert(periph, MA_OWNED);
 				softc->flags &= ~DA_FLAG_CAN_RC16;
 				free(rdcap, M_SCSIDA);
-				xpt_release_ccb(done_ccb);
 				softc->state = DA_STATE_PROBE_RC;
+				xpt_release_ccb(done_ccb);
 				xpt_schedule(periph, priority);
 				return;
 			}
@@ -4855,14 +4939,14 @@ dadone_proberc(struct cam_periph *periph, union ccb *done_ccb)
 		dadeleteflag(softc, DA_DELETE_WS10, 1);
 		dadeleteflag(softc, DA_DELETE_UNMAP, 1);
 
-		xpt_release_ccb(done_ccb);
 		softc->state = DA_STATE_PROBE_LBP;
+		xpt_release_ccb(done_ccb);
 		xpt_schedule(periph, priority);
 		return;
 	}
 
-	xpt_release_ccb(done_ccb);
 	softc->state = DA_STATE_PROBE_BDC;
+	xpt_release_ccb(done_ccb);
 	xpt_schedule(periph, priority);
 	return;
 }
@@ -4919,8 +5003,8 @@ dadone_probelbp(struct cam_periph *periph, union ccb *done_ccb)
 	}
 
 	free(lbp, M_SCSIDA);
-	xpt_release_ccb(done_ccb);
 	softc->state = DA_STATE_PROBE_BLK_LIMITS;
+	xpt_release_ccb(done_ccb);
 	xpt_schedule(periph, priority);
 	return;
 }
@@ -5013,8 +5097,8 @@ dadone_probeblklimits(struct cam_periph *periph, union ccb *done_ccb)
 	}
 
 	free(block_limits, M_SCSIDA);
-	xpt_release_ccb(done_ccb);
 	softc->state = DA_STATE_PROBE_BDC;
+	xpt_release_ccb(done_ccb);
 	xpt_schedule(periph, priority);
 	return;
 }
@@ -5114,8 +5198,8 @@ dadone_probebdc(struct cam_periph *periph, union ccb *done_ccb)
 	}
 
 	free(bdc, M_SCSIDA);
-	xpt_release_ccb(done_ccb);
 	softc->state = DA_STATE_PROBE_ATA;
+	xpt_release_ccb(done_ccb);
 	xpt_schedule(periph, priority);
 	return;
 }
@@ -5128,7 +5212,7 @@ dadone_probeata(struct cam_periph *periph, union ccb *done_ccb)
 	struct da_softc *softc;
 	u_int32_t  priority;
 	int continue_probe;
-	int error, i;
+	int error;
 	int16_t *ptr;
 
 	CAM_DEBUG(periph->path, CAM_DEBUG_TRACE, ("dadone_probeata\n"));
@@ -5146,8 +5230,7 @@ dadone_probeata(struct cam_periph *periph, union ccb *done_ccb)
 	if ((csio->ccb_h.status & CAM_STATUS_MASK) == CAM_REQ_CMP) {
 		uint16_t old_rate;
 
-		for (i = 0; i < sizeof(*ata_params) / 2; i++)
-			ptr[i] = le16toh(ptr[i]);
+		ata_param_fixup(ata_params);
 		if (ata_params->support_dsm & ATA_SUPPORT_DSM_TRIM &&
 		    (softc->quirks & DA_Q_NO_UNMAP) == 0) {
 			dadeleteflag(softc, DA_DELETE_ATA_TRIM, 1);
@@ -5231,7 +5314,6 @@ dadone_probeata(struct cam_periph *periph, union ccb *done_ccb)
 		}
 	}
 
-	free(ata_params, M_SCSIDA);
 	if ((softc->zone_mode == DA_ZONE_HOST_AWARE)
 	 || (softc->zone_mode == DA_ZONE_HOST_MANAGED)) {
 		/*
@@ -5256,8 +5338,8 @@ dadone_probeata(struct cam_periph *periph, union ccb *done_ccb)
 		continue_probe = 1;
 	}
 	if (continue_probe != 0) {
-		xpt_release_ccb(done_ccb);
 		xpt_schedule(periph, priority);
+		xpt_release_ccb(done_ccb);
 		return;
 	} else
 		daprobedone(periph, done_ccb);
@@ -5746,8 +5828,8 @@ dadone_tur(struct cam_periph *periph, union ccb *done_ccb)
 					 /*timeout*/0,
 					 /*getcount_only*/0);
 	}
-	xpt_release_ccb(done_ccb);
 	softc->flags &= ~DA_FLAG_TUR_PENDING;
+	xpt_release_ccb(done_ccb);
 	da_periph_release_locked(periph, DA_REF_TUR);
 	return;
 }
@@ -5759,6 +5841,8 @@ dareprobe(struct cam_periph *periph)
 	int status;
 
 	softc = (struct da_softc *)periph->softc;
+
+	cam_periph_assert(periph, MA_OWNED);
 
 	/* Probe in progress; don't interfere. */
 	if (softc->state != DA_STATE_NORMAL)
@@ -5865,6 +5949,7 @@ damediapoll(void *arg)
 
 	if (!cam_iosched_has_work_flags(softc->cam_iosched, DA_WORK_TUR) &&
 	    (softc->flags & DA_FLAG_TUR_PENDING) == 0 &&
+	    softc->state == DA_STATE_NORMAL &&
 	    LIST_EMPTY(&softc->pending_ccbs)) {
 		if (da_periph_acquire(periph, DA_REF_TUR) == 0) {
 			cam_iosched_set_work_flags(softc->cam_iosched, DA_WORK_TUR);
@@ -5935,9 +6020,15 @@ dasetgeom(struct cam_periph *periph, uint32_t block_len, uint64_t maxsector,
 		lbppbe = rcaplong->prot_lbppbe & SRC16_LBPPBE;
 		lalba = scsi_2btoul(rcaplong->lalba_lbp);
 		lalba &= SRC16_LALBA_A;
+		if (rcaplong->prot & SRC16_PROT_EN)
+			softc->p_type = ((rcaplong->prot & SRC16_P_TYPE) >>
+			    SRC16_P_TYPE_SHIFT) + 1;
+		else
+			softc->p_type = 0;
 	} else {
 		lbppbe = 0;
 		lalba = 0;
+		softc->p_type = 0;
 	}
 
 	if (lbppbe > 0) {

@@ -82,17 +82,17 @@ _Static_assert(offsetof(struct thread, td_flags) == 0xfc,
     "struct thread KBI td_flags");
 _Static_assert(offsetof(struct thread, td_pflags) == 0x104,
     "struct thread KBI td_pflags");
-_Static_assert(offsetof(struct thread, td_frame) == 0x470,
+_Static_assert(offsetof(struct thread, td_frame) == 0x478,
     "struct thread KBI td_frame");
-_Static_assert(offsetof(struct thread, td_emuldata) == 0x528,
+_Static_assert(offsetof(struct thread, td_emuldata) == 0x690,
     "struct thread KBI td_emuldata");
 _Static_assert(offsetof(struct proc, p_flag) == 0xb0,
     "struct proc KBI p_flag");
 _Static_assert(offsetof(struct proc, p_pid) == 0xbc,
     "struct proc KBI p_pid");
-_Static_assert(offsetof(struct proc, p_filemon) == 0x3d0,
+_Static_assert(offsetof(struct proc, p_filemon) == 0x3c8,
     "struct proc KBI p_filemon");
-_Static_assert(offsetof(struct proc, p_comm) == 0x3e8,
+_Static_assert(offsetof(struct proc, p_comm) == 0x3e0,
     "struct proc KBI p_comm");
 _Static_assert(offsetof(struct proc, p_emuldata) == 0x4c0,
     "struct proc KBI p_emuldata");
@@ -102,19 +102,19 @@ _Static_assert(offsetof(struct thread, td_flags) == 0x98,
     "struct thread KBI td_flags");
 _Static_assert(offsetof(struct thread, td_pflags) == 0xa0,
     "struct thread KBI td_pflags");
-_Static_assert(offsetof(struct thread, td_frame) == 0x2e8,
+_Static_assert(offsetof(struct thread, td_frame) == 0x2f0,
     "struct thread KBI td_frame");
-_Static_assert(offsetof(struct thread, td_emuldata) == 0x334,
+_Static_assert(offsetof(struct thread, td_emuldata) == 0x338,
     "struct thread KBI td_emuldata");
 _Static_assert(offsetof(struct proc, p_flag) == 0x68,
     "struct proc KBI p_flag");
 _Static_assert(offsetof(struct proc, p_pid) == 0x74,
     "struct proc KBI p_pid");
-_Static_assert(offsetof(struct proc, p_filemon) == 0x27c,
+_Static_assert(offsetof(struct proc, p_filemon) == 0x278,
     "struct proc KBI p_filemon");
-_Static_assert(offsetof(struct proc, p_comm) == 0x290,
+_Static_assert(offsetof(struct proc, p_comm) == 0x28c,
     "struct proc KBI p_comm");
-_Static_assert(offsetof(struct proc, p_emuldata) == 0x31c,
+_Static_assert(offsetof(struct proc, p_emuldata) == 0x318,
     "struct proc KBI p_emuldata");
 #endif
 
@@ -273,7 +273,6 @@ thread_init(void *mem, int size, int flags)
 	td->td_rlqe = NULL;
 	EVENTHANDLER_DIRECT_INVOKE(thread_init, td);
 	umtx_thread_init(td);
-	epoch_thread_init(td);
 	td->td_kstack = 0;
 	td->td_sel = NULL;
 	return (0);
@@ -293,7 +292,6 @@ thread_fini(void *mem, int size)
 	turnstile_free(td->td_turnstile);
 	sleepq_free(td->td_sleepqueue);
 	umtx_thread_fini(td);
-	epoch_thread_fini(td);
 	seltdfini(td);
 }
 
@@ -668,6 +666,9 @@ thread_link(struct thread *td, struct proc *p)
 	LIST_INIT(&td->td_contested);
 	LIST_INIT(&td->td_lprof[0]);
 	LIST_INIT(&td->td_lprof[1]);
+#ifdef EPOCH_TRACE
+	SLIST_INIT(&td->td_epochs);
+#endif
 	sigqueue_init(&td->td_sigqueue, p);
 	callout_init(&td->td_slpcallout, 1);
 	TAILQ_INSERT_TAIL(&p->p_threads, td, td_plist);
@@ -684,6 +685,10 @@ thread_unlink(struct thread *td)
 	struct proc *p = td->td_proc;
 
 	PROC_LOCK_ASSERT(p, MA_OWNED);
+#ifdef EPOCH_TRACE
+	MPASS(SLIST_EMPTY(&td->td_epochs));
+#endif
+
 	TAILQ_REMOVE(&p->p_threads, td, td_plist);
 	p->p_numthreads--;
 	/* could clear a few other things here */

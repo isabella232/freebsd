@@ -36,6 +36,7 @@ __umoddi3 U
 _exit U
 abort U
 access U
+bcmp U
 calloc U
 catclose U
 catgets U
@@ -49,6 +50,7 @@ dup U
 dup2 U
 environ U
 execv U
+execve U
 exit U
 fclose U
 fflush U
@@ -65,6 +67,7 @@ getcwd U
 getenv U
 getpagesize U
 getpid U
+getrlimit U
 gettimeofday U
 ioctl U
 isalpha U
@@ -101,6 +104,7 @@ rand U
 readlink U
 realloc U
 remove U
+setrlimit U
 setvbuf U
 sigfillset U
 sigprocmask U
@@ -125,10 +129,12 @@ strrchr U
 strsep U
 strtod_l U
 strtof_l U
+strtok_r U
 strtol U
 strtold_l U
 strtoll_l U
 strtoull_l U
+syscall U
 tcgetattr U
 uname U
 ungetc U

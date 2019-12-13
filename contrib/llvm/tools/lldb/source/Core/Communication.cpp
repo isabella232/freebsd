@@ -1,36 +1,35 @@
 //===-- Communication.cpp ---------------------------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
 #include "lldb/Core/Communication.h"
 
-#include "lldb/Core/Event.h"
-#include "lldb/Core/Listener.h"
 #include "lldb/Host/HostThread.h"
 #include "lldb/Host/ThreadLauncher.h"
 #include "lldb/Utility/Connection.h"
-#include "lldb/Utility/ConstString.h" // for ConstString
+#include "lldb/Utility/ConstString.h"
+#include "lldb/Utility/Event.h"
+#include "lldb/Utility/Listener.h"
 #include "lldb/Utility/Log.h"
-#include "lldb/Utility/Logging.h" // for LogIfAnyCategoriesSet, LIBLLDB...
-#include "lldb/Utility/Status.h"  // for Status
+#include "lldb/Utility/Logging.h"
+#include "lldb/Utility/Status.h"
 
-#include "llvm/ADT/None.h"         // for None
-#include "llvm/ADT/Optional.h"     // for Optional
-#include "llvm/Support/Compiler.h" // for LLVM_FALLTHROUGH
+#include "llvm/ADT/None.h"
+#include "llvm/ADT/Optional.h"
+#include "llvm/Support/Compiler.h"
 
-#include <algorithm> // for min
-#include <chrono>    // for duration, seconds
+#include <algorithm>
+#include <chrono>
 #include <cstring>
-#include <memory> // for shared_ptr
+#include <memory>
 
-#include <errno.h>    // for EIO
-#include <inttypes.h> // for PRIu64
-#include <stdio.h>    // for snprintf
+#include <errno.h>
+#include <inttypes.h>
+#include <stdio.h>
 
 using namespace lldb;
 using namespace lldb_private;
@@ -205,10 +204,23 @@ bool Communication::StartReadThread(Status *error_ptr) {
 
   m_read_thread_enabled = true;
   m_read_thread_did_exit = false;
-  m_read_thread = ThreadLauncher::LaunchThread(
-      thread_name, Communication::ReadThread, this, error_ptr);
+  auto maybe_thread = ThreadLauncher::LaunchThread(
+      thread_name, Communication::ReadThread, this);
+  if (maybe_thread) {
+    m_read_thread = *maybe_thread;
+  } else {
+    if (error_ptr)
+      *error_ptr = Status(maybe_thread.takeError());
+    else {
+      LLDB_LOG(lldb_private::GetLogIfAllCategoriesSet(LIBLLDB_LOG_HOST),
+               "failed to launch host thread: {}",
+               llvm::toString(maybe_thread.takeError()));
+    }
+  }
+
   if (!m_read_thread.IsJoinable())
     m_read_thread_enabled = false;
+
   return m_read_thread_enabled;
 }
 
@@ -360,7 +372,7 @@ lldb::thread_result_t Communication::ReadThread(lldb::thread_arg_t p) {
   // Let clients know that this thread is exiting
   comm->BroadcastEvent(eBroadcastBitNoMorePendingInput);
   comm->BroadcastEvent(eBroadcastBitReadThreadDidExit);
-  return NULL;
+  return {};
 }
 
 void Communication::SetReadThreadBytesReceivedCallback(

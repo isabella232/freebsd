@@ -2,7 +2,6 @@
  * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
  *
  * Copyright (c) 2018 Emmanuel Vadot <manu@FreeBSD.org>
- * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -61,7 +60,7 @@
 #define	RK805_LDO3_SLEEP_VSEL	0x40
 
 enum rk805_regulator {
-	RK805_DCDC1,
+	RK805_DCDC1 = 0,
 	RK805_DCDC2,
 	RK805_DCDC3,
 	RK805_DCDC4,
@@ -71,7 +70,7 @@ enum rk805_regulator {
 };
 
 enum rk808_regulator {
-	RK808_DCDC1,
+	RK808_DCDC1 = 0,
 	RK808_DCDC2,
 	RK808_DCDC3,
 	RK808_DCDC4,

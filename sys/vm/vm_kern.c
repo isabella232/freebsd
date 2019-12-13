@@ -124,8 +124,8 @@ SYSCTL_ULONG(_vm, OID_AUTO, max_kernel_address, CTLFLAG_RD,
 #if VM_NRESERVLEVEL > 0
 #define	KVA_QUANTUM_SHIFT	(VM_LEVEL_0_ORDER + PAGE_SHIFT)
 #else
-/* On non-superpage architectures want large import sizes. */
-#define	KVA_QUANTUM_SHIFT	(10 + PAGE_SHIFT)
+/* On non-superpage architectures we want large import sizes. */
+#define	KVA_QUANTUM_SHIFT	(8 + PAGE_SHIFT)
 #endif
 #define	KVA_QUANTUM		(1 << KVA_QUANTUM_SHIFT)
 
@@ -184,6 +184,7 @@ kmem_alloc_attr_domain(int domain, vm_size_t size, int flags, vm_paddr_t low,
 	vm_offset_t addr, i, offset;
 	vm_page_t m;
 	int pflags, tries;
+	vm_prot_t prot;
 
 	size = round_page(size);
 	vmem = vm_dom[domain].vmd_kernel_arena;
@@ -193,6 +194,7 @@ kmem_alloc_attr_domain(int domain, vm_size_t size, int flags, vm_paddr_t low,
 	pflags = malloc2vm_flags(flags) | VM_ALLOC_NOBUSY | VM_ALLOC_WIRED;
 	pflags &= ~(VM_ALLOC_NOWAIT | VM_ALLOC_WAITOK | VM_ALLOC_WAITFAIL);
 	pflags |= VM_ALLOC_NOWAIT;
+	prot = (flags & M_EXEC) != 0 ? VM_PROT_ALL : VM_PROT_RW;
 	VM_OBJECT_WLOCK(object);
 	for (i = 0; i < size; i += PAGE_SIZE) {
 		tries = 0;
@@ -220,8 +222,8 @@ retry:
 		if ((flags & M_ZERO) && (m->flags & PG_ZERO) == 0)
 			pmap_zero_page(m);
 		m->valid = VM_PAGE_BITS_ALL;
-		pmap_enter(kernel_pmap, addr + i, m, VM_PROT_RW,
-		    VM_PROT_RW | PMAP_ENTER_WIRED, 0);
+		pmap_enter(kernel_pmap, addr + i, m, prot,
+		    prot | PMAP_ENTER_WIRED, 0);
 	}
 	VM_OBJECT_WUNLOCK(object);
 	return (addr);
@@ -584,7 +586,7 @@ _kmem_unback(vm_object_t object, vm_offset_t addr, vm_size_t size)
 #endif
 	for (; offset < end; offset += PAGE_SIZE, m = next) {
 		next = vm_page_next(m);
-		vm_page_unwire(m, PQ_NONE);
+		vm_page_unwire_noq(m);
 		vm_page_free(m);
 	}
 	VM_OBJECT_WUNLOCK(object);
@@ -639,7 +641,8 @@ kmap_alloc_wait(vm_map_t map, vm_size_t size)
 		 * to lock out sleepers/wakers.
 		 */
 		vm_map_lock(map);
-		if (vm_map_findspace(map, vm_map_min(map), size, &addr) == 0)
+		addr = vm_map_findspace(map, vm_map_min(map), size);
+		if (addr + size <= vm_map_max(map))
 			break;
 		/* no space now; see if we can ever get space */
 		if (vm_map_max(map) - vm_map_min(map) < size) {
@@ -756,7 +759,7 @@ kmem_init(vm_offset_t start, vm_offset_t end)
 	vm_map_lock(m);
 	/* N.B.: cannot use kgdb to debug, starting with this assignment ... */
 	kernel_map = m;
-	(void) vm_map_insert(m, NULL, (vm_ooffset_t) 0,
+	(void)vm_map_insert(m, NULL, 0,
 #ifdef __amd64__
 	    KERNBASE,
 #else		     
@@ -764,6 +767,18 @@ kmem_init(vm_offset_t start, vm_offset_t end)
 #endif
 	    start, VM_PROT_ALL, VM_PROT_ALL, MAP_NOFAULT);
 	/* ... and ending with the completion of the above `insert' */
+
+#ifdef __amd64__
+	/*
+	 * Mark KVA used for the page array as allocated.  Other platforms
+	 * that handle vm_page_array allocation can simply adjust virtual_avail
+	 * instead.
+	 */
+	(void)vm_map_insert(m, NULL, 0, (vm_offset_t)vm_page_array,
+	    (vm_offset_t)vm_page_array + round_2mpage(vm_page_array_size *
+	    sizeof(struct vm_page)),
+	    VM_PROT_RW, VM_PROT_RW, MAP_NOFAULT);
+#endif
 	vm_map_unlock(m);
 
 	/*
@@ -819,6 +834,14 @@ kmem_bootstrap_free(vm_offset_t start, vm_size_t size)
 	end = trunc_page(start + size);
 	start = round_page(start);
 
+#ifdef __amd64__
+	/*
+	 * Preloaded files do not have execute permissions by default on amd64.
+	 * Restore the default permissions to ensure that the direct map alias
+	 * is updated.
+	 */
+	pmap_change_prot(start, end - start, VM_PROT_RW);
+#endif
 	for (va = start; va < end; va += PAGE_SIZE) {
 		pa = pmap_kextract(va);
 		m = PHYS_TO_VM_PAGE(pa);
@@ -836,7 +859,6 @@ kmem_bootstrap_free(vm_offset_t start, vm_size_t size)
 #endif
 }
 
-#ifdef DIAGNOSTIC
 /*
  * Allow userspace to directly trigger the VM drain routine for testing
  * purposes.
@@ -859,4 +881,3 @@ debug_vm_lowmem(SYSCTL_HANDLER_ARGS)
 
 SYSCTL_PROC(_debug, OID_AUTO, vm_lowmem, CTLTYPE_INT | CTLFLAG_RW, 0, 0,
     debug_vm_lowmem, "I", "set to trigger vm_lowmem event with given flags");
-#endif

@@ -1,9 +1,8 @@
 //===- PathDiagnostic.h - Path-Specific Diagnostic Handling -----*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -118,7 +117,7 @@ public:
     /// Only runs visitors, no output generated.
     None,
 
-    /// Used for HTML and text output.
+    /// Used for HTML, SARIF, and text output.
     Minimal,
 
     /// Used for plist output, used for "arrows" generation.
@@ -178,10 +177,9 @@ public:
   PathDiagnosticLocation() = default;
 
   /// Create a location corresponding to the given statement.
-  PathDiagnosticLocation(const Stmt *s,
-                         const SourceManager &sm,
+  PathDiagnosticLocation(const Stmt *s, const SourceManager &sm,
                          LocationOrAnalysisDeclContext lac)
-      : K(s->getLocStart().isValid() ? StmtK : SingleLocK),
+      : K(s->getBeginLoc().isValid() ? StmtK : SingleLocK),
         S(K == StmtK ? s : nullptr), SM(&sm),
         Loc(genLocation(SourceLocation(), lac)), Range(genRange(lac)) {
     assert(K == SingleLocK || S);
@@ -315,6 +313,8 @@ public:
 
   bool hasRange() const { return K == StmtK || K == RangeK || K == DeclK; }
 
+  bool hasValidLocation() const { return asLocation().isValid(); }
+
   void invalidate() {
     *this = PathDiagnosticLocation();
   }
@@ -367,7 +367,7 @@ public:
 
 class PathDiagnosticPiece: public llvm::FoldingSetNode {
 public:
-  enum Kind { ControlFlow, Event, Macro, Call, Note };
+  enum Kind { ControlFlow, Event, Macro, Call, Note, PopUp };
   enum DisplayHint { Above, Below };
 
 private:
@@ -470,7 +470,7 @@ public:
                           PathDiagnosticPiece::Kind k,
                           bool addPosRange = true)
       : PathDiagnosticPiece(s, k), Pos(pos) {
-    assert(Pos.isValid() && Pos.asLocation().isValid() &&
+    assert(Pos.isValid() && Pos.hasValidLocation() &&
            "PathDiagnosticSpotPiece's must have a valid location.");
     if (addPosRange && Pos.hasRange()) addRange(Pos.asRange());
   }
@@ -482,7 +482,7 @@ public:
 
   static bool classof(const PathDiagnosticPiece *P) {
     return P->getKind() == Event || P->getKind() == Macro ||
-           P->getKind() == Note;
+           P->getKind() == Note || P->getKind() == PopUp;
   }
 };
 
@@ -633,7 +633,7 @@ public:
   }
 
   static std::shared_ptr<PathDiagnosticCallPiece>
-  construct(const ExplodedNode *N, const CallExitEnd &CE,
+  construct(const CallExitEnd &CE,
             const SourceManager &SM);
 
   static PathDiagnosticCallPiece *construct(PathPieces &pieces,
@@ -746,7 +746,7 @@ public:
 class PathDiagnosticNotePiece: public PathDiagnosticSpotPiece {
 public:
   PathDiagnosticNotePiece(const PathDiagnosticLocation &Pos, StringRef S,
-                               bool AddPosRange = true)
+                          bool AddPosRange = true)
       : PathDiagnosticSpotPiece(Pos, S, Note, AddPosRange) {}
   ~PathDiagnosticNotePiece() override;
 
@@ -759,8 +759,24 @@ public:
   void Profile(llvm::FoldingSetNodeID &ID) const override;
 };
 
+class PathDiagnosticPopUpPiece: public PathDiagnosticSpotPiece {
+public:
+  PathDiagnosticPopUpPiece(const PathDiagnosticLocation &Pos, StringRef S,
+                           bool AddPosRange = true)
+      : PathDiagnosticSpotPiece(Pos, S, PopUp, AddPosRange) {}
+  ~PathDiagnosticPopUpPiece() override;
+
+  static bool classof(const PathDiagnosticPiece *P) {
+    return P->getKind() == PopUp;
+  }
+
+  void dump() const override;
+
+  void Profile(llvm::FoldingSetNodeID &ID) const override;
+};
+
 /// File IDs mapped to sets of line numbers.
-using FilesToLineNumsMap = std::map<unsigned, std::set<unsigned>>;
+using FilesToLineNumsMap = std::map<FileID, std::set<unsigned>>;
 
 /// PathDiagnostic - PathDiagnostic objects represent a single path-sensitive
 ///  diagnostic.  It represents an ordered-collection of PathDiagnosticPieces,
@@ -859,13 +875,13 @@ public:
   meta_iterator meta_end() const { return OtherDesc.end(); }
   void addMeta(StringRef s) { OtherDesc.push_back(s); }
 
-  using filesmap_iterator = FilesToLineNumsMap::const_iterator;
-
-  filesmap_iterator executedLines_begin() const {
-    return ExecutedLines->begin();
+  const FilesToLineNumsMap &getExecutedLines() const {
+    return *ExecutedLines;
   }
 
-  filesmap_iterator executedLines_end() const { return ExecutedLines->end(); }
+  FilesToLineNumsMap &getExecutedLines() {
+    return *ExecutedLines;
+  }
 
   PathDiagnosticLocation getLocation() const {
     return Loc;

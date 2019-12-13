@@ -203,10 +203,6 @@
 #define ATA_OP_FINISHED                 1
 #define ATA_MAX_28BIT_LBA               268435455UL
 
-#ifndef	ATA_REQUEST_TIMEOUT
-#define	ATA_REQUEST_TIMEOUT		10
-#endif
-
 /* structure used for composite atomic operations */
 #define MAX_COMPOSITES          32              /* u_int32_t bits */
 struct ata_composite {
@@ -481,7 +477,7 @@ const char *ata_mode2str(int mode);
 void ata_setmode(device_t dev);
 void ata_print_cable(device_t dev, u_int8_t *who);
 int ata_atapi(device_t dev, int target);
-void ata_timeout(struct ata_request *);
+void ata_timeout(void *);
 
 /* ata-lowlevel.c: */
 void ata_generic_hw(device_t dev);

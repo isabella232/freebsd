@@ -1,9 +1,8 @@
 //=-- lsan_interceptors.cc ------------------------------------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -84,6 +83,12 @@ INTERCEPTOR(void*, realloc, void *q, uptr size) {
   return lsan_realloc(q, size, stack);
 }
 
+INTERCEPTOR(void*, reallocarray, void *q, uptr nmemb, uptr size) {
+  ENSURE_LSAN_INITED;
+  GET_STACK_TRACE_MALLOC;
+  return lsan_reallocarray(q, nmemb, size, stack);
+}
+
 INTERCEPTOR(int, posix_memalign, void **memptr, uptr alignment, uptr size) {
   ENSURE_LSAN_INITED;
   GET_STACK_TRACE_MALLOC;
@@ -153,7 +158,7 @@ INTERCEPTOR(struct fake_mallinfo, mallinfo, void) {
 #define LSAN_MAYBE_INTERCEPT_MALLINFO INTERCEPT_FUNCTION(mallinfo)
 
 INTERCEPTOR(int, mallopt, int cmd, int value) {
-  return -1;
+  return 0;
 }
 #define LSAN_MAYBE_INTERCEPT_MALLOPT INTERCEPT_FUNCTION(mallopt)
 #else

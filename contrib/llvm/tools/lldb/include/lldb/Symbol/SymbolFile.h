@@ -1,9 +1,8 @@
 //===-- SymbolFile.h --------------------------------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -14,23 +13,31 @@
 #include "lldb/Symbol/CompilerDecl.h"
 #include "lldb/Symbol/CompilerDeclContext.h"
 #include "lldb/Symbol/CompilerType.h"
+#include "lldb/Symbol/Function.h"
+#include "lldb/Symbol/SourceModule.h"
 #include "lldb/Symbol/Type.h"
 #include "lldb/lldb-private.h"
 
 #include "llvm/ADT/DenseSet.h"
 
+#include <mutex>
+
+#if defined(LLDB_CONFIGURATION_DEBUG)
+#define ASSERT_MODULE_LOCK(expr) (expr->AssertModuleLock())
+#else
+#define ASSERT_MODULE_LOCK(expr) ((void)0)
+#endif
+
 namespace lldb_private {
 
 class SymbolFile : public PluginInterface {
 public:
-  //------------------------------------------------------------------
   // Symbol file ability bits.
   //
   // Each symbol file can claim to support one or more symbol file abilities.
   // These get returned from SymbolFile::GetAbilities(). These help us to
   // determine which plug-in will be best to load the debug information found
   // in files.
-  //------------------------------------------------------------------
   enum Abilities {
     CompileUnits = (1u << 0),
     LineTables = (1u << 1),
@@ -44,15 +51,12 @@ public:
 
   static SymbolFile *FindPlugin(ObjectFile *obj_file);
 
-  //------------------------------------------------------------------
   // Constructors and Destructors
-  //------------------------------------------------------------------
   SymbolFile(ObjectFile *obj_file)
       : m_obj_file(obj_file), m_abilities(0), m_calculated_abilities(false) {}
 
   ~SymbolFile() override {}
 
-  //------------------------------------------------------------------
   /// Get a mask of what this symbol file supports for the object file
   /// that it was constructed with.
   ///
@@ -76,11 +80,10 @@ public:
   /// for "void SymbolFile::InitializeObject()" which will get called
   /// on the SymbolFile object with the best set of abilities.
   ///
-  /// @return
+  /// \return
   ///     A uint32_t mask containing bits from the SymbolFile::Abilities
   ///     enumeration. Any bits that are set represent an ability that
   ///     this symbol plug-in can parse from the object file.
-  ///------------------------------------------------------------------
   uint32_t GetAbilities() {
     if (!m_calculated_abilities) {
       m_abilities = CalculateAbilities();
@@ -92,7 +95,10 @@ public:
 
   virtual uint32_t CalculateAbilities() = 0;
 
-  //------------------------------------------------------------------
+  /// Symbols file subclasses should override this to return the Module that
+  /// owns the TypeSystem that this symbol file modifies type information in.
+  virtual std::recursive_mutex &GetModuleMutex() const;
+
   /// Initialize the SymbolFile object.
   ///
   /// The SymbolFile object with the best set of abilities (detected
@@ -100,34 +106,45 @@ public:
   /// called if it is chosen to parse an object file. More complete
   /// initialization can happen in this function which will get called
   /// prior to any other functions in the SymbolFile protocol.
-  //------------------------------------------------------------------
   virtual void InitializeObject() {}
 
-  //------------------------------------------------------------------
   // Compile Unit function calls
-  //------------------------------------------------------------------
   // Approach 1 - iterator
   virtual uint32_t GetNumCompileUnits() = 0;
   virtual lldb::CompUnitSP ParseCompileUnitAtIndex(uint32_t index) = 0;
 
-  virtual lldb::LanguageType
-  ParseCompileUnitLanguage(const SymbolContext &sc) = 0;
-  virtual size_t ParseCompileUnitFunctions(const SymbolContext &sc) = 0;
-  virtual bool ParseCompileUnitLineTable(const SymbolContext &sc) = 0;
-  virtual bool ParseCompileUnitDebugMacros(const SymbolContext &sc) = 0;
-  virtual bool ParseCompileUnitSupportFiles(const SymbolContext &sc,
-                                            FileSpecList &support_files) = 0;
-  virtual bool
-  ParseCompileUnitIsOptimized(const lldb_private::SymbolContext &sc) {
-    return false;
-  }
+  virtual lldb::LanguageType ParseLanguage(CompileUnit &comp_unit) = 0;
+  virtual size_t ParseFunctions(CompileUnit &comp_unit) = 0;
+  virtual bool ParseLineTable(CompileUnit &comp_unit) = 0;
+  virtual bool ParseDebugMacros(CompileUnit &comp_unit) = 0;
+  virtual bool ParseSupportFiles(CompileUnit &comp_unit,
+                                 FileSpecList &support_files) = 0;
+  virtual size_t ParseTypes(CompileUnit &comp_unit) = 0;
+  virtual bool ParseIsOptimized(CompileUnit &comp_unit) { return false; }
+
   virtual bool
   ParseImportedModules(const SymbolContext &sc,
-                       std::vector<ConstString> &imported_modules) = 0;
-  virtual size_t ParseFunctionBlocks(const SymbolContext &sc) = 0;
-  virtual size_t ParseTypes(const SymbolContext &sc) = 0;
+                       std::vector<SourceModule> &imported_modules) = 0;
+  virtual size_t ParseBlocksRecursive(Function &func) = 0;
   virtual size_t ParseVariablesForContext(const SymbolContext &sc) = 0;
   virtual Type *ResolveTypeUID(lldb::user_id_t type_uid) = 0;
+
+
+  /// The characteristics of an array type.
+  struct ArrayInfo {
+    int64_t first_index = 0;
+    llvm::SmallVector<uint64_t, 1> element_orders;
+    uint32_t byte_stride = 0;
+    uint32_t bit_stride = 0;
+  };
+  /// If \c type_uid points to an array type, return its characteristics.
+  /// To support variable-length array types, this function takes an
+  /// optional \p ExtecutionContext. If \c exe_ctx is non-null, the
+  /// dynamic characteristics for that context are returned.
+  virtual llvm::Optional<ArrayInfo>
+  GetDynamicArrayInfoForUID(lldb::user_id_t type_uid,
+                            const lldb_private::ExecutionContext *exe_ctx) = 0;
+
   virtual bool CompleteType(CompilerType &compiler_type) = 0;
   virtual void ParseDeclsForContext(CompilerDeclContext decl_ctx) {}
   virtual CompilerDecl GetDeclForUID(lldb::user_id_t uid) {
@@ -140,30 +157,32 @@ public:
     return CompilerDeclContext();
   }
   virtual uint32_t ResolveSymbolContext(const Address &so_addr,
-                                        uint32_t resolve_scope,
+                                        lldb::SymbolContextItem resolve_scope,
                                         SymbolContext &sc) = 0;
   virtual uint32_t ResolveSymbolContext(const FileSpec &file_spec,
                                         uint32_t line, bool check_inlines,
-                                        uint32_t resolve_scope,
+                                        lldb::SymbolContextItem resolve_scope,
                                         SymbolContextList &sc_list);
+
+  virtual void DumpClangAST(Stream &s) {}
   virtual uint32_t
-  FindGlobalVariables(const ConstString &name,
+  FindGlobalVariables(ConstString name,
                       const CompilerDeclContext *parent_decl_ctx,
                       uint32_t max_matches, VariableList &variables);
   virtual uint32_t FindGlobalVariables(const RegularExpression &regex,
                                        uint32_t max_matches,
                                        VariableList &variables);
-  virtual uint32_t FindFunctions(const ConstString &name,
+  virtual uint32_t FindFunctions(ConstString name,
                                  const CompilerDeclContext *parent_decl_ctx,
-                                 uint32_t name_type_mask, bool include_inlines,
-                                 bool append, SymbolContextList &sc_list);
+                                 lldb::FunctionNameType name_type_mask,
+                                 bool include_inlines, bool append,
+                                 SymbolContextList &sc_list);
   virtual uint32_t FindFunctions(const RegularExpression &regex,
                                  bool include_inlines, bool append,
                                  SymbolContextList &sc_list);
   virtual uint32_t
-  FindTypes(const SymbolContext &sc, const ConstString &name,
-            const CompilerDeclContext *parent_decl_ctx, bool append,
-            uint32_t max_matches,
+  FindTypes(ConstString name, const CompilerDeclContext *parent_decl_ctx,
+            bool append, uint32_t max_matches,
             llvm::DenseSet<lldb_private::SymbolFile *> &searched_symbol_files,
             TypeMap &types);
   virtual size_t FindTypes(const std::vector<CompilerContext> &context,
@@ -177,7 +196,7 @@ public:
   //  types) = 0;
   virtual TypeList *GetTypeList();
   virtual size_t GetTypes(lldb_private::SymbolContextScope *sc_scope,
-                          uint32_t type_mask,
+                          lldb::TypeClass type_mask,
                           lldb_private::TypeList &type_list) = 0;
 
   virtual void PreloadSymbols();
@@ -186,7 +205,7 @@ public:
   GetTypeSystemForLanguage(lldb::LanguageType language);
 
   virtual CompilerDeclContext
-  FindNamespace(const SymbolContext &sc, const ConstString &name,
+  FindNamespace(ConstString name,
                 const CompilerDeclContext *parent_decl_ctx) {
     return CompilerDeclContext();
   }
@@ -194,15 +213,33 @@ public:
   ObjectFile *GetObjectFile() { return m_obj_file; }
   const ObjectFile *GetObjectFile() const { return m_obj_file; }
 
-  //------------------------------------------------------------------
+  virtual std::vector<CallEdge> ParseCallEdgesInFunction(UserID func_id) {
+    return {};
+  }
+
+  virtual void AddSymbols(Symtab &symtab) {}
+
   /// Notify the SymbolFile that the file addresses in the Sections
   /// for this module have been changed.
-  //------------------------------------------------------------------
   virtual void SectionFileAddressesChanged() {}
+
+  struct RegisterInfoResolver {
+    virtual ~RegisterInfoResolver(); // anchor
+
+    virtual const RegisterInfo *ResolveName(llvm::StringRef name) const = 0;
+    virtual const RegisterInfo *ResolveNumber(lldb::RegisterKind kind,
+                                              uint32_t number) const = 0;
+  };
+  virtual lldb::UnwindPlanSP
+  GetUnwindPlan(const Address &address, const RegisterInfoResolver &resolver) {
+    return nullptr;
+  }
 
   virtual void Dump(Stream &s) {}
 
 protected:
+  void AssertModuleLock();
+
   ObjectFile *m_obj_file; // The object file that symbols can be extracted from.
   uint32_t m_abilities;
   bool m_calculated_abilities;

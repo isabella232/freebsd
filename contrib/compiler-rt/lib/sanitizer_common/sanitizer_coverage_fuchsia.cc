@@ -1,9 +1,8 @@
 //===-- sanitizer_coverage_fuchsia.cc -------------------------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -31,6 +30,7 @@
 #include "sanitizer_atomic.h"
 #include "sanitizer_common.h"
 #include "sanitizer_internal_defs.h"
+#include "sanitizer_symbolizer_fuchsia.h"
 
 #include <zircon/process.h>
 #include <zircon/sanitizer.h>
@@ -101,7 +101,7 @@ class TracePcGuardController final {
       // uses the `dumpfile` symbolizer markup element to highlight the
       // dump.  See the explanation for this in:
       // https://fuchsia.googlesource.com/zircon/+/master/docs/symbolizer_markup.md
-      Printf("SanitizerCoverage: {{{dumpfile:%s:%s}}} with up to %u PCs\n",
+      Printf("SanitizerCoverage: " FORMAT_DUMPFILE " with up to %u PCs\n",
              kSancovSinkName, vmo_name_, next_index_ - 1);
     }
   }
@@ -132,7 +132,7 @@ class TracePcGuardController final {
       // The first sample goes at [1] to reserve [0] for the magic number.
       next_index_ = 1 + num_guards;
 
-      zx_status_t status = _zx_vmo_create(DataSize(), 0, &vmo_);
+      zx_status_t status = _zx_vmo_create(DataSize(), ZX_VMO_RESIZABLE, &vmo_);
       CHECK_EQ(status, ZX_OK);
 
       // Give the VMO a name including our process KOID so it's easy to spot.
@@ -146,9 +146,9 @@ class TracePcGuardController final {
       // indices, but we'll never move the mapping address so we don't have
       // any multi-thread synchronization issues with that.
       uintptr_t mapping;
-      status = _zx_vmar_map_old(_zx_vmar_root_self(), 0, vmo_, 0, MappingSize,
-                                ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE,
-                                &mapping);
+      status =
+          _zx_vmar_map(_zx_vmar_root_self(), ZX_VM_PERM_READ | ZX_VM_PERM_WRITE,
+                       0, vmo_, 0, MappingSize, &mapping);
       CHECK_EQ(status, ZX_OK);
 
       // Hereafter other threads are free to start storing into

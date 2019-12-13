@@ -200,7 +200,6 @@ extern int mp_ncpus;			/* system's total active cpu cores */
 #define OCE_IF_CAPABILITIES_NONE 	0
 
 
-#define ETH_ADDR_LEN			6
 #define MAX_VLANFILTER_SIZE		64
 #define MAX_VLANS			4096
 
@@ -1188,6 +1187,7 @@ static inline int MPU_EP_SEMAPHORE(POCE_SOFTC sc)
 #define PAGE_NUM_A2 0xa2
 #define IS_QNQ_OR_UMC(sc) ((sc->pvid && (sc->function_mode & FNM_UMC_MODE ))\
 		     || (sc->qnqid && (sc->function_mode & FNM_FLEX10_MODE)))
+extern uint8_t sfp_vpd_dump_buffer[TRANSCEIVER_DATA_SIZE];
 
 struct oce_rdma_info;
 extern struct oce_rdma_if *oce_rdma_if;

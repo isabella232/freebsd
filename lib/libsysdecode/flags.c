@@ -657,8 +657,18 @@ sysdecode_mlockall_flags(FILE *fp, int flags, int *rem)
 bool
 sysdecode_mmap_prot(FILE *fp, int prot, int *rem)
 {
+	int protm;
+	bool printed;
 
-	return (print_mask_int(fp, mmapprot, prot, rem));
+	printed = false;
+	protm = PROT_MAX_EXTRACT(prot);
+	if (protm != 0) {
+		fputs("PROT_MAX(", fp);
+		printed = print_mask_int(fp, mmapprot, protm, rem);
+		fputs(")|", fp);
+		prot = protm;
+	}
+	return (print_mask_int(fp, mmapprot, prot, rem) || printed);
 }
 
 bool
@@ -1208,7 +1218,7 @@ sysdecode_sctp_pr_policy(int policy)
 
 static struct name_table sctpsndflags[] = {
 	X(SCTP_EOF) X(SCTP_ABORT) X(SCTP_UNORDERED) X(SCTP_ADDR_OVER)
-	X(SCTP_SENDALL) X(SCTP_SACK_IMMEDIATELY) XEND
+	X(SCTP_SENDALL) X(SCTP_EOR) X(SCTP_SACK_IMMEDIATELY) XEND
 };
 
 bool

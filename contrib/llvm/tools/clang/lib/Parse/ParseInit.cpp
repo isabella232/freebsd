@@ -1,9 +1,8 @@
 //===--- ParseInit.cpp - Initializer Parsing ------------------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -66,15 +65,28 @@ bool Parser::MayBeDesignationStart() {
 
   // Parse up to (at most) the token after the closing ']' to determine
   // whether this is a C99 designator or a lambda.
-  TentativeParsingAction Tentative(*this);
+  RevertingTentativeParsingAction Tentative(*this);
 
   LambdaIntroducer Intro;
-  bool SkippedInits = false;
-  Optional<unsigned> DiagID(ParseLambdaIntroducer(Intro, &SkippedInits));
+  LambdaIntroducerTentativeParse ParseResult;
+  if (ParseLambdaIntroducer(Intro, &ParseResult)) {
+    // Hit and diagnosed an error in a lambda.
+    // FIXME: Tell the caller this happened so they can recover.
+    return true;
+  }
 
-  if (DiagID) {
-    // If this can't be a lambda capture list, it's a designator.
-    Tentative.Revert();
+  switch (ParseResult) {
+  case LambdaIntroducerTentativeParse::Success:
+  case LambdaIntroducerTentativeParse::Incomplete:
+    // Might be a lambda-expression. Keep looking.
+    // FIXME: If our tentative parse was not incomplete, parse the lambda from
+    // here rather than throwing away then reparsing the LambdaIntroducer.
+    break;
+
+  case LambdaIntroducerTentativeParse::MessageSend:
+  case LambdaIntroducerTentativeParse::Invalid:
+    // Can't be a lambda-expression. Treat it as a designator.
+    // FIXME: Should we disambiguate against a message-send?
     return true;
   }
 
@@ -83,11 +95,7 @@ bool Parser::MayBeDesignationStart() {
   // lambda expression. This decision favors lambdas over the older
   // GNU designator syntax, which allows one to omit the '=', but is
   // consistent with GCC.
-  tok::TokenKind Kind = Tok.getKind();
-  // FIXME: If we didn't skip any inits, parse the lambda from here
-  // rather than throwing away then reparsing the LambdaIntroducer.
-  Tentative.Revert();
-  return Kind == tok::equal;
+  return Tok.is(tok::equal);
 }
 
 static void CheckArrayDesignatorSyntax(Parser &P, SourceLocation Loc,
@@ -209,7 +217,7 @@ ExprResult Parser::ParseInitializerWithPotentialDesignator() {
     // send) or send to 'super', parse this as a message send
     // expression.  We handle C++ and C separately, since C++ requires
     // much more complicated parsing.
-    if  (getLangOpts().ObjC1 && getLangOpts().CPlusPlus) {
+    if  (getLangOpts().ObjC && getLangOpts().CPlusPlus) {
       // Send to 'super'.
       if (Tok.is(tok::identifier) && Tok.getIdentifierInfo() == Ident_super &&
           NextToken().isNot(tok::period) &&
@@ -242,7 +250,7 @@ ExprResult Parser::ParseInitializerWithPotentialDesignator() {
       // adopt the expression for further analysis below.
       // FIXME: potentially-potentially evaluated expression above?
       Idx = ExprResult(static_cast<Expr*>(TypeOrExpr));
-    } else if (getLangOpts().ObjC1 && Tok.is(tok::identifier)) {
+    } else if (getLangOpts().ObjC && Tok.is(tok::identifier)) {
       IdentifierInfo *II = Tok.getIdentifierInfo();
       SourceLocation IILoc = Tok.getLocation();
       ParsedType ReceiverType;
@@ -312,7 +320,7 @@ ExprResult Parser::ParseInitializerWithPotentialDesignator() {
     // tokens are '...' or ']' or an objc message send.  If this is an objc
     // message send, handle it now.  An objc-message send is the start of
     // an assignment-expression production.
-    if (getLangOpts().ObjC1 && Tok.isNot(tok::ellipsis) &&
+    if (getLangOpts().ObjC && Tok.isNot(tok::ellipsis) &&
         Tok.isNot(tok::r_square)) {
       CheckArrayDesignatorSyntax(*this, Tok.getLocation(), Desig);
       return ParseAssignmentExprWithObjCMessageExprStart(

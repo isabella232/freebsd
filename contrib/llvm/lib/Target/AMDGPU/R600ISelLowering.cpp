@@ -1,9 +1,8 @@
 //===-- R600ISelLowering.cpp - R600 DAG Lowering Implementation -----------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -589,7 +588,7 @@ SDValue R600TargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const 
     }
 
     case Intrinsic::r600_implicitarg_ptr: {
-      MVT PtrVT = getPointerTy(DAG.getDataLayout(), AMDGPUASI.PARAM_I_ADDRESS);
+      MVT PtrVT = getPointerTy(DAG.getDataLayout(), AMDGPUAS::PARAM_I_ADDRESS);
       uint32_t ByteOffset = getImplicitParameterOffset(MF, FIRST_IMPLICIT);
       return DAG.getConstant(ByteOffset, DL, PtrVT);
     }
@@ -741,12 +740,12 @@ SDValue R600TargetLowering::LowerGlobalAddress(AMDGPUMachineFunction *MFI,
                                                SDValue Op,
                                                SelectionDAG &DAG) const {
   GlobalAddressSDNode *GSD = cast<GlobalAddressSDNode>(Op);
-  if (GSD->getAddressSpace() != AMDGPUASI.CONSTANT_ADDRESS)
+  if (GSD->getAddressSpace() != AMDGPUAS::CONSTANT_ADDRESS)
     return AMDGPUTargetLowering::LowerGlobalAddress(MFI, Op, DAG);
 
   const DataLayout &DL = DAG.getDataLayout();
   const GlobalValue *GV = GSD->getGlobal();
-  MVT ConstPtrVT = getPointerTy(DL, AMDGPUASI.CONSTANT_ADDRESS);
+  MVT ConstPtrVT = getPointerTy(DL, AMDGPUAS::CONSTANT_ADDRESS);
 
   SDValue GA = DAG.getTargetGlobalAddress(GV, SDLoc(GSD), ConstPtrVT);
   return DAG.getNode(AMDGPUISD::CONST_DATA_PTR, SDLoc(GSD), ConstPtrVT, GA);
@@ -903,7 +902,7 @@ SDValue R600TargetLowering::LowerImplicitParameter(SelectionDAG &DAG, EVT VT,
                                                    unsigned DwordOffset) const {
   unsigned ByteOffset = DwordOffset * 4;
   PointerType * PtrType = PointerType::get(VT.getTypeForEVT(*DAG.getContext()),
-                                      AMDGPUASI.PARAM_I_ADDRESS);
+                                      AMDGPUAS::PARAM_I_ADDRESS);
 
   // We shouldn't be using an offset wider than 16-bits for implicit parameters.
   assert(isInt<16>(ByteOffset));
@@ -1141,7 +1140,7 @@ SDValue R600TargetLowering::lowerPrivateTruncStore(StoreSDNode *Store,
   //TODO: Who creates the i8 stores?
   assert(Store->isTruncatingStore()
          || Store->getValue().getValueType() == MVT::i8);
-  assert(Store->getAddressSpace() == AMDGPUASI.PRIVATE_ADDRESS);
+  assert(Store->getAddressSpace() == AMDGPUAS::PRIVATE_ADDRESS);
 
   SDValue Mask;
   if (Store->getMemoryVT() == MVT::i8) {
@@ -1175,7 +1174,7 @@ SDValue R600TargetLowering::lowerPrivateTruncStore(StoreSDNode *Store,
   // Load dword
   // TODO: can we be smarter about machine pointer info?
   MachinePointerInfo PtrInfo(UndefValue::get(
-      Type::getInt32PtrTy(*DAG.getContext(), AMDGPUASI.PRIVATE_ADDRESS)));
+      Type::getInt32PtrTy(*DAG.getContext(), AMDGPUAS::PRIVATE_ADDRESS)));
   SDValue Dst = DAG.getLoad(MVT::i32, DL, Chain, Ptr, PtrInfo);
 
   Chain = Dst.getValue(1);
@@ -1240,11 +1239,13 @@ SDValue R600TargetLowering::LowerSTORE(SDValue Op, SelectionDAG &DAG) const {
 
   SDLoc DL(Op);
 
+  const bool TruncatingStore = StoreNode->isTruncatingStore();
+
   // Neither LOCAL nor PRIVATE can do vectors at the moment
-  if ((AS == AMDGPUASI.LOCAL_ADDRESS || AS == AMDGPUASI.PRIVATE_ADDRESS) &&
+  if ((AS == AMDGPUAS::LOCAL_ADDRESS || AS == AMDGPUAS::PRIVATE_ADDRESS ||
+       TruncatingStore) &&
       VT.isVector()) {
-    if ((AS == AMDGPUASI.PRIVATE_ADDRESS) &&
-         StoreNode->isTruncatingStore()) {
+    if ((AS == AMDGPUAS::PRIVATE_ADDRESS) && TruncatingStore) {
       // Add an extra level of chain to isolate this vector
       SDValue NewChain = DAG.getNode(AMDGPUISD::DUMMY_CHAIN, DL, MVT::Other, Chain);
       // TODO: can the chain be replaced without creating a new store?
@@ -1260,17 +1261,18 @@ SDValue R600TargetLowering::LowerSTORE(SDValue Op, SelectionDAG &DAG) const {
 
   unsigned Align = StoreNode->getAlignment();
   if (Align < MemVT.getStoreSize() &&
-      !allowsMisalignedMemoryAccesses(MemVT, AS, Align, nullptr)) {
+      !allowsMisalignedMemoryAccesses(
+          MemVT, AS, Align, StoreNode->getMemOperand()->getFlags(), nullptr)) {
     return expandUnalignedStore(StoreNode, DAG);
   }
 
   SDValue DWordAddr = DAG.getNode(ISD::SRL, DL, PtrVT, Ptr,
                                   DAG.getConstant(2, DL, PtrVT));
 
-  if (AS == AMDGPUASI.GLOBAL_ADDRESS) {
+  if (AS == AMDGPUAS::GLOBAL_ADDRESS) {
     // It is beneficial to create MSKOR here instead of combiner to avoid
     // artificial dependencies introduced by RMW
-    if (StoreNode->isTruncatingStore()) {
+    if (TruncatingStore) {
       assert(VT.bitsLE(MVT::i32));
       SDValue MaskConstant;
       if (MemVT == MVT::i8) {
@@ -1310,8 +1312,8 @@ SDValue R600TargetLowering::LowerSTORE(SDValue Op, SelectionDAG &DAG) const {
       // Convert pointer from byte address to dword address.
       Ptr = DAG.getNode(AMDGPUISD::DWORDADDR, DL, PtrVT, DWordAddr);
 
-      if (StoreNode->isTruncatingStore() || StoreNode->isIndexed()) {
-        llvm_unreachable("Truncated and indexed stores not supported yet");
+      if (StoreNode->isIndexed()) {
+        llvm_unreachable("Indexed stores not supported yet");
       } else {
         Chain = DAG.getStore(Chain, DL, Value, Ptr, StoreNode->getMemOperand());
       }
@@ -1320,7 +1322,7 @@ SDValue R600TargetLowering::LowerSTORE(SDValue Op, SelectionDAG &DAG) const {
   }
 
   // GLOBAL_ADDRESS has been handled above, LOCAL_ADDRESS allows all sizes
-  if (AS != AMDGPUASI.PRIVATE_ADDRESS)
+  if (AS != AMDGPUAS::PRIVATE_ADDRESS)
     return SDValue();
 
   if (MemVT.bitsLT(MVT::i32))
@@ -1403,7 +1405,7 @@ SDValue R600TargetLowering::lowerPrivateExtLoad(SDValue Op,
   // Load dword
   // TODO: can we be smarter about machine pointer info?
   MachinePointerInfo PtrInfo(UndefValue::get(
-      Type::getInt32PtrTy(*DAG.getContext(), AMDGPUASI.PRIVATE_ADDRESS)));
+      Type::getInt32PtrTy(*DAG.getContext(), AMDGPUAS::PRIVATE_ADDRESS)));
   SDValue Read = DAG.getLoad(MVT::i32, DL, Chain, Ptr, PtrInfo);
 
   // Get offset within the register.
@@ -1441,7 +1443,7 @@ SDValue R600TargetLowering::LowerLOAD(SDValue Op, SelectionDAG &DAG) const {
   EVT MemVT = LoadNode->getMemoryVT();
   ISD::LoadExtType ExtType = LoadNode->getExtensionType();
 
-  if (AS == AMDGPUASI.PRIVATE_ADDRESS &&
+  if (AS == AMDGPUAS::PRIVATE_ADDRESS &&
       ExtType != ISD::NON_EXTLOAD && MemVT.bitsLT(MVT::i32)) {
     return lowerPrivateExtLoad(Op, DAG);
   }
@@ -1451,8 +1453,8 @@ SDValue R600TargetLowering::LowerLOAD(SDValue Op, SelectionDAG &DAG) const {
   SDValue Chain = LoadNode->getChain();
   SDValue Ptr = LoadNode->getBasePtr();
 
-  if ((LoadNode->getAddressSpace() == AMDGPUASI.LOCAL_ADDRESS ||
-      LoadNode->getAddressSpace() == AMDGPUASI.PRIVATE_ADDRESS) &&
+  if ((LoadNode->getAddressSpace() == AMDGPUAS::LOCAL_ADDRESS ||
+      LoadNode->getAddressSpace() == AMDGPUAS::PRIVATE_ADDRESS) &&
       VT.isVector()) {
       return scalarizeVectorLoad(LoadNode, DAG);
   }
@@ -1473,7 +1475,7 @@ SDValue R600TargetLowering::LowerLOAD(SDValue Op, SelectionDAG &DAG) const {
           DAG.getNode(ISD::SRL, DL, MVT::i32, Ptr,
                       DAG.getConstant(4, DL, MVT::i32)),
                       DAG.getConstant(LoadNode->getAddressSpace() -
-                                      AMDGPUASI.CONSTANT_BUFFER_0, DL, MVT::i32)
+                                      AMDGPUAS::CONSTANT_BUFFER_0, DL, MVT::i32)
           );
     }
 
@@ -1509,7 +1511,7 @@ SDValue R600TargetLowering::LowerLOAD(SDValue Op, SelectionDAG &DAG) const {
     return DAG.getMergeValues(MergedValues, DL);
   }
 
-  if (LoadNode->getAddressSpace() != AMDGPUASI.PRIVATE_ADDRESS) {
+  if (LoadNode->getAddressSpace() != AMDGPUAS::PRIVATE_ADDRESS) {
     return SDValue();
   }
 
@@ -1606,7 +1608,7 @@ SDValue R600TargetLowering::LowerFormalArguments(
     }
 
     PointerType *PtrTy = PointerType::get(VT.getTypeForEVT(*DAG.getContext()),
-                                          AMDGPUASI.PARAM_I_ADDRESS);
+                                          AMDGPUAS::PARAM_I_ADDRESS);
 
     // i64 isn't a legal type, so the register type used ends up as i32, which
     // isn't expected here. It attempts to create this sextload, but it ends up
@@ -1656,16 +1658,15 @@ EVT R600TargetLowering::getSetCCResultType(const DataLayout &DL, LLVMContext &,
 bool R600TargetLowering::canMergeStoresTo(unsigned AS, EVT MemVT,
                                           const SelectionDAG &DAG) const {
   // Local and Private addresses do not handle vectors. Limit to i32
-  if ((AS == AMDGPUASI.LOCAL_ADDRESS || AS == AMDGPUASI.PRIVATE_ADDRESS)) {
+  if ((AS == AMDGPUAS::LOCAL_ADDRESS || AS == AMDGPUAS::PRIVATE_ADDRESS)) {
     return (MemVT.getSizeInBits() <= 32);
   }
   return true;
 }
 
-bool R600TargetLowering::allowsMisalignedMemoryAccesses(EVT VT,
-                                                        unsigned AddrSpace,
-                                                        unsigned Align,
-                                                        bool *IsFast) const {
+bool R600TargetLowering::allowsMisalignedMemoryAccesses(
+    EVT VT, unsigned AddrSpace, unsigned Align, MachineMemOperand::Flags Flags,
+    bool *IsFast) const {
   if (IsFast)
     *IsFast = false;
 
@@ -1685,14 +1686,15 @@ bool R600TargetLowering::allowsMisalignedMemoryAccesses(EVT VT,
 static SDValue CompactSwizzlableVector(
   SelectionDAG &DAG, SDValue VectorEntry,
   DenseMap<unsigned, unsigned> &RemapSwizzle) {
-  assert(VectorEntry.getOpcode() == ISD::BUILD_VECTOR);
   assert(RemapSwizzle.empty());
-  SDValue NewBldVec[4] = {
-    VectorEntry.getOperand(0),
-    VectorEntry.getOperand(1),
-    VectorEntry.getOperand(2),
-    VectorEntry.getOperand(3)
-  };
+
+  SDLoc DL(VectorEntry);
+  EVT EltTy = VectorEntry.getValueType().getVectorElementType();
+
+  SDValue NewBldVec[4];
+  for (unsigned i = 0; i < 4; i++)
+    NewBldVec[i] = DAG.getNode(ISD::EXTRACT_VECTOR_ELT, DL, EltTy, VectorEntry,
+                               DAG.getIntPtrConstant(i, DL));
 
   for (unsigned i = 0; i < 4; i++) {
     if (NewBldVec[i].isUndef())
@@ -1712,6 +1714,12 @@ static SDValue CompactSwizzlableVector(
 
     if (NewBldVec[i].isUndef())
       continue;
+    // Fix spurious warning with gcc 7.3 -O3
+    //    warning: array subscript is above array bounds [-Warray-bounds]
+    //    if (NewBldVec[i] == NewBldVec[j]) {
+    //        ~~~~~~~~~~~^
+    if (i >= 4)
+      continue;
     for (unsigned j = 0; j < i; j++) {
       if (NewBldVec[i] == NewBldVec[j]) {
         NewBldVec[i] = DAG.getUNDEF(NewBldVec[i].getValueType());
@@ -1727,15 +1735,17 @@ static SDValue CompactSwizzlableVector(
 
 static SDValue ReorganizeVector(SelectionDAG &DAG, SDValue VectorEntry,
                                 DenseMap<unsigned, unsigned> &RemapSwizzle) {
-  assert(VectorEntry.getOpcode() == ISD::BUILD_VECTOR);
   assert(RemapSwizzle.empty());
-  SDValue NewBldVec[4] = {
-      VectorEntry.getOperand(0),
-      VectorEntry.getOperand(1),
-      VectorEntry.getOperand(2),
-      VectorEntry.getOperand(3)
-  };
-  bool isUnmovable[4] = { false, false, false, false };
+
+  SDLoc DL(VectorEntry);
+  EVT EltTy = VectorEntry.getValueType().getVectorElementType();
+
+  SDValue NewBldVec[4];
+  bool isUnmovable[4] = {false, false, false, false};
+  for (unsigned i = 0; i < 4; i++)
+    NewBldVec[i] = DAG.getNode(ISD::EXTRACT_VECTOR_ELT, DL, EltTy, VectorEntry,
+                               DAG.getIntPtrConstant(i, DL));
+
   for (unsigned i = 0; i < 4; i++) {
     RemapSwizzle[i] = i;
     if (NewBldVec[i].getOpcode() == ISD::EXTRACT_VECTOR_ELT) {
@@ -1766,7 +1776,6 @@ static SDValue ReorganizeVector(SelectionDAG &DAG, SDValue VectorEntry,
 SDValue R600TargetLowering::OptimizeSwizzle(SDValue BuildVector, SDValue Swz[4],
                                             SelectionDAG &DAG,
                                             const SDLoc &DL) const {
-  assert(BuildVector.getOpcode() == ISD::BUILD_VECTOR);
   // Old -> New swizzle values
   DenseMap<unsigned, unsigned> SwizzleRemap;
 

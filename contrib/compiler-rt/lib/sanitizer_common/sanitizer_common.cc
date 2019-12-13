@@ -1,9 +1,8 @@
 //===-- sanitizer_common.cc -----------------------------------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -336,11 +335,6 @@ SANITIZER_INTERFACE_ATTRIBUTE
 int __sanitizer_acquire_crash_state() {
   static atomic_uint8_t in_crash_state = {};
   return !atomic_exchange(&in_crash_state, 1, memory_order_relaxed);
-}
-
-SANITIZER_INTERFACE_ATTRIBUTE
-void __sanitizer_set_death_callback(void (*callback)(void)) {
-  SetUserDieCallback(callback);
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE

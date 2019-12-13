@@ -1,9 +1,8 @@
 //=== StackAddrEscapeChecker.cpp ----------------------------------*- C++ -*--//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -12,7 +11,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "ClangSACheckers.h"
+#include "clang/StaticAnalyzer/Checkers/BuiltinCheckerRegistration.h"
 #include "clang/AST/ExprCXX.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
@@ -79,17 +78,17 @@ SourceRange StackAddrEscapeChecker::genName(raw_ostream &os, const MemRegion *R,
     const CompoundLiteralExpr *CL = CR->getLiteralExpr();
     os << "stack memory associated with a compound literal "
           "declared on line "
-       << SM.getExpansionLineNumber(CL->getLocStart()) << " returned to caller";
+       << SM.getExpansionLineNumber(CL->getBeginLoc()) << " returned to caller";
     range = CL->getSourceRange();
   } else if (const auto *AR = dyn_cast<AllocaRegion>(R)) {
     const Expr *ARE = AR->getExpr();
-    SourceLocation L = ARE->getLocStart();
+    SourceLocation L = ARE->getBeginLoc();
     range = ARE->getSourceRange();
     os << "stack memory allocated by call to alloca() on line "
        << SM.getExpansionLineNumber(L);
   } else if (const auto *BR = dyn_cast<BlockDataRegion>(R)) {
     const BlockDecl *BD = BR->getCodeRegion()->getDecl();
-    SourceLocation L = BD->getLocStart();
+    SourceLocation L = BD->getBeginLoc();
     range = BD->getSourceRange();
     os << "stack-allocated block declared on line "
        << SM.getExpansionLineNumber(L);
@@ -360,11 +359,23 @@ void StackAddrEscapeChecker::checkEndFunction(const ReturnStmt *RS,
   }
 }
 
-#define REGISTER_CHECKER(name) \
-  void ento::register##name(CheckerManager &Mgr) { \
-    StackAddrEscapeChecker *Chk = \
-        Mgr.registerChecker<StackAddrEscapeChecker>(); \
-    Chk->ChecksEnabled[StackAddrEscapeChecker::CK_##name] = true; \
+void ento::registerStackAddrEscapeBase(CheckerManager &mgr) {
+  mgr.registerChecker<StackAddrEscapeChecker>();
+}
+
+bool ento::shouldRegisterStackAddrEscapeBase(const LangOptions &LO) {
+  return true;
+}
+
+#define REGISTER_CHECKER(name)                                                 \
+  void ento::register##name(CheckerManager &Mgr) {                             \
+    StackAddrEscapeChecker *Chk =                                              \
+        Mgr.getChecker<StackAddrEscapeChecker>();                              \
+    Chk->ChecksEnabled[StackAddrEscapeChecker::CK_##name] = true;              \
+  }                                                                            \
+                                                                               \
+  bool ento::shouldRegister##name(const LangOptions &LO) {                     \
+    return true;                                                               \
   }
 
 REGISTER_CHECKER(StackAddrEscapeChecker)

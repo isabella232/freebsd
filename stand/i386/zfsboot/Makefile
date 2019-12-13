@@ -27,6 +27,8 @@ CFLAGS+=-DBOOTPROG=\"zfsboot\" \
 	-I${ZFSSRC} \
 	-I${SYSDIR}/crypto/skein \
 	-I${SYSDIR}/cddl/boot/zfs \
+	-I${SYSDIR}/cddl/contrib/opensolaris/uts/common \
+	-I${SYSDIR}/cddl/contrib/opensolaris/common/lz4 \
 	-I${BOOTSRC}/i386/boot2 \
 	-Wall -Waggregate-return -Wbad-function-cast -Wno-cast-align \
 	-Wmissing-declarations -Wmissing-prototypes -Wnested-externs \
@@ -78,6 +80,3 @@ zfsboot.out: ${BTXCRT} zfsboot.o sio.o drv.o cons.o
 SRCS=	zfsboot.c
 
 .include <bsd.prog.mk>
-
-# XXX: clang integrated-as doesn't grok .codeNN directives yet
-CFLAGS.zfsldr.S=	${CLANG_NO_IAS}

@@ -1,9 +1,8 @@
 //===-- GDBRemoteCommunicationServerPlatform.cpp ----------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -11,25 +10,21 @@
 
 #include <errno.h>
 
-// C Includes
-// C++ Includes
 #include <chrono>
 #include <csignal>
 #include <cstring>
 #include <mutex>
 #include <sstream>
 
-// Other libraries and framework includes
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Threading.h"
 
 #include "lldb/Host/Config.h"
 #include "lldb/Host/ConnectionFileDescriptor.h"
+#include "lldb/Host/FileAction.h"
 #include "lldb/Host/Host.h"
 #include "lldb/Host/HostInfo.h"
-#include "lldb/Target/FileAction.h"
 #include "lldb/Target/Platform.h"
-#include "lldb/Target/Process.h"
 #include "lldb/Target/UnixSignals.h"
 #include "lldb/Utility/JSON.h"
 #include "lldb/Utility/Log.h"
@@ -38,16 +33,13 @@
 #include "lldb/Utility/StructuredData.h"
 #include "lldb/Utility/UriParser.h"
 
-// Project includes
 #include "lldb/Utility/StringExtractorGDBRemote.h"
 
 using namespace lldb;
 using namespace lldb_private;
 using namespace lldb_private::process_gdb_remote;
 
-//----------------------------------------------------------------------
 // GDBRemoteCommunicationServerPlatform constructor
-//----------------------------------------------------------------------
 GDBRemoteCommunicationServerPlatform::GDBRemoteCommunicationServerPlatform(
     const Socket::SocketProtocol socket_protocol, const char *socket_scheme)
     : GDBRemoteCommunicationServerCommon("gdb-remote.server",
@@ -91,9 +83,7 @@ GDBRemoteCommunicationServerPlatform::GDBRemoteCommunicationServerPlatform(
                         });
 }
 
-//----------------------------------------------------------------------
 // Destructor
-//----------------------------------------------------------------------
 GDBRemoteCommunicationServerPlatform::~GDBRemoteCommunicationServerPlatform() {}
 
 Status GDBRemoteCommunicationServerPlatform::LaunchGDBServer(
@@ -125,25 +115,24 @@ Status GDBRemoteCommunicationServerPlatform::LaunchGDBServer(
                 this, std::placeholders::_1),
       false);
 
-  llvm::StringRef platform_scheme;
-  llvm::StringRef platform_ip;
-  int platform_port;
-  llvm::StringRef platform_path;
-  std::string platform_uri = GetConnection()->GetURI();
-  bool ok = UriParser::Parse(platform_uri, platform_scheme, platform_ip,
-                             platform_port, platform_path);
-  UNUSED_IF_ASSERT_DISABLED(ok);
-  assert(ok);
-
   std::ostringstream url;
 // debugserver does not accept the URL scheme prefix.
 #if !defined(__APPLE__)
   url << m_socket_scheme << "://";
 #endif
   uint16_t *port_ptr = &port;
-  if (m_socket_protocol == Socket::ProtocolTcp)
+  if (m_socket_protocol == Socket::ProtocolTcp) {
+    llvm::StringRef platform_scheme;
+    llvm::StringRef platform_ip;
+    int platform_port;
+    llvm::StringRef platform_path;
+    std::string platform_uri = GetConnection()->GetURI();
+    bool ok = UriParser::Parse(platform_uri, platform_scheme, platform_ip,
+                               platform_port, platform_path);
+    UNUSED_IF_ASSERT_DISABLED(ok);
+    assert(ok);
     url << platform_ip.str() << ":" << port;
-  else {
+  } else {
     socket_name = GetDomainSocketPath("gdbserver").GetPath();
     url << socket_name;
     port_ptr = nullptr;
@@ -168,9 +157,6 @@ Status GDBRemoteCommunicationServerPlatform::LaunchGDBServer(
 GDBRemoteCommunication::PacketResult
 GDBRemoteCommunicationServerPlatform::Handle_qLaunchGDBServer(
     StringExtractorGDBRemote &packet) {
-#ifdef _WIN32
-  return SendErrorResponse(9);
-#else
   // Spawn a local debugserver as a platform so we can then attach or launch a
   // process...
 
@@ -214,17 +200,16 @@ GDBRemoteCommunicationServerPlatform::Handle_qLaunchGDBServer(
                   port + m_port_offset);
   if (!socket_name.empty()) {
     response.PutCString("socket_name:");
-    response.PutCStringAsRawHex8(socket_name.c_str());
+    response.PutStringAsRawHex8(socket_name);
     response.PutChar(';');
   }
 
   PacketResult packet_result = SendPacketNoLock(response.GetString());
   if (packet_result != PacketResult::Success) {
     if (debugserver_pid != LLDB_INVALID_PROCESS_ID)
-      ::kill(debugserver_pid, SIGINT);
+      Host::Kill(debugserver_pid, SIGINT);
   }
   return packet_result;
-#endif
 }
 
 GDBRemoteCommunication::PacketResult
@@ -407,7 +392,7 @@ GDBRemoteCommunicationServerPlatform::Handle_jSignalsInfo(
     StringExtractorGDBRemote &packet) {
   StructuredData::Array signal_array;
 
-  const auto &signals = Host::GetUnixSignals();
+  lldb::UnixSignalsSP signals = UnixSignals::CreateForHost();
   for (auto signo = signals->GetFirstSignalNumber();
        signo != LLDB_INVALID_SIGNAL_NUMBER;
        signo = signals->GetNextSignalNumber(signo)) {
@@ -532,7 +517,7 @@ const FileSpec &GDBRemoteCommunicationServerPlatform::GetDomainSocketDir() {
     const char *domainsocket_dir_env =
         ::getenv("LLDB_DEBUGSERVER_DOMAINSOCKET_DIR");
     if (domainsocket_dir_env != nullptr)
-      g_domainsocket_dir = FileSpec(domainsocket_dir_env, false);
+      g_domainsocket_dir = FileSpec(domainsocket_dir_env);
     else
       g_domainsocket_dir = HostInfo::GetProcessTempDir();
   });
@@ -542,15 +527,15 @@ const FileSpec &GDBRemoteCommunicationServerPlatform::GetDomainSocketDir() {
 
 FileSpec
 GDBRemoteCommunicationServerPlatform::GetDomainSocketPath(const char *prefix) {
-  llvm::SmallString<PATH_MAX> socket_path;
-  llvm::SmallString<PATH_MAX> socket_name(
+  llvm::SmallString<128> socket_path;
+  llvm::SmallString<128> socket_name(
       (llvm::StringRef(prefix) + ".%%%%%%").str());
 
   FileSpec socket_path_spec(GetDomainSocketDir());
   socket_path_spec.AppendPathComponent(socket_name.c_str());
 
   llvm::sys::fs::createUniqueFile(socket_path_spec.GetCString(), socket_path);
-  return FileSpec(socket_path.c_str(), false);
+  return FileSpec(socket_path.c_str());
 }
 
 void GDBRemoteCommunicationServerPlatform::SetPortOffset(uint16_t port_offset) {

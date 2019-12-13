@@ -1,6 +1,5 @@
 /*-
  * Copyright (c) 2016 Jared McNeill <jmcneill@invisible.ca>
- * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -35,6 +34,7 @@ __FBSDID("$FreeBSD$");
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/eventhandler.h>
 #include <sys/bus.h>
 #include <sys/rman.h>
 #include <sys/kernel.h>
@@ -728,3 +728,5 @@ static devclass_t aw_thermal_devclass;
 DRIVER_MODULE(aw_thermal, simplebus, aw_thermal_driver, aw_thermal_devclass,
     0, 0);
 MODULE_VERSION(aw_thermal, 1);
+MODULE_DEPEND(aw_thermal, aw_sid, 1, 1, 1);
+SIMPLEBUS_PNP_INFO(compat_data);

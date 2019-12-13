@@ -1,9 +1,8 @@
 //===-- MICmdArgValThreadGrp.cpp --------------------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -12,7 +11,6 @@
 #include "MICmdArgContext.h"
 
 //++
-//------------------------------------------------------------------------------------
 // Details: CMICmdArgValThreadGrp constructor.
 // Type:    Method.
 // Args:    None.
@@ -22,7 +20,6 @@
 CMICmdArgValThreadGrp::CMICmdArgValThreadGrp() : m_nThreadGrp(0) {}
 
 //++
-//------------------------------------------------------------------------------------
 // Details: CMICmdArgValThreadGrp constructor.
 // Type:    Method.
 // Args:    vrArgName       - (R) Argument's name to search by.
@@ -40,7 +37,6 @@ CMICmdArgValThreadGrp::CMICmdArgValThreadGrp(const CMIUtilString &vrArgName,
       m_nThreadGrp(0) {}
 
 //++
-//------------------------------------------------------------------------------------
 // Details: CMICmdArgValThreadGrp destructor.
 // Type:    Overridden.
 // Args:    None.
@@ -50,7 +46,6 @@ CMICmdArgValThreadGrp::CMICmdArgValThreadGrp(const CMIUtilString &vrArgName,
 CMICmdArgValThreadGrp::~CMICmdArgValThreadGrp() {}
 
 //++
-//------------------------------------------------------------------------------------
 // Details: Parse the command's argument options string and try to extract the
 // value *this
 //          argument is looking for.
@@ -100,7 +95,6 @@ bool CMICmdArgValThreadGrp::Validate(CMICmdArgContext &vwArgContext) {
 }
 
 //++
-//------------------------------------------------------------------------------------
 // Details: Examine the string and determine if it is a valid string type
 // argument.
 // Type:    Method.
@@ -115,14 +109,10 @@ bool CMICmdArgValThreadGrp::IsArgThreadGrp(const CMIUtilString &vrTxt) const {
     return false;
 
   const CMIUtilString strNum = vrTxt.substr(1);
-  if (!strNum.IsNumber())
-    return false;
-
-  return true;
+  return strNum.IsNumber();
 }
 
 //++
-//------------------------------------------------------------------------------------
 // Details: Extract the thread group number from the thread group argument.
 // Type:    Method.
 // Args:    vrTxt   - (R) Some text.
@@ -142,7 +132,6 @@ bool CMICmdArgValThreadGrp::ExtractNumber(const CMIUtilString &vrTxt) {
 }
 
 //++
-//------------------------------------------------------------------------------------
 // Details: Retrieve the thread group ID found in the argument.
 // Type:    Method.
 // Args:    None.

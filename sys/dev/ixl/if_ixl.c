@@ -122,7 +122,7 @@ static void	 ixl_if_vflr_handle(if_ctx_t ctx);
 #endif
 
 /*** Other ***/
-static int	 ixl_mc_filter_apply(void *arg, struct ifmultiaddr *ifma, int);
+static u_int	 ixl_mc_filter_apply(void *, struct sockaddr_dl *, u_int);
 static void	 ixl_save_pf_tunables(struct ixl_pf *);
 static int	 ixl_allocate_pci_resources(struct ixl_pf *);
 
@@ -299,7 +299,7 @@ int ixl_limit_iwarp_msix = IXL_IW_MAX_MSIX;
 #endif
 TUNABLE_INT("hw.ixl.limit_iwarp_msix", &ixl_limit_iwarp_msix);
 SYSCTL_INT(_hw_ixl, OID_AUTO, limit_iwarp_msix, CTLFLAG_RDTUN,
-    &ixl_limit_iwarp_msix, 0, "Limit MSIX vectors assigned to iWARP");
+    &ixl_limit_iwarp_msix, 0, "Limit MSI-X vectors assigned to iWARP");
 #endif
 
 extern struct if_txrx ixl_txrx_hwb;
@@ -684,14 +684,14 @@ ixl_if_attach_post(if_ctx_t ctx)
 			error = ixl_iw_pf_attach(pf);
 			if (error) {
 				device_printf(dev,
-				    "interfacing to iwarp driver failed: %d\n",
+				    "interfacing to iWARP driver failed: %d\n",
 				    error);
 				goto err;
 			} else
 				device_printf(dev, "iWARP ready\n");
 		} else
-			device_printf(dev,
-			    "iwarp disabled on this device (no msix vectors)\n");
+			device_printf(dev, "iWARP disabled on this device "
+			    "(no MSI-X vectors)\n");
 	} else {
 		pf->iw_enabled = false;
 		device_printf(dev, "The device is not iWARP enabled\n");
@@ -857,7 +857,7 @@ ixl_if_init(if_ctx_t ctx)
 	/* Set up RSS */
 	ixl_config_rss(pf);
 
-	/* Set up MSI/X routing and the ITR settings */
+	/* Set up MSI-X routing and the ITR settings */
 	if (vsi->shared->isc_intr == IFLIB_INTR_MSIX) {
 		ixl_configure_queue_intr_msix(pf);
 		ixl_configure_itr(pf);
@@ -932,7 +932,7 @@ ixl_if_msix_intr_assign(if_ctx_t ctx, int msix)
 		return (err);
 	}
 	/* Create soft IRQ for handling VFLRs */
-	iflib_softirq_alloc_generic(ctx, &pf->iov_irq, IFLIB_INTR_IOV, pf, 0, "iov");
+	iflib_softirq_alloc_generic(ctx, NULL, IFLIB_INTR_IOV, pf, 0, "iov");
 
 	/* Now set up the stations */
 	for (i = 0, vector = 1; i < vsi->shared->isc_nrxqsets; i++, vector++, rx_que++) {
@@ -1298,12 +1298,12 @@ ixl_if_multi_set(if_ctx_t ctx)
 	struct ixl_pf *pf = iflib_get_softc(ctx);
 	struct ixl_vsi *vsi = &pf->vsi;
 	struct i40e_hw *hw = vsi->hw;
-	int mcnt = 0, flags;
+	int mcnt, flags;
 	int del_mcnt;
 
 	IOCTL_DEBUGOUT("ixl_if_multi_set: begin");
 
-	mcnt = if_multiaddr_count(iflib_get_ifp(ctx), MAX_MULTICAST_ADDR);
+	mcnt = min(if_llmaddr_count(iflib_get_ifp(ctx)), MAX_MULTICAST_ADDR);
 	/* Delete filters for removed multicast addresses */
 	del_mcnt = ixl_del_multi(vsi);
 	vsi->num_macs -= del_mcnt;
@@ -1315,8 +1315,7 @@ ixl_if_multi_set(if_ctx_t ctx)
 	}
 	/* (re-)install filters for all mcast addresses */
 	/* XXX: This bypasses filter count tracking code! */
-	mcnt = if_multi_apply(iflib_get_ifp(ctx), ixl_mc_filter_apply, vsi);
-	
+	mcnt = if_foreach_llmaddr(iflib_get_ifp(ctx), ixl_mc_filter_apply, vsi);
 	if (mcnt > 0) {
 		vsi->num_macs += mcnt;
 		flags = (IXL_FILTER_ADD | IXL_FILTER_USED | IXL_FILTER_MC);
@@ -1504,8 +1503,8 @@ ixl_if_promisc_set(if_ctx_t ctx, int flags)
 
 	if (flags & IFF_PROMISC)
 		uni = multi = TRUE;
-	else if (flags & IFF_ALLMULTI ||
-		if_multiaddr_count(ifp, MAX_MULTICAST_ADDR) == MAX_MULTICAST_ADDR)
+	else if (flags & IFF_ALLMULTI || if_llmaddr_count(ifp) >=
+	    MAX_MULTICAST_ADDR)
 		multi = TRUE;
 
 	err = i40e_aq_set_vsi_unicast_promiscuous(hw,
@@ -1634,15 +1633,12 @@ ixl_if_priv_ioctl(if_ctx_t ctx, u_long command, caddr_t data)
 	return (error);
 }
 
-static int
-ixl_mc_filter_apply(void *arg, struct ifmultiaddr *ifma, int count __unused)
+static u_int
+ixl_mc_filter_apply(void *arg, struct sockaddr_dl *sdl, u_int count __unused)
 {
 	struct ixl_vsi *vsi = arg;
 
-	if (ifma->ifma_addr->sa_family != AF_LINK)
-		return (0);
-	ixl_add_mc_filter(vsi, 
-	    (u8*)LLADDR((struct sockaddr_dl *) ifma->ifma_addr));
+	ixl_add_mc_filter(vsi, (u8*)LLADDR(sdl));
 	return (1);
 }
 

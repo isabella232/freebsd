@@ -35,14 +35,15 @@
 __FBSDID("$FreeBSD$");
 
 #include <sys/param.h>
-#include <sys/systm.h>
+#include <sys/kernel.h>
+#include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
-#include <sys/kernel.h>
+#include <sys/mutex.h>
 #include <sys/queue.h>
 #include <sys/sbuf.h>
 #include <sys/sysctl.h>
-#include <sys/types.h>
+#include <sys/systm.h>
 
 #include <sys/bus.h>
 #include <machine/bus.h>
@@ -265,7 +266,7 @@ pccard_probe_and_attach_child(device_t dev, device_t child,
 	 * In NetBSD, the drivers are responsible for activating each
 	 * function of a card and selecting the config to use.  In
 	 * FreeBSD, all that's done automatically in the typical lazy
-	 * way we do device resoruce allocation (except we pick the
+	 * way we do device resource allocation (except we pick the
 	 * cfe up front).  This is the biggest depature from the
 	 * inherited NetBSD model, apart from the FreeBSD resource code.
 	 *
@@ -1272,13 +1273,16 @@ pccard_setup_intr(device_t dev, device_t child, struct resource *irq,
 
 	if (pf->intr_filter != NULL || pf->intr_handler != NULL)
 		panic("Only one interrupt handler per function allowed");
-	err = bus_generic_setup_intr(dev, child, irq, flags, pccard_filter, 
-	    intr ? pccard_intr : NULL, pf, cookiep);
-	if (err != 0)
-		return (err);
 	pf->intr_filter = filt;
 	pf->intr_handler = intr;
 	pf->intr_handler_arg = arg;
+	err = bus_generic_setup_intr(dev, child, irq, flags, pccard_filter,
+	    intr ? pccard_intr : NULL, pf, cookiep);
+	if (err != 0) {
+		pf->intr_filter = NULL;
+		pf->intr_handler = NULL;
+		return (err);
+	}
 	pf->intr_handler_cookie = *cookiep;
 	if (pccard_mfc(sc)) {
 		pccard_ccr_write(pf, PCCARD_CCR_OPTION,

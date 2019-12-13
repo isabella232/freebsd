@@ -1,9 +1,8 @@
 //===-- HexagonRegisterInfo.cpp - Hexagon Register Information ------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -118,18 +117,7 @@ HexagonRegisterInfo::getCalleeSavedRegs(const MachineFunction *MF) const {
 
   bool HasEHReturn = MF->getInfo<HexagonMachineFunctionInfo>()->hasEHReturn();
 
-  switch (MF->getSubtarget<HexagonSubtarget>().getHexagonArchVersion()) {
-  case Hexagon::ArchEnum::V4:
-  case Hexagon::ArchEnum::V5:
-  case Hexagon::ArchEnum::V55:
-  case Hexagon::ArchEnum::V60:
-  case Hexagon::ArchEnum::V62:
-  case Hexagon::ArchEnum::V65:
-    return HasEHReturn ? CalleeSavedRegsV3EHReturn : CalleeSavedRegsV3;
-  }
-
-  llvm_unreachable("Callee saved registers requested for unknown architecture "
-                   "version");
+  return HasEHReturn ? CalleeSavedRegsV3EHReturn : CalleeSavedRegsV3;
 }
 
 
@@ -298,7 +286,7 @@ unsigned HexagonRegisterInfo::getRARegister() const {
 }
 
 
-unsigned HexagonRegisterInfo::getFrameRegister(const MachineFunction
+Register HexagonRegisterInfo::getFrameRegister(const MachineFunction
                                                &MF) const {
   const HexagonFrameLowering *TFI = getFrameLowering(MF);
   if (TFI->hasFP(MF))
@@ -323,6 +311,7 @@ unsigned HexagonRegisterInfo::getHexagonSubRegIndex(
 
   static const unsigned ISub[] = { Hexagon::isub_lo, Hexagon::isub_hi };
   static const unsigned VSub[] = { Hexagon::vsub_lo, Hexagon::vsub_hi };
+  static const unsigned WSub[] = { Hexagon::wsub_lo, Hexagon::wsub_hi };
 
   switch (RC.getID()) {
     case Hexagon::CtrRegs64RegClassID:
@@ -330,6 +319,8 @@ unsigned HexagonRegisterInfo::getHexagonSubRegIndex(
       return ISub[GenIdx];
     case Hexagon::HvxWRRegClassID:
       return VSub[GenIdx];
+    case Hexagon::HvxVQRRegClassID:
+      return WSub[GenIdx];
   }
 
   if (const TargetRegisterClass *SuperRC = *RC.getSuperClasses())

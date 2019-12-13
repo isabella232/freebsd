@@ -791,8 +791,10 @@ mpr_user_pass_thru(struct mpr_softc *sc, mpr_pass_thru_t *data)
 			data->DataDirection = MPR_PASS_THRU_DIRECTION_READ;
 		else
 			data->DataOutSize = 0;
-	} else
-		return (EINVAL);
+	} else {
+		err = EINVAL;
+		goto RetFreeUnlocked;
+	}
 
 	mpr_dprint(sc, MPR_USER, "%s: req 0x%jx %d  rpl 0x%jx %d "
 	    "data in 0x%jx %d data out 0x%jx %d data dir %d\n", __func__,
@@ -1107,9 +1109,8 @@ mpr_user_pass_thru(struct mpr_softc *sc, mpr_pass_thru_t *data)
 				    SenseCount)), sizeof(struct
 				    scsi_sense_data));
 				mpr_unlock(sc);
-				copyout(cm->cm_sense,
-				    (PTRIN(data->PtrReply + sizeof(MPI2_SCSI_IO_REPLY))),
-				    sense_len);
+				copyout(cm->cm_sense, (PTRIN(data->PtrReply +
+				    sizeof(MPI2_SCSI_IO_REPLY))), sense_len);
 				mpr_lock(sc);
 			}
 		}

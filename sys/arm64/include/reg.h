@@ -42,7 +42,11 @@ struct reg {
 };
 
 struct reg32 {
-	int dummy;
+	unsigned int r[13];
+	unsigned int r_sp;
+	unsigned int r_lr;
+	unsigned int r_pc;
+	unsigned int r_cpsr;
 };
 
 struct fpreg {
@@ -56,7 +60,14 @@ struct fpreg32 {
 };
 
 struct dbreg {
-	int dummy;
+	uint32_t	db_info;
+	uint32_t	db_pad;
+
+	struct {
+		uint64_t dbr_addr;
+		uint32_t dbr_ctrl;
+		uint32_t dbr_pad;
+	} db_regs[16];
 };
 
 struct dbreg32 {

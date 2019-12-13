@@ -14,7 +14,7 @@ LIBADD=	z
 MAN=	libmagic.3 magic.5
 
 SRCS=	apprentice.c apptype.c ascmagic.c buffer.c cdf.c cdf_time.c \
-	compress.c der.c encoding.c fsmagic.c funcs.c \
+	compress.c der.c encoding.c fsmagic.c funcs.c is_json.c \
 	is_tar.c magic.c print.c readcdf.c readelf.c seccomp.c softmagic.c
 INCS=	magic.h
 
@@ -40,11 +40,18 @@ magic: ${MAGFILES}
 magic.mgc: mkmagic magic
 	${BTOOLSPATH:U.}/mkmagic magic
 
+.if ${MACHINE} == "host" || ${MK_DIRDEPS_BUILD} == "no"
 CLEANFILES+=	mkmagic
+DEPENDOBJS+=	mkmagic
 build-tools: mkmagic
 mkmagic: apprentice.c cdf_time.c encoding.c funcs.c magic.c print.c ${INCS} ${BUILD_TOOLS_META}
-	${CC:N${CCACHE_BIN}} ${CFLAGS} -DCOMPILE_ONLY ${LDFLAGS} -o ${.TARGET} ${.ALLSRC:N*.h} \
-	    ${LDADD}
+	${CC:N${CCACHE_BIN}} ${CFLAGS} -DCOMPILE_ONLY ${LDFLAGS} -o ${.TARGET} \
+	    ${.ALLSRC:N*.h:O:u} ${LDADD}
+
+.endif
+.if ${MK_DIRDEPS_BUILD} == "yes"
+BTOOLSPATH= ${HOST_OBJTOP}/${RELDIR}
+.endif
 
 FILEVER!= awk '$$1 == "\#define" && $$2 == "VERSION" { print $$3; exit }' \
 			${.CURDIR}/config.h

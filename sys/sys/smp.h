@@ -167,8 +167,10 @@ extern cpuset_t logical_cpus_mask;
 
 extern u_int mp_maxid;
 extern int mp_maxcpus;
+extern int mp_ncores;
 extern int mp_ncpus;
 extern volatile int smp_started;
+extern int smp_threads_per_core;
 
 extern cpuset_t all_cpus;
 extern cpuset_t cpuset_domain[MAXMEMDOM]; 	/* CPUs in each NUMA domain. */
@@ -262,6 +264,8 @@ extern	struct mtx smp_ipi_mtx;
 
 int	quiesce_all_cpus(const char *, int);
 int	quiesce_cpus(cpuset_t, const char *, int);
+void	quiesce_all_critical(void);
+void	cpus_fence_seq_cst(void);
 void	smp_no_rendezvous_barrier(void *);
 void	smp_rendezvous(void (*)(void *), 
 		       void (*)(void *),

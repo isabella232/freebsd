@@ -1,9 +1,8 @@
 //===- SearchableTableEmitter.cpp - Generate efficiently searchable tables -==//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -142,7 +141,7 @@ private:
   bool compareBy(Record *LHS, Record *RHS, const SearchIndex &Index);
 
   bool isIntegral(Init *I) {
-    return isa<BitsInit>(I) || isIntrinsic(I);
+    return isa<BitsInit>(I) || isa<CodeInit>(I) || isIntrinsic(I);
   }
 
   std::string searchableFieldType(const GenericField &Field, TypeContext Ctx) {
@@ -155,17 +154,15 @@ private:
     } else if (BitsRecTy *BI = dyn_cast<BitsRecTy>(Field.RecType)) {
       unsigned NumBits = BI->getNumBits();
       if (NumBits <= 8)
-        NumBits = 8;
-      else if (NumBits <= 16)
-        NumBits = 16;
-      else if (NumBits <= 32)
-        NumBits = 32;
-      else if (NumBits <= 64)
-        NumBits = 64;
-      else
-        PrintFatalError(Twine("bitfield '") + Field.Name +
-                        "' too large to search");
-      return "uint" + utostr(NumBits) + "_t";
+        return "uint8_t";
+      if (NumBits <= 16)
+        return "uint16_t";
+      if (NumBits <= 32)
+        return "uint32_t";
+      if (NumBits <= 64)
+        return "uint64_t";
+      PrintFatalError(Twine("bitfield '") + Field.Name +
+                      "' too large to search");
     } else if (Field.Enum || Field.IsIntrinsic || Field.IsInstruction)
       return "unsigned";
     PrintFatalError(Twine("Field '") + Field.Name + "' has unknown type '" +
@@ -430,6 +427,15 @@ void SearchableTableEmitter::emitLookupFunction(const GenericTable &Table,
          << ").compare(RHS." << Field.Name << ");\n";
       OS << "      if (Cmp" << Field.Name << " < 0) return true;\n";
       OS << "      if (Cmp" << Field.Name << " > 0) return false;\n";
+    } else if (Field.Enum) {
+      // Explicitly cast to unsigned, because the signedness of enums is
+      // compiler-dependent.
+      OS << "      if ((unsigned)LHS." << Field.Name << " < (unsigned)RHS."
+         << Field.Name << ")\n";
+      OS << "        return true;\n";
+      OS << "      if ((unsigned)LHS." << Field.Name << " > (unsigned)RHS."
+         << Field.Name << ")\n";
+      OS << "        return false;\n";
     } else {
       OS << "      if (LHS." << Field.Name << " < RHS." << Field.Name << ")\n";
       OS << "        return true;\n";
@@ -593,9 +599,10 @@ void SearchableTableEmitter::collectTableEntries(
     for (auto &Field : Table.Fields) {
       auto TI = dyn_cast<TypedInit>(EntryRec->getValueInit(Field.Name));
       if (!TI) {
-        PrintFatalError(Twine("Record '") + EntryRec->getName() +
-                        "' in table '" + Table.Name + "' is missing field '" +
-                        Field.Name + "'");
+        PrintFatalError(EntryRec->getLoc(),
+                        Twine("Record '") + EntryRec->getName() +
+                            "' in table '" + Table.Name +
+                            "' is missing field '" + Field.Name + "'");
       }
       if (!Field.RecType) {
         Field.RecType = TI->getType();
@@ -604,7 +611,7 @@ void SearchableTableEmitter::collectTableEntries(
         if (!Ty)
           PrintFatalError(Twine("Field '") + Field.Name + "' of table '" +
                           Table.Name + "' has incompatible type: " +
-                          Ty->getAsString() + " vs. " +
+                          Field.RecType->getAsString() + " vs. " +
                           TI->getType()->getAsString());
         Field.RecType = Ty;
       }
@@ -647,8 +654,8 @@ void SearchableTableEmitter::run(raw_ostream &OS) {
     StringRef FilterClass = EnumRec->getValueAsString("FilterClass");
     Enum->Class = Records.getClass(FilterClass);
     if (!Enum->Class)
-      PrintFatalError(Twine("Enum FilterClass '") + FilterClass +
-                      "' does not exist");
+      PrintFatalError(EnumRec->getLoc(), Twine("Enum FilterClass '") +
+                                             FilterClass + "' does not exist");
 
     collectEnumEntries(*Enum, NameField, ValueField,
                        Records.getAllDerivedDefinitions(FilterClass));
@@ -668,9 +675,10 @@ void SearchableTableEmitter::run(raw_ostream &OS) {
 
       if (auto TypeOfVal = TableRec->getValue(("TypeOf_" + FieldName).str())) {
         if (!parseFieldType(Table->Fields.back(), TypeOfVal->getValue())) {
-          PrintFatalError(Twine("Table '") + Table->Name +
-                          "' has bad 'TypeOf_" + FieldName + "': " +
-                          TypeOfVal->getValue()->getAsString());
+          PrintFatalError(TableRec->getLoc(),
+                          Twine("Table '") + Table->Name +
+                              "' has bad 'TypeOf_" + FieldName +
+                              "': " + TypeOfVal->getValue()->getAsString());
         }
       }
     }
@@ -698,8 +706,10 @@ void SearchableTableEmitter::run(raw_ostream &OS) {
     Record *TableRec = IndexRec->getValueAsDef("Table");
     auto It = TableMap.find(TableRec);
     if (It == TableMap.end())
-      PrintFatalError(Twine("SearchIndex '") + IndexRec->getName() +
-                      "' refers to non-existing table '" + TableRec->getName());
+      PrintFatalError(IndexRec->getLoc(),
+                      Twine("SearchIndex '") + IndexRec->getName() +
+                          "' refers to non-existing table '" +
+                          TableRec->getName());
 
     GenericTable &Table = *It->second;
     Table.Indices.push_back(parseSearchIndex(

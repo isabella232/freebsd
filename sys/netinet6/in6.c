@@ -84,6 +84,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/rmlock.h>
+#include <sys/sysctl.h>
 #include <sys/syslog.h>
 
 #include <net/if.h>
@@ -1388,13 +1389,15 @@ in6_notify_ifa(struct ifnet *ifp, struct in6_ifaddr *ia,
 	 * if this is its first address,
 	 */
 	if (hostIsNew != 0) {
-		IF_ADDR_RLOCK(ifp);
+		struct epoch_tracker et;
+
+		NET_EPOCH_ENTER(et);
 		CK_STAILQ_FOREACH(ifa, &ifp->if_addrhead, ifa_link) {
 			if (ifa->ifa_addr->sa_family != AF_INET6)
 				continue;
 			ifacount++;
 		}
-		IF_ADDR_RUNLOCK(ifp);
+		NET_EPOCH_EXIT(et);
 	}
 
 	if (ifacount <= 1 && ifp->if_ioctl) {
@@ -1474,7 +1477,8 @@ in6ifa_ifpforlinklocal(struct ifnet *ifp, int ignoreflags)
 {
 	struct ifaddr *ifa;
 
-	IF_ADDR_RLOCK(ifp);
+	NET_EPOCH_ASSERT();
+
 	CK_STAILQ_FOREACH(ifa, &ifp->if_addrhead, ifa_link) {
 		if (ifa->ifa_addr->sa_family != AF_INET6)
 			continue;
@@ -1486,7 +1490,6 @@ in6ifa_ifpforlinklocal(struct ifnet *ifp, int ignoreflags)
 			break;
 		}
 	}
-	IF_ADDR_RUNLOCK(ifp);
 
 	return ((struct in6_ifaddr *)ifa);
 }
@@ -1523,9 +1526,10 @@ in6ifa_ifwithaddr(const struct in6_addr *addr, uint32_t zoneid)
 struct in6_ifaddr *
 in6ifa_ifpwithaddr(struct ifnet *ifp, const struct in6_addr *addr)
 {
+	struct epoch_tracker et;
 	struct ifaddr *ifa;
 
-	IF_ADDR_RLOCK(ifp);
+	NET_EPOCH_ENTER(et);
 	CK_STAILQ_FOREACH(ifa, &ifp->if_addrhead, ifa_link) {
 		if (ifa->ifa_addr->sa_family != AF_INET6)
 			continue;
@@ -1534,7 +1538,7 @@ in6ifa_ifpwithaddr(struct ifnet *ifp, const struct in6_addr *addr)
 			break;
 		}
 	}
-	IF_ADDR_RUNLOCK(ifp);
+	NET_EPOCH_EXIT(et);
 
 	return ((struct in6_ifaddr *)ifa);
 }
@@ -1545,12 +1549,14 @@ in6ifa_ifpwithaddr(struct ifnet *ifp, const struct in6_addr *addr)
 struct in6_ifaddr *
 in6ifa_llaonifp(struct ifnet *ifp)
 {
+	struct epoch_tracker et;
 	struct sockaddr_in6 *sin6;
 	struct ifaddr *ifa;
 
+
 	if (ND_IFINFO(ifp)->flags & ND6_IFF_IFDISABLED)
 		return (NULL);
-	IF_ADDR_RLOCK(ifp);
+	NET_EPOCH_ENTER(et);
 	CK_STAILQ_FOREACH(ifa, &ifp->if_addrhead, ifa_link) {
 		if (ifa->ifa_addr->sa_family != AF_INET6)
 			continue;
@@ -1560,7 +1566,7 @@ in6ifa_llaonifp(struct ifnet *ifp)
 		    IN6_IS_ADDR_MC_NODELOCAL(&sin6->sin6_addr))
 			break;
 	}
-	IF_ADDR_RUNLOCK(ifp);
+	NET_EPOCH_EXIT(et);
 
 	return ((struct in6_ifaddr *)ifa);
 }
@@ -1700,22 +1706,20 @@ in6_ifhasaddr(struct ifnet *ifp, struct in6_addr *addr)
 	struct ifaddr *ifa;
 	struct in6_ifaddr *ia6;
 
+	NET_EPOCH_ASSERT();
+
 	in6 = *addr;
 	if (in6_clearscope(&in6))
 		return (0);
 	in6_setscope(&in6, ifp, NULL);
 
-	IF_ADDR_RLOCK(ifp);
 	CK_STAILQ_FOREACH(ifa, &ifp->if_addrhead, ifa_link) {
 		if (ifa->ifa_addr->sa_family != AF_INET6)
 			continue;
 		ia6 = (struct in6_ifaddr *)ifa;
-		if (IN6_ARE_ADDR_EQUAL(&ia6->ia_addr.sin6_addr, &in6)) {
-			IF_ADDR_RUNLOCK(ifp);
+		if (IN6_ARE_ADDR_EQUAL(&ia6->ia_addr.sin6_addr, &in6))
 			return (1);
-		}
 	}
-	IF_ADDR_RUNLOCK(ifp);
 
 	return (0);
 }
@@ -1824,6 +1828,8 @@ in6_ifawithifp(struct ifnet *ifp, struct in6_addr *dst)
 	struct in6_ifaddr *besta = NULL;
 	struct in6_ifaddr *dep[2];	/* last-resort: deprecated */
 
+	NET_EPOCH_ASSERT();
+
 	dep[0] = dep[1] = NULL;
 
 	/*
@@ -1832,7 +1838,6 @@ in6_ifawithifp(struct ifnet *ifp, struct in6_addr *dst)
 	 * If two or more, return one which matches the dst longest.
 	 * If none, return one of global addresses assigned other ifs.
 	 */
-	IF_ADDR_RLOCK(ifp);
 	CK_STAILQ_FOREACH(ifa, &ifp->if_addrhead, ifa_link) {
 		if (ifa->ifa_addr->sa_family != AF_INET6)
 			continue;
@@ -1866,7 +1871,6 @@ in6_ifawithifp(struct ifnet *ifp, struct in6_addr *dst)
 	}
 	if (besta) {
 		ifa_ref(&besta->ia_ifa);
-		IF_ADDR_RUNLOCK(ifp);
 		return (besta);
 	}
 
@@ -1887,23 +1891,19 @@ in6_ifawithifp(struct ifnet *ifp, struct in6_addr *dst)
 
 		if (ifa != NULL)
 			ifa_ref(ifa);
-		IF_ADDR_RUNLOCK(ifp);
 		return (struct in6_ifaddr *)ifa;
 	}
 
 	/* use the last-resort values, that are, deprecated addresses */
 	if (dep[0]) {
 		ifa_ref((struct ifaddr *)dep[0]);
-		IF_ADDR_RUNLOCK(ifp);
 		return dep[0];
 	}
 	if (dep[1]) {
 		ifa_ref((struct ifaddr *)dep[1]);
-		IF_ADDR_RUNLOCK(ifp);
 		return dep[1];
 	}
 
-	IF_ADDR_RUNLOCK(ifp);
 	return NULL;
 }
 
@@ -1913,10 +1913,11 @@ in6_ifawithifp(struct ifnet *ifp, struct in6_addr *dst)
 void
 in6_if_up(struct ifnet *ifp)
 {
+	struct epoch_tracker et;
 	struct ifaddr *ifa;
 	struct in6_ifaddr *ia;
 
-	IF_ADDR_RLOCK(ifp);
+	NET_EPOCH_ENTER(et);
 	CK_STAILQ_FOREACH(ifa, &ifp->if_addrhead, ifa_link) {
 		if (ifa->ifa_addr->sa_family != AF_INET6)
 			continue;
@@ -1932,7 +1933,7 @@ in6_if_up(struct ifnet *ifp)
 			    arc4random() % (MAX_RTR_SOLICITATION_DELAY * hz));
 		}
 	}
-	IF_ADDR_RUNLOCK(ifp);
+	NET_EPOCH_EXIT(et);
 
 	/*
 	 * special cases, like 6to4, are handled in in6_ifattach
@@ -1943,26 +1944,14 @@ in6_if_up(struct ifnet *ifp)
 int
 in6if_do_dad(struct ifnet *ifp)
 {
+
 	if ((ifp->if_flags & IFF_LOOPBACK) != 0)
 		return (0);
-
-	if ((ND_IFINFO(ifp)->flags & ND6_IFF_IFDISABLED) ||
-	    (ND_IFINFO(ifp)->flags & ND6_IFF_NO_DAD))
+	if ((ifp->if_flags & IFF_MULTICAST) == 0)
 		return (0);
-
-	/*
-	 * Our DAD routine requires the interface up and running.
-	 * However, some interfaces can be up before the RUNNING
-	 * status.  Additionally, users may try to assign addresses
-	 * before the interface becomes up (or running).
-	 * This function returns EAGAIN in that case.
-	 * The caller should mark "tentative" on the address instead of
-	 * performing DAD immediately.
-	 */
-	if (!((ifp->if_flags & IFF_UP) &&
-	    (ifp->if_drv_flags & IFF_DRV_RUNNING)))
-		return (EAGAIN);
-
+	if ((ND_IFINFO(ifp)->flags &
+	    (ND6_IFF_IFDISABLED | ND6_IFF_NO_DAD)) != 0)
+		return (0);
 	return (1);
 }
 
@@ -1973,10 +1962,11 @@ in6if_do_dad(struct ifnet *ifp)
 void
 in6_setmaxmtu(void)
 {
+	struct epoch_tracker et;
 	unsigned long maxmtu = 0;
 	struct ifnet *ifp;
 
-	IFNET_RLOCK_NOSLEEP();
+	NET_EPOCH_ENTER(et);
 	CK_STAILQ_FOREACH(ifp, &V_ifnet, if_link) {
 		/* this function can be called during ifnet initialization */
 		if (!ifp->if_afdata[AF_INET6])
@@ -1985,7 +1975,7 @@ in6_setmaxmtu(void)
 		    IN6_LINKMTU(ifp) > maxmtu)
 			maxmtu = IN6_LINKMTU(ifp);
 	}
-	IFNET_RUNLOCK_NOSLEEP();
+	NET_EPOCH_EXIT(et);
 	if (maxmtu)	/* update only when maxmtu is positive */
 		V_in6_maxmtu = maxmtu;
 }
@@ -2034,8 +2024,6 @@ in6_if2idlen(struct ifnet *ifp)
 		return (64);
 	}
 }
-
-#include <sys/sysctl.h>
 
 struct in6_llentry {
 	struct llentry		base;
@@ -2155,6 +2143,7 @@ in6_lltable_rtcheck(struct ifnet *ifp,
 	char ip6buf[INET6_ADDRSTRLEN];
 	int fibnum;
 
+	NET_EPOCH_ASSERT();
 	KASSERT(l3addr->sa_family == AF_INET6,
 	    ("sin_family %d", l3addr->sa_family));
 
@@ -2168,13 +2157,10 @@ in6_lltable_rtcheck(struct ifnet *ifp,
 		 * Create an ND6 cache for an IPv6 neighbor
 		 * that is not covered by our own prefix.
 		 */
-		NET_EPOCH_ENTER();
 		ifa = ifaof_ifpforaddr(l3addr, ifp);
 		if (ifa != NULL) {
-			NET_EPOCH_EXIT();
 			return 0;
 		}
-		NET_EPOCH_EXIT();
 		log(LOG_INFO, "IPv6 address: \"%s\" is not on the network\n",
 		    ip6_sprintf(ip6buf, &sin6->sin6_addr));
 		return EINVAL;
@@ -2315,16 +2301,13 @@ in6_lltable_lookup(struct lltable *llt, u_int flags,
 	IF_AFDATA_LOCK_ASSERT(llt->llt_ifp);
 	KASSERT(l3addr->sa_family == AF_INET6,
 	    ("sin_family %d", l3addr->sa_family));
+	KASSERT((flags & (LLE_UNLOCKED | LLE_EXCLUSIVE)) !=
+	    (LLE_UNLOCKED | LLE_EXCLUSIVE),
+	    ("wrong lle request flags: %#x", flags));
 
 	lle = in6_lltable_find_dst(llt, &sin6->sin6_addr);
-
 	if (lle == NULL)
 		return (NULL);
-
-	KASSERT((flags & (LLE_UNLOCKED|LLE_EXCLUSIVE)) !=
-	    (LLE_UNLOCKED|LLE_EXCLUSIVE),("wrong lle request flags: 0x%X",
-	    flags));
-
 	if (flags & LLE_UNLOCKED)
 		return (lle);
 
@@ -2332,6 +2315,18 @@ in6_lltable_lookup(struct lltable *llt, u_int flags,
 		LLE_WLOCK(lle);
 	else
 		LLE_RLOCK(lle);
+
+	/*
+	 * If the afdata lock is not held, the LLE may have been unlinked while
+	 * we were blocked on the LLE lock.  Check for this case.
+	 */
+	if (__predict_false((lle->la_flags & LLE_LINKED) == 0)) {
+		if (flags & LLE_EXCLUSIVE)
+			LLE_WUNLOCK(lle);
+		else
+			LLE_RUNLOCK(lle);
+		return (NULL);
+	}
 	return (lle);
 }
 

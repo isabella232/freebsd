@@ -1,9 +1,8 @@
 //===--- VTableBuilder.cpp - C++ vtable layout builder --------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -480,7 +479,7 @@ static bool HasSameVirtualSignature(const CXXMethodDecl *LHS,
   // Force the signatures to match.  We can't rely on the overrides
   // list here because there isn't necessarily an inheritance
   // relationship between the two methods.
-  if (LT->getTypeQuals() != RT->getTypeQuals())
+  if (LT->getMethodQuals() != RT->getMethodQuals())
     return false;
   return LT->getParamTypes() == RT->getParamTypes();
 }
@@ -847,6 +846,8 @@ private:
       : BaseOffset(CharUnits::Zero()),
       BaseOffsetInLayoutClass(CharUnits::Zero()),
       VTableIndex(0) { }
+
+    MethodInfo(MethodInfo const&) = default;
   };
 
   typedef llvm::DenseMap<const CXXMethodDecl *, MethodInfo> MethodInfoMapTy;
@@ -1061,8 +1062,7 @@ void ItaniumVTableBuilder::AddThunk(const CXXMethodDecl *MD,
   SmallVectorImpl<ThunkInfo> &ThunksVector = Thunks[MD];
 
   // Check if we have this thunk already.
-  if (std::find(ThunksVector.begin(), ThunksVector.end(), Thunk) !=
-      ThunksVector.end())
+  if (llvm::find(ThunksVector, Thunk) != ThunksVector.end())
     return;
 
   ThunksVector.push_back(Thunk);
@@ -1272,7 +1272,7 @@ ThisAdjustment ItaniumVTableBuilder::ComputeThisAdjustment(
       // We don't have vcall offsets for this virtual base, go ahead and
       // build them.
       VCallAndVBaseOffsetBuilder Builder(MostDerivedClass, MostDerivedClass,
-                                         /*FinalOverriders=*/nullptr,
+                                         /*Overriders=*/nullptr,
                                          BaseSubobject(Offset.VirtualBase,
                                                        CharUnits::Zero()),
                                          /*BaseIsVirtual=*/true,
@@ -2105,8 +2105,7 @@ void ItaniumVTableBuilder::dumpLayout(raw_ostream &Out) {
       const CXXMethodDecl *MD = I.second;
 
       ThunkInfoVectorTy ThunksVector = Thunks[MD];
-      llvm::sort(ThunksVector.begin(), ThunksVector.end(),
-                 [](const ThunkInfo &LHS, const ThunkInfo &RHS) {
+      llvm::sort(ThunksVector, [](const ThunkInfo &LHS, const ThunkInfo &RHS) {
         assert(LHS.Method == nullptr && RHS.Method == nullptr);
         return std::tie(LHS.This, LHS.Return) < std::tie(RHS.This, RHS.Return);
       });
@@ -2206,13 +2205,12 @@ VTableLayout::VTableLayout(ArrayRef<size_t> VTableIndices,
   else
     this->VTableIndices = OwningArrayRef<size_t>(VTableIndices);
 
-  llvm::sort(this->VTableThunks.begin(), this->VTableThunks.end(),
-             [](const VTableLayout::VTableThunkTy &LHS,
-                const VTableLayout::VTableThunkTy &RHS) {
-              assert((LHS.first != RHS.first || LHS.second == RHS.second) &&
-                     "Different thunks should have unique indices!");
-              return LHS.first < RHS.first;
-            });
+  llvm::sort(this->VTableThunks, [](const VTableLayout::VTableThunkTy &LHS,
+                                    const VTableLayout::VTableThunkTy &RHS) {
+    assert((LHS.first != RHS.first || LHS.second == RHS.second) &&
+           "Different thunks should have unique indices!");
+    return LHS.first < RHS.first;
+  });
 }
 
 VTableLayout::~VTableLayout() { }
@@ -2247,7 +2245,7 @@ ItaniumVTableContext::getVirtualBaseOffsetOffset(const CXXRecordDecl *RD,
   if (I != VirtualBaseClassOffsetOffsets.end())
     return I->second;
 
-  VCallAndVBaseOffsetBuilder Builder(RD, RD, /*FinalOverriders=*/nullptr,
+  VCallAndVBaseOffsetBuilder Builder(RD, RD, /*Overriders=*/nullptr,
                                      BaseSubobject(RD, CharUnits::Zero()),
                                      /*BaseIsVirtual=*/false,
                                      /*OffsetInLayoutClass=*/CharUnits::Zero());
@@ -2453,8 +2451,7 @@ private:
     SmallVector<ThunkInfo, 1> &ThunksVector = Thunks[MD];
 
     // Check if we have this thunk already.
-    if (std::find(ThunksVector.begin(), ThunksVector.end(), Thunk) !=
-        ThunksVector.end())
+    if (llvm::find(ThunksVector, Thunk) != ThunksVector.end())
       return;
 
     ThunksVector.push_back(Thunk);
@@ -3191,8 +3188,8 @@ void VFTableBuilder::dumpLayout(raw_ostream &Out) {
       const CXXMethodDecl *MD = MethodNameAndDecl.second;
 
       ThunkInfoVectorTy ThunksVector = Thunks[MD];
-      std::stable_sort(ThunksVector.begin(), ThunksVector.end(),
-                       [](const ThunkInfo &LHS, const ThunkInfo &RHS) {
+      llvm::stable_sort(ThunksVector, [](const ThunkInfo &LHS,
+                                         const ThunkInfo &RHS) {
         // Keep different thunks with the same adjustments in the order they
         // were put into the vector.
         return std::tie(LHS.This, LHS.Return) < std::tie(RHS.This, RHS.Return);
@@ -3345,8 +3342,7 @@ static bool rebucketPaths(VPtrInfoVector &Paths) {
   PathsSorted.reserve(Paths.size());
   for (auto& P : Paths)
     PathsSorted.push_back(*P);
-  llvm::sort(PathsSorted.begin(), PathsSorted.end(),
-             [](const VPtrInfo &LHS, const VPtrInfo &RHS) {
+  llvm::sort(PathsSorted, [](const VPtrInfo &LHS, const VPtrInfo &RHS) {
     return LHS.MangledPath < RHS.MangledPath;
   });
   bool Changed = false;
@@ -3409,10 +3405,9 @@ static void removeRedundantPaths(std::list<FullPathTy> &FullPaths) {
     for (const FullPathTy &OtherPath : FullPaths) {
       if (&SpecificPath == &OtherPath)
         continue;
-      if (std::all_of(SpecificPath.begin(), SpecificPath.end(),
-                      [&](const BaseSubobject &BSO) {
-                        return OtherPath.count(BSO) != 0;
-                      })) {
+      if (llvm::all_of(SpecificPath, [&](const BaseSubobject &BSO) {
+            return OtherPath.count(BSO) != 0;
+          })) {
         return true;
       }
     }
@@ -3488,10 +3483,9 @@ static const FullPathTy *selectBestPath(ASTContext &Context,
       // It's possible that the overrider isn't in this path.  If so, skip it
       // because this path didn't introduce it.
       const CXXRecordDecl *OverridingParent = OverridingMethod->getParent();
-      if (std::none_of(SpecificPath.begin(), SpecificPath.end(),
-                       [&](const BaseSubobject &BSO) {
-                         return BSO.getBase() == OverridingParent;
-                       }))
+      if (llvm::none_of(SpecificPath, [&](const BaseSubobject &BSO) {
+            return BSO.getBase() == OverridingParent;
+          }))
         continue;
       CurrentOverrides.insert(OverridingMethod);
     }

@@ -237,18 +237,7 @@ generic_netmap_unregister(struct netmap_adapter *na)
 		nm_os_catch_tx(gna, 0);
 	}
 
-	for_each_rx_kring_h(r, kring, na) {
-		if (nm_kring_pending_off(kring)) {
-			nm_prinf("Emulated adapter: ring '%s' deactivated", kring->name);
-			kring->nr_mode = NKR_NETMAP_OFF;
-		}
-	}
-	for_each_tx_kring_h(r, kring, na) {
-		if (nm_kring_pending_off(kring)) {
-			kring->nr_mode = NKR_NETMAP_OFF;
-			nm_prinf("Emulated adapter: ring '%s' deactivated", kring->name);
-		}
-	}
+	netmap_krings_mode_commit(na, /*onoff=*/0);
 
 	for_each_rx_kring(r, kring, na) {
 		/* Free the mbufs still pending in the RX queues,
@@ -371,19 +360,7 @@ generic_netmap_register(struct netmap_adapter *na, int enable)
 		}
 	}
 
-	for_each_rx_kring_h(r, kring, na) {
-		if (nm_kring_pending_on(kring)) {
-			nm_prinf("Emulated adapter: ring '%s' activated", kring->name);
-			kring->nr_mode = NKR_NETMAP_ON;
-		}
-
-	}
-	for_each_tx_kring_h(r, kring, na) {
-		if (nm_kring_pending_on(kring)) {
-			nm_prinf("Emulated adapter: ring '%s' activated", kring->name);
-			kring->nr_mode = NKR_NETMAP_ON;
-		}
-	}
+	netmap_krings_mode_commit(na, /*onoff=*/1);
 
 	for_each_tx_kring(r, kring, na) {
 		/* Initialize tx_pool and tx_event. */
@@ -692,6 +669,11 @@ generic_netmap_txsync(struct netmap_kring *kring, int flags)
 	if (nm_i != head) {	/* we have new packets to send */
 		struct nm_os_gen_arg a;
 		u_int event = -1;
+#ifdef __FreeBSD__
+		struct epoch_tracker et;
+
+		NET_EPOCH_ENTER(et);
+#endif
 
 		if (gna->txqdisc && nm_kr_txempty(kring)) {
 			/* In txqdisc mode, we ask for a delayed notification,
@@ -799,6 +781,10 @@ generic_netmap_txsync(struct netmap_kring *kring, int flags)
 		/* Update hwcur to the next slot to transmit. Here nm_i
 		 * is not necessarily head, we could break early. */
 		kring->nr_hwcur = nm_i;
+
+#ifdef __FreeBSD__
+		NET_EPOCH_EXIT(et);
+#endif
 	}
 
 	/*
@@ -1047,7 +1033,7 @@ generic_netmap_dtor(struct netmap_adapter *na)
 		         */
 		        netmap_adapter_put(prev_na);
 		}
-		nm_prinf("Native netmap adapter %p restored", prev_na);
+		nm_prinf("Native netmap adapter for %s restored", prev_na->name);
 	}
 	NM_RESTORE_NA(ifp, prev_na);
 	/*
@@ -1149,7 +1135,8 @@ generic_netmap_attach(struct ifnet *ifp)
 
 	nm_os_generic_set_features(gna);
 
-	nm_prinf("Emulated adapter for %s created (prev was %p)", na->name, gna->prev);
+	nm_prinf("Emulated adapter for %s created (prev was %s)", na->name,
+	    gna->prev ? gna->prev->name : "NULL");
 
 	return retval;
 }

@@ -1,16 +1,11 @@
 //===-- ThreadPlanCallFunction.cpp ------------------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
-// C Includes
-// C++ Includes
-// Other libraries and framework includes
-// Project includes
 #include "lldb/Target/ThreadPlanCallFunction.h"
 #include "lldb/Breakpoint/Breakpoint.h"
 #include "lldb/Breakpoint/BreakpointLocation.h"
@@ -29,12 +24,12 @@
 #include "lldb/Utility/Log.h"
 #include "lldb/Utility/Stream.h"
 
+#include <memory>
+
 using namespace lldb;
 using namespace lldb_private;
 
-//----------------------------------------------------------------------
 // ThreadPlanCallFunction: Plan to call a single function
-//----------------------------------------------------------------------
 bool ThreadPlanCallFunction::ConstructorSetup(
     Thread &thread, ABI *&abi, lldb::addr_t &start_load_addr,
     lldb::addr_t &function_load_addr) {
@@ -409,8 +404,8 @@ void ThreadPlanCallFunction::DidPush() {
   GetThread().SetStopInfoToNothing();
 
 #ifndef SINGLE_STEP_EXPRESSIONS
-  m_subplan_sp.reset(
-      new ThreadPlanRunToAddress(m_thread, m_start_addr, m_stop_other_threads));
+  m_subplan_sp = std::make_shared<ThreadPlanRunToAddress>(
+      m_thread, m_start_addr, m_stop_other_threads);
 
   m_thread.QueueThreadPlan(m_subplan_sp, false);
   m_subplan_sp->SetPrivate(true);

@@ -1,9 +1,8 @@
 //===-- ClangASTContext.cpp -------------------------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -12,13 +11,10 @@
 #include "llvm/Support/FormatAdapters.h"
 #include "llvm/Support/FormatVariadic.h"
 
-// C Includes
-// C++ Includes
 #include <mutex>
 #include <string>
 #include <vector>
 
-// Other libraries and framework includes
 
 // Clang headers like to use NDEBUG inside of them to enable/disable debug
 // related features using "#ifndef NDEBUG" preprocessor blocks to do one thing
@@ -56,6 +52,7 @@
 #include "clang/Basic/TargetOptions.h"
 #include "clang/Frontend/FrontendOptions.h"
 #include "clang/Frontend/LangStandard.h"
+#include "clang/Sema/Sema.h"
 
 #ifdef LLDB_DEFINED_NDEBUG_FOR_CLANG
 #undef NDEBUG
@@ -76,7 +73,6 @@
 #include "lldb/Core/DumpDataExtractor.h"
 #include "lldb/Core/Module.h"
 #include "lldb/Core/PluginManager.h"
-#include "lldb/Core/Scalar.h"
 #include "lldb/Core/StreamFile.h"
 #include "lldb/Core/ThreadSafeDenseMap.h"
 #include "lldb/Core/UniqueCStringMap.h"
@@ -90,14 +86,15 @@
 #include "lldb/Symbol/VerifyDecl.h"
 #include "lldb/Target/ExecutionContext.h"
 #include "lldb/Target/Language.h"
-#include "lldb/Target/ObjCLanguageRuntime.h"
 #include "lldb/Target/Process.h"
 #include "lldb/Target/Target.h"
 #include "lldb/Utility/DataExtractor.h"
 #include "lldb/Utility/LLDBAssert.h"
 #include "lldb/Utility/Log.h"
 #include "lldb/Utility/RegularExpression.h"
+#include "lldb/Utility/Scalar.h"
 
+#include "Plugins/LanguageRuntime/ObjC/ObjCLanguageRuntime.h"
 #include "Plugins/SymbolFile/DWARF/DWARFASTParserClang.h"
 #ifdef LLDB_ENABLE_ALL
 #include "Plugins/SymbolFile/PDB/PDBASTParser.h"
@@ -124,8 +121,204 @@ ClangASTContextSupportsLanguage(lldb::LanguageType language) {
          language == eLanguageTypeRust ||
          language == eLanguageTypeExtRenderScript ||
          // Use Clang for D until there is a proper language plugin for it
-         language == eLanguageTypeD;
+         language == eLanguageTypeD ||
+         // Open Dylan compiler debug info is designed to be Clang-compatible
+         language == eLanguageTypeDylan;
 }
+
+// Checks whether m1 is an overload of m2 (as opposed to an override). This is
+// called by addOverridesForMethod to distinguish overrides (which share a
+// vtable entry) from overloads (which require distinct entries).
+bool isOverload(clang::CXXMethodDecl *m1, clang::CXXMethodDecl *m2) {
+  // FIXME: This should detect covariant return types, but currently doesn't.
+  lldbassert(&m1->getASTContext() == &m2->getASTContext() &&
+             "Methods should have the same AST context");
+  clang::ASTContext &context = m1->getASTContext();
+
+  const auto *m1Type = llvm::cast<clang::FunctionProtoType>(
+      context.getCanonicalType(m1->getType()));
+
+  const auto *m2Type = llvm::cast<clang::FunctionProtoType>(
+      context.getCanonicalType(m2->getType()));
+
+  auto compareArgTypes = [&context](const clang::QualType &m1p,
+                                    const clang::QualType &m2p) {
+    return context.hasSameType(m1p.getUnqualifiedType(),
+                               m2p.getUnqualifiedType());
+  };
+
+  // FIXME: In C++14 and later, we can just pass m2Type->param_type_end()
+  //        as a fourth parameter to std::equal().
+  return (m1->getNumParams() != m2->getNumParams()) ||
+         !std::equal(m1Type->param_type_begin(), m1Type->param_type_end(),
+                     m2Type->param_type_begin(), compareArgTypes);
+}
+
+// If decl is a virtual method, walk the base classes looking for methods that
+// decl overrides. This table of overridden methods is used by IRGen to
+// determine the vtable layout for decl's parent class.
+void addOverridesForMethod(clang::CXXMethodDecl *decl) {
+  if (!decl->isVirtual())
+    return;
+
+  clang::CXXBasePaths paths;
+
+  auto find_overridden_methods =
+      [decl](const clang::CXXBaseSpecifier *specifier,
+             clang::CXXBasePath &path) {
+        if (auto *base_record = llvm::dyn_cast<clang::CXXRecordDecl>(
+                specifier->getType()->getAs<clang::RecordType>()->getDecl())) {
+
+          clang::DeclarationName name = decl->getDeclName();
+
+          // If this is a destructor, check whether the base class destructor is
+          // virtual.
+          if (name.getNameKind() == clang::DeclarationName::CXXDestructorName)
+            if (auto *baseDtorDecl = base_record->getDestructor()) {
+              if (baseDtorDecl->isVirtual()) {
+                path.Decls = baseDtorDecl;
+                return true;
+              } else
+                return false;
+            }
+
+          // Otherwise, search for name in the base class.
+          for (path.Decls = base_record->lookup(name); !path.Decls.empty();
+               path.Decls = path.Decls.slice(1)) {
+            if (auto *method_decl =
+                    llvm::dyn_cast<clang::CXXMethodDecl>(path.Decls.front()))
+              if (method_decl->isVirtual() && !isOverload(decl, method_decl)) {
+                path.Decls = method_decl;
+                return true;
+              }
+          }
+        }
+
+        return false;
+      };
+
+  if (decl->getParent()->lookupInBases(find_overridden_methods, paths)) {
+    for (auto *overridden_decl : paths.found_decls())
+      decl->addOverriddenMethod(
+          llvm::cast<clang::CXXMethodDecl>(overridden_decl));
+  }
+}
+}
+
+static lldb::addr_t GetVTableAddress(Process &process,
+                                     VTableContextBase &vtable_ctx,
+                                     ValueObject &valobj,
+                                     const ASTRecordLayout &record_layout) {
+  // Retrieve type info
+  CompilerType pointee_type;
+  CompilerType this_type(valobj.GetCompilerType());
+  uint32_t type_info = this_type.GetTypeInfo(&pointee_type);
+  if (!type_info)
+    return LLDB_INVALID_ADDRESS;
+
+  // Check if it's a pointer or reference
+  bool ptr_or_ref = false;
+  if (type_info & (eTypeIsPointer | eTypeIsReference)) {
+    ptr_or_ref = true;
+    type_info = pointee_type.GetTypeInfo();
+  }
+
+  // We process only C++ classes
+  const uint32_t cpp_class = eTypeIsClass | eTypeIsCPlusPlus;
+  if ((type_info & cpp_class) != cpp_class)
+    return LLDB_INVALID_ADDRESS;
+
+  // Calculate offset to VTable pointer
+  lldb::offset_t vbtable_ptr_offset =
+      vtable_ctx.isMicrosoft() ? record_layout.getVBPtrOffset().getQuantity()
+                               : 0;
+
+  if (ptr_or_ref) {
+    // We have a pointer / ref to object, so read
+    // VTable pointer from process memory
+
+    if (valobj.GetAddressTypeOfChildren() != eAddressTypeLoad)
+      return LLDB_INVALID_ADDRESS;
+
+    auto vbtable_ptr_addr = valobj.GetValueAsUnsigned(LLDB_INVALID_ADDRESS);
+    if (vbtable_ptr_addr == LLDB_INVALID_ADDRESS)
+      return LLDB_INVALID_ADDRESS;
+
+    vbtable_ptr_addr += vbtable_ptr_offset;
+
+    Status err;
+    return process.ReadPointerFromMemory(vbtable_ptr_addr, err);
+  }
+
+  // We have an object already read from process memory,
+  // so just extract VTable pointer from it
+
+  DataExtractor data;
+  Status err;
+  auto size = valobj.GetData(data, err);
+  if (err.Fail() || vbtable_ptr_offset + data.GetAddressByteSize() > size)
+    return LLDB_INVALID_ADDRESS;
+
+  return data.GetPointer(&vbtable_ptr_offset);
+}
+
+static int64_t ReadVBaseOffsetFromVTable(Process &process,
+                                         VTableContextBase &vtable_ctx,
+                                         lldb::addr_t vtable_ptr,
+                                         const CXXRecordDecl *cxx_record_decl,
+                                         const CXXRecordDecl *base_class_decl) {
+  if (vtable_ctx.isMicrosoft()) {
+    clang::MicrosoftVTableContext &msoft_vtable_ctx =
+        static_cast<clang::MicrosoftVTableContext &>(vtable_ctx);
+
+    // Get the index into the virtual base table. The
+    // index is the index in uint32_t from vbtable_ptr
+    const unsigned vbtable_index =
+        msoft_vtable_ctx.getVBTableIndex(cxx_record_decl, base_class_decl);
+    const lldb::addr_t base_offset_addr = vtable_ptr + vbtable_index * 4;
+    Status err;
+    return process.ReadSignedIntegerFromMemory(base_offset_addr, 4, INT64_MAX,
+                                               err);
+  }
+
+  clang::ItaniumVTableContext &itanium_vtable_ctx =
+      static_cast<clang::ItaniumVTableContext &>(vtable_ctx);
+
+  clang::CharUnits base_offset_offset =
+      itanium_vtable_ctx.getVirtualBaseOffsetOffset(cxx_record_decl,
+                                                    base_class_decl);
+  const lldb::addr_t base_offset_addr =
+      vtable_ptr + base_offset_offset.getQuantity();
+  const uint32_t base_offset_size = process.GetAddressByteSize();
+  Status err;
+  return process.ReadSignedIntegerFromMemory(base_offset_addr, base_offset_size,
+                                             INT64_MAX, err);
+}
+
+static bool GetVBaseBitOffset(VTableContextBase &vtable_ctx,
+                              ValueObject &valobj,
+                              const ASTRecordLayout &record_layout,
+                              const CXXRecordDecl *cxx_record_decl,
+                              const CXXRecordDecl *base_class_decl,
+                              int32_t &bit_offset) {
+  ExecutionContext exe_ctx(valobj.GetExecutionContextRef());
+  Process *process = exe_ctx.GetProcessPtr();
+  if (!process)
+    return false;
+
+  lldb::addr_t vtable_ptr =
+      GetVTableAddress(*process, vtable_ctx, valobj, record_layout);
+  if (vtable_ptr == LLDB_INVALID_ADDRESS)
+    return false;
+
+  auto base_offset = ReadVBaseOffsetFromVTable(
+      *process, vtable_ctx, vtable_ptr, cxx_record_decl, base_class_decl);
+  if (base_offset == INT64_MAX)
+    return false;
+
+  bit_offset = base_offset * 8;
+
+  return true;
 }
 
 typedef lldb_private::ThreadSafeDenseMap<clang::ASTContext *, ClangASTContext *>
@@ -383,7 +576,7 @@ static void ParseLangArgs(LangOptions &Opts, InputKind IK, const char *triple) {
   if (IK.getLanguage() == InputKind::Asm) {
     Opts.AsmPreprocessor = 1;
   } else if (IK.isObjectiveC()) {
-    Opts.ObjC1 = Opts.ObjC2 = 1;
+    Opts.ObjC = 1;
   }
 
   LangStandard::Kind LangStd = LangStandard::lang_unspecified;
@@ -463,19 +656,17 @@ static void ParseLangArgs(LangOptions &Opts, InputKind IK, const char *triple) {
 }
 
 ClangASTContext::ClangASTContext(const char *target_triple)
-    : TypeSystem(TypeSystem::eKindClang), m_target_triple(), m_ast_ap(),
-      m_language_options_ap(), m_source_manager_ap(), m_diagnostics_engine_ap(),
-      m_target_options_rp(), m_target_info_ap(), m_identifier_table_ap(),
-      m_selector_table_ap(), m_builtins_ap(), m_callback_tag_decl(nullptr),
+    : TypeSystem(TypeSystem::eKindClang), m_target_triple(), m_ast_up(),
+      m_language_options_up(), m_source_manager_up(), m_diagnostics_engine_up(),
+      m_target_options_rp(), m_target_info_up(), m_identifier_table_up(),
+      m_selector_table_up(), m_builtins_up(), m_callback_tag_decl(nullptr),
       m_callback_objc_decl(nullptr), m_callback_baton(nullptr),
       m_pointer_byte_size(0), m_ast_owned(false) {
   if (target_triple && target_triple[0])
     SetTargetTriple(target_triple);
 }
 
-//----------------------------------------------------------------------
 // Destructor
-//----------------------------------------------------------------------
 ClangASTContext::~ClangASTContext() { Finalize(); }
 
 ConstString ClangASTContext::GetPluginNameStatic() {
@@ -524,13 +715,13 @@ lldb::TypeSystemSP ClangASTContext::CreateInstance(lldb::LanguageType language,
             new ClangASTContextForExpressions(*target));
         if (ast_sp) {
           ast_sp->SetArchitecture(fixed_arch);
-          ast_sp->m_scratch_ast_source_ap.reset(
+          ast_sp->m_scratch_ast_source_up.reset(
               new ClangASTSource(target->shared_from_this()));
           lldbassert(ast_sp->getFileManager());
-          ast_sp->m_scratch_ast_source_ap->InstallASTContext(
+          ast_sp->m_scratch_ast_source_up->InstallASTContext(
               *ast_sp->getASTContext(), *ast_sp->getFileManager(), true);
           llvm::IntrusiveRefCntPtr<clang::ExternalASTSource> proxy_ast_source(
-              ast_sp->m_scratch_ast_source_ap->CreateProxy());
+              ast_sp->m_scratch_ast_source_up->CreateProxy());
           ast_sp->SetExternalSource(proxy_ast_source);
           return ast_sp;
         }
@@ -573,35 +764,41 @@ void ClangASTContext::Terminate() {
 }
 
 void ClangASTContext::Finalize() {
-  if (m_ast_ap.get()) {
-    GetASTMap().Erase(m_ast_ap.get());
+  if (m_ast_up) {
+    GetASTMap().Erase(m_ast_up.get());
     if (!m_ast_owned)
-      m_ast_ap.release();
+      m_ast_up.release();
   }
 
-  m_builtins_ap.reset();
-  m_selector_table_ap.reset();
-  m_identifier_table_ap.reset();
-  m_target_info_ap.reset();
+  m_builtins_up.reset();
+  m_selector_table_up.reset();
+  m_identifier_table_up.reset();
+  m_target_info_up.reset();
   m_target_options_rp.reset();
-  m_diagnostics_engine_ap.reset();
-  m_source_manager_ap.reset();
-  m_language_options_ap.reset();
-  m_ast_ap.reset();
-  m_scratch_ast_source_ap.reset();
+  m_diagnostics_engine_up.reset();
+  m_source_manager_up.reset();
+  m_language_options_up.reset();
+  m_ast_up.reset();
+  m_scratch_ast_source_up.reset();
 }
 
 void ClangASTContext::Clear() {
-  m_ast_ap.reset();
-  m_language_options_ap.reset();
-  m_source_manager_ap.reset();
-  m_diagnostics_engine_ap.reset();
+  m_ast_up.reset();
+  m_language_options_up.reset();
+  m_source_manager_up.reset();
+  m_diagnostics_engine_up.reset();
   m_target_options_rp.reset();
-  m_target_info_ap.reset();
-  m_identifier_table_ap.reset();
-  m_selector_table_ap.reset();
-  m_builtins_ap.reset();
+  m_target_info_up.reset();
+  m_identifier_table_up.reset();
+  m_selector_table_up.reset();
+  m_builtins_up.reset();
   m_pointer_byte_size = 0;
+}
+
+void ClangASTContext::setSema(Sema *s) {
+  // Ensure that the new sema actually belongs to our ASTContext.
+  assert(s == nullptr || &s->getASTContext() == m_ast_up.get());
+  m_sema = s;
 }
 
 const char *ClangASTContext::GetTargetTriple() {
@@ -625,12 +822,11 @@ bool ClangASTContext::HasExternalSource() {
 }
 
 void ClangASTContext::SetExternalSource(
-    llvm::IntrusiveRefCntPtr<ExternalASTSource> &ast_source_ap) {
+    llvm::IntrusiveRefCntPtr<ExternalASTSource> &ast_source_up) {
   ASTContext *ast = getASTContext();
   if (ast) {
-    ast->setExternalSource(ast_source_ap);
+    ast->setExternalSource(ast_source_up);
     ast->getTranslationUnitDecl()->setHasExternalLexicalStorage(true);
-    // ast->getTranslationUnitDecl()->setHasExternalVisibleStorage(true);
   }
 }
 
@@ -638,53 +834,52 @@ void ClangASTContext::RemoveExternalSource() {
   ASTContext *ast = getASTContext();
 
   if (ast) {
-    llvm::IntrusiveRefCntPtr<ExternalASTSource> empty_ast_source_ap;
-    ast->setExternalSource(empty_ast_source_ap);
+    llvm::IntrusiveRefCntPtr<ExternalASTSource> empty_ast_source_up;
+    ast->setExternalSource(empty_ast_source_up);
     ast->getTranslationUnitDecl()->setHasExternalLexicalStorage(false);
-    // ast->getTranslationUnitDecl()->setHasExternalVisibleStorage(false);
   }
 }
 
 void ClangASTContext::setASTContext(clang::ASTContext *ast_ctx) {
   if (!m_ast_owned) {
-    m_ast_ap.release();
+    m_ast_up.release();
   }
   m_ast_owned = false;
-  m_ast_ap.reset(ast_ctx);
+  m_ast_up.reset(ast_ctx);
   GetASTMap().Insert(ast_ctx, this);
 }
 
 ASTContext *ClangASTContext::getASTContext() {
-  if (m_ast_ap.get() == nullptr) {
+  if (m_ast_up == nullptr) {
     m_ast_owned = true;
-    m_ast_ap.reset(new ASTContext(*getLanguageOptions(), *getSourceManager(),
+    m_ast_up.reset(new ASTContext(*getLanguageOptions(), *getSourceManager(),
                                   *getIdentifierTable(), *getSelectorTable(),
                                   *getBuiltinContext()));
 
-    m_ast_ap->getDiagnostics().setClient(getDiagnosticConsumer(), false);
+    m_ast_up->getDiagnostics().setClient(getDiagnosticConsumer(), false);
 
     // This can be NULL if we don't know anything about the architecture or if
     // the target for an architecture isn't enabled in the llvm/clang that we
     // built
     TargetInfo *target_info = getTargetInfo();
     if (target_info)
-      m_ast_ap->InitBuiltinTypes(*target_info);
+      m_ast_up->InitBuiltinTypes(*target_info);
 
     if ((m_callback_tag_decl || m_callback_objc_decl) && m_callback_baton) {
-      m_ast_ap->getTranslationUnitDecl()->setHasExternalLexicalStorage();
-      // m_ast_ap->getTranslationUnitDecl()->setHasExternalVisibleStorage();
+      m_ast_up->getTranslationUnitDecl()->setHasExternalLexicalStorage();
+      // m_ast_up->getTranslationUnitDecl()->setHasExternalVisibleStorage();
     }
 
-    GetASTMap().Insert(m_ast_ap.get(), this);
+    GetASTMap().Insert(m_ast_up.get(), this);
 
-    llvm::IntrusiveRefCntPtr<clang::ExternalASTSource> ast_source_ap(
+    llvm::IntrusiveRefCntPtr<clang::ExternalASTSource> ast_source_up(
         new ClangExternalASTSourceCallbacks(
             ClangASTContext::CompleteTagDecl,
             ClangASTContext::CompleteObjCInterfaceDecl, nullptr,
             ClangASTContext::LayoutRecordType, this));
-    SetExternalSource(ast_source_ap);
+    SetExternalSource(ast_source_up);
   }
-  return m_ast_ap.get();
+  return m_ast_up.get();
 }
 
 ClangASTContext *ClangASTContext::GetASTContext(clang::ASTContext *ast) {
@@ -693,61 +888,62 @@ ClangASTContext *ClangASTContext::GetASTContext(clang::ASTContext *ast) {
 }
 
 Builtin::Context *ClangASTContext::getBuiltinContext() {
-  if (m_builtins_ap.get() == nullptr)
-    m_builtins_ap.reset(new Builtin::Context());
-  return m_builtins_ap.get();
+  if (m_builtins_up == nullptr)
+    m_builtins_up.reset(new Builtin::Context());
+  return m_builtins_up.get();
 }
 
 IdentifierTable *ClangASTContext::getIdentifierTable() {
-  if (m_identifier_table_ap.get() == nullptr)
-    m_identifier_table_ap.reset(
+  if (m_identifier_table_up == nullptr)
+    m_identifier_table_up.reset(
         new IdentifierTable(*ClangASTContext::getLanguageOptions(), nullptr));
-  return m_identifier_table_ap.get();
+  return m_identifier_table_up.get();
 }
 
 LangOptions *ClangASTContext::getLanguageOptions() {
-  if (m_language_options_ap.get() == nullptr) {
-    m_language_options_ap.reset(new LangOptions());
-    ParseLangArgs(*m_language_options_ap, InputKind::ObjCXX, GetTargetTriple());
-    //        InitializeLangOptions(*m_language_options_ap, InputKind::ObjCXX);
+  if (m_language_options_up == nullptr) {
+    m_language_options_up.reset(new LangOptions());
+    ParseLangArgs(*m_language_options_up, InputKind::ObjCXX, GetTargetTriple());
+    //        InitializeLangOptions(*m_language_options_up, InputKind::ObjCXX);
   }
-  return m_language_options_ap.get();
+  return m_language_options_up.get();
 }
 
 SelectorTable *ClangASTContext::getSelectorTable() {
-  if (m_selector_table_ap.get() == nullptr)
-    m_selector_table_ap.reset(new SelectorTable());
-  return m_selector_table_ap.get();
+  if (m_selector_table_up == nullptr)
+    m_selector_table_up.reset(new SelectorTable());
+  return m_selector_table_up.get();
 }
 
 clang::FileManager *ClangASTContext::getFileManager() {
-  if (m_file_manager_ap.get() == nullptr) {
+  if (m_file_manager_up == nullptr) {
     clang::FileSystemOptions file_system_options;
-    m_file_manager_ap.reset(new clang::FileManager(file_system_options));
+    m_file_manager_up.reset(new clang::FileManager(
+        file_system_options, FileSystem::Instance().GetVirtualFileSystem()));
   }
-  return m_file_manager_ap.get();
+  return m_file_manager_up.get();
 }
 
 clang::SourceManager *ClangASTContext::getSourceManager() {
-  if (m_source_manager_ap.get() == nullptr)
-    m_source_manager_ap.reset(
+  if (m_source_manager_up == nullptr)
+    m_source_manager_up.reset(
         new clang::SourceManager(*getDiagnosticsEngine(), *getFileManager()));
-  return m_source_manager_ap.get();
+  return m_source_manager_up.get();
 }
 
 clang::DiagnosticsEngine *ClangASTContext::getDiagnosticsEngine() {
-  if (m_diagnostics_engine_ap.get() == nullptr) {
+  if (m_diagnostics_engine_up == nullptr) {
     llvm::IntrusiveRefCntPtr<DiagnosticIDs> diag_id_sp(new DiagnosticIDs());
-    m_diagnostics_engine_ap.reset(
+    m_diagnostics_engine_up.reset(
         new DiagnosticsEngine(diag_id_sp, new DiagnosticOptions()));
   }
-  return m_diagnostics_engine_ap.get();
+  return m_diagnostics_engine_up.get();
 }
 
 clang::MangleContext *ClangASTContext::getMangleContext() {
-  if (m_mangle_ctx_ap.get() == nullptr)
-    m_mangle_ctx_ap.reset(getASTContext()->createMangleContext());
-  return m_mangle_ctx_ap.get();
+  if (m_mangle_ctx_up == nullptr)
+    m_mangle_ctx_up.reset(getASTContext()->createMangleContext());
+  return m_mangle_ctx_up.get();
 }
 
 class NullDiagnosticConsumer : public DiagnosticConsumer {
@@ -757,7 +953,7 @@ public:
   }
 
   void HandleDiagnostic(DiagnosticsEngine::Level DiagLevel,
-                        const clang::Diagnostic &info) {
+                        const clang::Diagnostic &info) override {
     if (m_log) {
       llvm::SmallVector<char, 32> diag_str(10);
       info.FormatDiagnostic(diag_str);
@@ -775,16 +971,16 @@ private:
 };
 
 DiagnosticConsumer *ClangASTContext::getDiagnosticConsumer() {
-  if (m_diagnostic_consumer_ap.get() == nullptr)
-    m_diagnostic_consumer_ap.reset(new NullDiagnosticConsumer);
+  if (m_diagnostic_consumer_up == nullptr)
+    m_diagnostic_consumer_up.reset(new NullDiagnosticConsumer);
 
-  return m_diagnostic_consumer_ap.get();
+  return m_diagnostic_consumer_up.get();
 }
 
 std::shared_ptr<clang::TargetOptions> &ClangASTContext::getTargetOptions() {
-  if (m_target_options_rp.get() == nullptr && !m_target_triple.empty()) {
+  if (m_target_options_rp == nullptr && !m_target_triple.empty()) {
     m_target_options_rp = std::make_shared<clang::TargetOptions>();
-    if (m_target_options_rp.get() != nullptr)
+    if (m_target_options_rp != nullptr)
       m_target_options_rp->Triple = m_target_triple;
   }
   return m_target_options_rp;
@@ -792,10 +988,10 @@ std::shared_ptr<clang::TargetOptions> &ClangASTContext::getTargetOptions() {
 
 TargetInfo *ClangASTContext::getTargetInfo() {
   // target_triple should be something like "x86_64-apple-macosx"
-  if (m_target_info_ap.get() == nullptr && !m_target_triple.empty())
-    m_target_info_ap.reset(TargetInfo::CreateTargetInfo(*getDiagnosticsEngine(),
+  if (m_target_info_up == nullptr && !m_target_triple.empty())
+    m_target_info_up.reset(TargetInfo::CreateTargetInfo(*getDiagnosticsEngine(),
                                                         getTargetOptions()));
-  return m_target_info_ap.get();
+  return m_target_info_up.get();
 }
 
 #pragma mark Basic Types
@@ -803,9 +999,7 @@ TargetInfo *ClangASTContext::getTargetInfo() {
 static inline bool QualTypeMatchesBitSize(const uint64_t bit_size,
                                           ASTContext *ast, QualType qual_type) {
   uint64_t qual_type_bit_size = ast->getTypeSize(qual_type);
-  if (qual_type_bit_size == bit_size)
-    return true;
-  return false;
+  return qual_type_bit_size == bit_size;
 }
 
 CompilerType
@@ -878,7 +1072,7 @@ CompilerType ClangASTContext::GetBuiltinTypeForEncodingAndBitSize(
 }
 
 lldb::BasicType
-ClangASTContext::GetBasicTypeEnumeration(const ConstString &name) {
+ClangASTContext::GetBasicTypeEnumeration(ConstString name) {
   if (name) {
     typedef UniqueCStringMap<lldb::BasicType> TypeNameToBasicTypeMap;
     static TypeNameToBasicTypeMap g_type_map;
@@ -944,7 +1138,7 @@ ClangASTContext::GetBasicTypeEnumeration(const ConstString &name) {
 }
 
 CompilerType ClangASTContext::GetBasicType(ASTContext *ast,
-                                           const ConstString &name) {
+                                           ConstString name) {
   if (ast) {
     lldb::BasicType basic_type = ClangASTContext::GetBasicTypeEnumeration(name);
     return ClangASTContext::GetBasicType(ast, basic_type);
@@ -954,9 +1148,10 @@ CompilerType ClangASTContext::GetBasicType(ASTContext *ast,
 
 uint32_t ClangASTContext::GetPointerByteSize() {
   if (m_pointer_byte_size == 0)
-    m_pointer_byte_size = GetBasicType(lldb::eBasicTypeVoid)
-                              .GetPointerType()
-                              .GetByteSize(nullptr);
+    if (auto size = GetBasicType(lldb::eBasicTypeVoid)
+                        .GetPointerType()
+                        .GetByteSize(nullptr))
+      m_pointer_byte_size = *size;
   return m_pointer_byte_size;
 }
 
@@ -1222,7 +1417,14 @@ clang::Decl *ClangASTContext::CopyDecl(ASTContext *dst_ast, ASTContext *src_ast,
   FileManager file_manager(file_system_options);
   ASTImporter importer(*dst_ast, file_manager, *src_ast, file_manager, false);
 
-  return importer.Import(source_decl);
+  if (llvm::Expected<clang::Decl *> ret_or_error =
+          importer.Import(source_decl)) {
+    return *ret_or_error;
+  } else {
+    Log *log = lldb_private::GetLogIfAllCategoriesSet(LIBLLDB_LOG_EXPRESSIONS);
+    LLDB_LOG_ERROR(log, ret_or_error.takeError(), "Couldn't import decl: {0}");
+    return nullptr;
+  }
 }
 
 bool ClangASTContext::AreTypesSame(CompilerType type1, CompilerType type2,
@@ -1362,25 +1564,24 @@ static TemplateParameterList *CreateTemplateParameterList(
     }
   }
 
-  if (template_param_infos.packed_args &&
-      template_param_infos.packed_args->args.size()) {
+  if (template_param_infos.packed_args) {
     IdentifierInfo *identifier_info = nullptr;
     if (template_param_infos.pack_name && template_param_infos.pack_name[0])
       identifier_info = &ast->Idents.get(template_param_infos.pack_name);
     const bool parameter_pack_true = true;
-    if (IsValueParam(template_param_infos.packed_args->args[0])) {
+
+    if (!template_param_infos.packed_args->args.empty() &&
+        IsValueParam(template_param_infos.packed_args->args[0])) {
       template_param_decls.push_back(NonTypeTemplateParmDecl::Create(
-          *ast, decl_context,
-          SourceLocation(), SourceLocation(), depth, num_template_params,
-          identifier_info,
+          *ast, decl_context, SourceLocation(), SourceLocation(), depth,
+          num_template_params, identifier_info,
           template_param_infos.packed_args->args[0].getIntegralType(),
           parameter_pack_true, nullptr));
     } else {
       template_param_decls.push_back(TemplateTypeParmDecl::Create(
-          *ast, decl_context,
-          SourceLocation(), SourceLocation(), depth, num_template_params,
-          identifier_info,
-          is_typename, parameter_pack_true));
+          *ast, decl_context, SourceLocation(), SourceLocation(), depth,
+          num_template_params, identifier_info, is_typename,
+          parameter_pack_true));
     }
   }
   clang::Expr *const requires_clause = nullptr; // TODO: Concepts
@@ -1416,10 +1617,11 @@ clang::FunctionTemplateDecl *ClangASTContext::CreateFunctionTemplateDecl(
 void ClangASTContext::CreateFunctionTemplateSpecializationInfo(
     FunctionDecl *func_decl, clang::FunctionTemplateDecl *func_tmpl_decl,
     const TemplateParameterInfos &infos) {
-  TemplateArgumentList template_args(TemplateArgumentList::OnStack, infos.args);
+  TemplateArgumentList *template_args_ptr =
+      TemplateArgumentList::CreateCopy(func_decl->getASTContext(), infos.args);
 
-  func_decl->setFunctionTemplateSpecialization(func_tmpl_decl, &template_args,
-                                               nullptr);
+  func_decl->setFunctionTemplateSpecialization(func_tmpl_decl,
+                                               template_args_ptr, nullptr);
 }
 
 ClassTemplateDecl *ClangASTContext::CreateClassTemplateDecl(
@@ -1468,6 +1670,7 @@ ClassTemplateDecl *ClangASTContext::CreateClassTemplateDecl(
       decl_ctx, // What decl context do we use here? TU? The actual decl
                 // context?
       SourceLocation(), decl_name, template_param_list, template_cxx_decl);
+  template_cxx_decl->setDescribedClassTemplate(class_template_decl);
 
   if (class_template_decl) {
     if (access_type != eAccessNone)
@@ -1677,8 +1880,7 @@ CompilerType ClangASTContext::CreateObjCClass(const char *name,
 }
 
 static inline bool BaseSpecifierIsEmpty(const CXXBaseSpecifier *b) {
-  return ClangASTContext::RecordHasFields(b->getType()->getAsCXXRecordDecl()) ==
-         false;
+  return !ClangASTContext::RecordHasFields(b->getType()->getAsCXXRecordDecl());
 }
 
 uint32_t
@@ -1706,9 +1908,8 @@ ClangASTContext::GetNumBaseClasses(const CXXRecordDecl *cxx_record_decl,
 
 #pragma mark Namespace Declarations
 
-NamespaceDecl *
-ClangASTContext::GetUniqueNamespaceDeclaration(const char *name,
-                                               DeclContext *decl_ctx) {
+NamespaceDecl *ClangASTContext::GetUniqueNamespaceDeclaration(
+    const char *name, DeclContext *decl_ctx, bool is_inline) {
   NamespaceDecl *namespace_decl = nullptr;
   ASTContext *ast = getASTContext();
   TranslationUnitDecl *translation_unit_decl = ast->getTranslationUnitDecl();
@@ -1726,7 +1927,7 @@ ClangASTContext::GetUniqueNamespaceDeclaration(const char *name,
     }
 
     namespace_decl =
-        NamespaceDecl::Create(*ast, decl_ctx, false, SourceLocation(),
+        NamespaceDecl::Create(*ast, decl_ctx, is_inline, SourceLocation(),
                               SourceLocation(), &identifier_info, nullptr);
 
     decl_ctx->addDecl(namespace_decl);
@@ -1756,7 +1957,8 @@ ClangASTContext::GetUniqueNamespaceDeclaration(const char *name,
         assert(namespace_decl ==
                parent_namespace_decl->getAnonymousNamespace());
       } else {
-        // BAD!!!
+        assert(false && "GetUniqueNamespaceDeclaration called with no name and "
+                        "no namespace as decl_ctx");
       }
     }
   }
@@ -1767,12 +1969,13 @@ ClangASTContext::GetUniqueNamespaceDeclaration(const char *name,
 }
 
 NamespaceDecl *ClangASTContext::GetUniqueNamespaceDeclaration(
-    clang::ASTContext *ast, const char *name, clang::DeclContext *decl_ctx) {
+    clang::ASTContext *ast, const char *name, clang::DeclContext *decl_ctx,
+    bool is_inline) {
   ClangASTContext *ast_ctx = ClangASTContext::GetASTContext(ast);
   if (ast_ctx == nullptr)
     return nullptr;
 
-  return ast_ctx->GetUniqueNamespaceDeclaration(name, decl_ctx);
+  return ast_ctx->GetUniqueNamespaceDeclaration(name, decl_ctx, is_inline);
 }
 
 clang::BlockDecl *
@@ -1971,7 +2174,7 @@ FunctionDecl *ClangASTContext::CreateFunctionDeclaration(
       *ast, decl_ctx, SourceLocation(), SourceLocation(), declarationName,
       ClangUtil::GetQualType(function_clang_type), nullptr,
       (clang::StorageClass)storage, is_inline, hasWrittenPrototype,
-      isConstexprSpecified);
+      isConstexprSpecified ? CSK_constexpr : CSK_unspecified);
   if (func_decl)
     decl_ctx->addDecl(func_decl);
 
@@ -1984,7 +2187,8 @@ FunctionDecl *ClangASTContext::CreateFunctionDeclaration(
 
 CompilerType ClangASTContext::CreateFunctionType(
     ASTContext *ast, const CompilerType &result_type, const CompilerType *args,
-    unsigned num_args, bool is_variadic, unsigned type_quals) {
+    unsigned num_args, bool is_variadic, unsigned type_quals,
+    clang::CallingConv cc) {
   if (ast == nullptr)
     return CompilerType(); // invalid AST
 
@@ -2012,9 +2216,10 @@ CompilerType ClangASTContext::CreateFunctionType(
 
   // TODO: Detect calling convention in DWARF?
   FunctionProtoType::ExtProtoInfo proto_info;
+  proto_info.ExtInfo = cc;
   proto_info.Variadic = is_variadic;
   proto_info.ExceptionSpec = EST_None;
-  proto_info.TypeQuals = type_quals;
+  proto_info.TypeQuals = clang::Qualifiers::fromFastMask(type_quals);
   proto_info.RefQualifier = RQ_None;
 
   return CompilerType(ast,
@@ -2023,14 +2228,17 @@ CompilerType ClangASTContext::CreateFunctionType(
 }
 
 ParmVarDecl *ClangASTContext::CreateParameterDeclaration(
-    const char *name, const CompilerType &param_type, int storage) {
+    clang::DeclContext *decl_ctx, const char *name,
+    const CompilerType &param_type, int storage) {
   ASTContext *ast = getASTContext();
   assert(ast != nullptr);
-  return ParmVarDecl::Create(*ast, ast->getTranslationUnitDecl(),
-                             SourceLocation(), SourceLocation(),
-                             name && name[0] ? &ast->Idents.get(name) : nullptr,
-                             ClangUtil::GetQualType(param_type), nullptr,
-                             (clang::StorageClass)storage, nullptr);
+  auto *decl =
+      ParmVarDecl::Create(*ast, decl_ctx, SourceLocation(), SourceLocation(),
+                          name && name[0] ? &ast->Idents.get(name) : nullptr,
+                          ClangUtil::GetQualType(param_type), nullptr,
+                          (clang::StorageClass)storage, nullptr);
+  decl_ctx->addDecl(decl);
+  return decl;
 }
 
 void ClangASTContext::SetFunctionParameters(FunctionDecl *function_decl,
@@ -2042,7 +2250,7 @@ void ClangASTContext::SetFunctionParameters(FunctionDecl *function_decl,
 
 CompilerType
 ClangASTContext::CreateBlockPointerType(const CompilerType &function_type) {
-  QualType block_type = m_ast_ap->getBlockPointerType(
+  QualType block_type = m_ast_up->getBlockPointerType(
       clang::QualType::getFromOpaquePtr(function_type.GetOpaqueQualType()));
 
   return CompilerType(this, block_type.getAsOpaquePtr());
@@ -2080,7 +2288,7 @@ CompilerType ClangASTContext::CreateArrayType(const CompilerType &element_type,
 }
 
 CompilerType ClangASTContext::CreateStructForIdentifier(
-    const ConstString &type_name,
+    ConstString type_name,
     const std::initializer_list<std::pair<const char *, CompilerType>>
         &type_fields,
     bool packed) {
@@ -2105,7 +2313,7 @@ CompilerType ClangASTContext::CreateStructForIdentifier(
 }
 
 CompilerType ClangASTContext::GetOrCreateStructForIdentifier(
-    const ConstString &type_name,
+    ConstString type_name,
     const std::initializer_list<std::pair<const char *, CompilerType>>
         &type_fields,
     bool packed) {
@@ -2138,6 +2346,9 @@ ClangASTContext::CreateEnumerationType(const char *name, DeclContext *decl_ctx,
       false);    // IsFixed
 
   if (enum_decl) {
+    if (decl_ctx)
+      decl_ctx->addDecl(enum_decl);
+
     // TODO: check if we should be setting the promotion type too?
     enum_decl->setIntegerType(ClangUtil::GetQualType(integer_clang_type));
 
@@ -2240,21 +2451,17 @@ void ClangASTContext::DumpDeclHiearchy(clang::Decl *decl) {
 bool ClangASTContext::DeclsAreEquivalent(clang::Decl *lhs_decl,
                                          clang::Decl *rhs_decl) {
   if (lhs_decl && rhs_decl) {
-    //----------------------------------------------------------------------
     // Make sure the decl kinds match first
-    //----------------------------------------------------------------------
     const clang::Decl::Kind lhs_decl_kind = lhs_decl->getKind();
     const clang::Decl::Kind rhs_decl_kind = rhs_decl->getKind();
 
     if (lhs_decl_kind == rhs_decl_kind) {
-      //------------------------------------------------------------------
       // Now check that the decl contexts kinds are all equivalent before we
       // have to check any names of the decl contexts...
-      //------------------------------------------------------------------
       clang::DeclContext *lhs_decl_ctx = lhs_decl->getDeclContext();
       clang::DeclContext *rhs_decl_ctx = rhs_decl->getDeclContext();
       if (lhs_decl_ctx && rhs_decl_ctx) {
-        while (1) {
+        while (true) {
           if (lhs_decl_ctx && rhs_decl_ctx) {
             const clang::Decl::Kind lhs_decl_ctx_kind =
                 lhs_decl_ctx->getDeclKind();
@@ -2272,9 +2479,7 @@ bool ClangASTContext::DeclsAreEquivalent(clang::Decl *lhs_decl,
             return false;
         }
 
-        //--------------------------------------------------------------
         // Now make sure the name of the decls match
-        //--------------------------------------------------------------
         clang::NamedDecl *lhs_named_decl =
             llvm::dyn_cast<clang::NamedDecl>(lhs_decl);
         clang::NamedDecl *rhs_named_decl =
@@ -2290,13 +2495,11 @@ bool ClangASTContext::DeclsAreEquivalent(clang::Decl *lhs_decl,
         } else
           return false;
 
-        //--------------------------------------------------------------
         // We know that the decl context kinds all match, so now we need to
         // make sure the names match as well
-        //--------------------------------------------------------------
         lhs_decl_ctx = lhs_decl->getDeclContext();
         rhs_decl_ctx = rhs_decl->getDeclContext();
-        while (1) {
+        while (true) {
           switch (lhs_decl_ctx->getDeclKind()) {
           case clang::Decl::TranslationUnit:
             // We don't care about the translation unit names
@@ -2635,9 +2838,7 @@ ConvertAccessTypeToObjCIvarAccessControl(AccessType access) {
   return clang::ObjCIvarDecl::None;
 }
 
-//----------------------------------------------------------------------
 // Tests
-//----------------------------------------------------------------------
 
 bool ClangASTContext::IsAggregateType(lldb::opaque_compiler_type_t type) {
   clang::QualType qual_type(GetCanonicalQualType(type));
@@ -3129,7 +3330,7 @@ bool ClangASTContext::IsBlockPointerType(
         const clang::BlockPointerType *block_pointer_type =
             qual_type->getAs<clang::BlockPointerType>();
         QualType pointee_type = block_pointer_type->getPointeeType();
-        QualType function_pointer_type = m_ast_ap->getPointerType(pointee_type);
+        QualType function_pointer_type = m_ast_up->getPointerType(pointee_type);
         *function_pointer_type_ptr =
             CompilerType(getASTContext(), function_pointer_type);
       }
@@ -3714,6 +3915,14 @@ bool ClangASTContext::IsVoidType(lldb::opaque_compiler_type_t type) {
   return GetCanonicalQualType(type)->isVoidType();
 }
 
+bool ClangASTContext::CanPassInRegisters(const CompilerType &type) {
+  if (auto *record_decl =
+      ClangASTContext::GetAsRecordDecl(type)) {
+    return record_decl->canPassInRegisters();
+  }
+  return false;
+}
+
 bool ClangASTContext::SupportsLanguage(lldb::LanguageType language) {
   return ClangASTContextSupportsLanguage(language);
 }
@@ -3739,9 +3948,7 @@ bool ClangASTContext::IsCXXClassType(const CompilerType &type) {
     return false;
 
   clang::QualType qual_type(ClangUtil::GetCanonicalQualType(type));
-  if (!qual_type.isNull() && qual_type->getAsCXXRecordDecl() != nullptr)
-    return true;
-  return false;
+  return !qual_type.isNull() && qual_type->getAsCXXRecordDecl() != nullptr;
 }
 
 bool ClangASTContext::IsBeingDefined(lldb::opaque_compiler_type_t type) {
@@ -3801,9 +4008,7 @@ bool ClangASTContext::GetObjCClassName(const CompilerType &type,
   return false;
 }
 
-//----------------------------------------------------------------------
 // Type Completion
-//----------------------------------------------------------------------
 
 bool ClangASTContext::GetCompleteType(lldb::opaque_compiler_type_t type) {
   if (!type)
@@ -4071,9 +4276,11 @@ ClangASTContext::GetMinimumLanguage(lldb::opaque_compiler_type_t type) {
   if (qual_type->isAnyPointerType()) {
     if (qual_type->isObjCObjectPointerType())
       return lldb::eLanguageTypeObjC;
+    if (qual_type->getPointeeCXXRecordDecl())
+      return lldb::eLanguageTypeC_plus_plus;
 
     clang::QualType pointee_type(qual_type->getPointeeType());
-    if (pointee_type->getPointeeCXXRecordDecl() != nullptr)
+    if (pointee_type->getPointeeCXXRecordDecl())
       return lldb::eLanguageTypeC_plus_plus;
     if (pointee_type->isObjCObjectOrInterfaceType())
       return lldb::eLanguageTypeObjC;
@@ -4281,6 +4488,8 @@ ClangASTContext::GetTypeClass(lldb::opaque_compiler_type_t type) {
 
   case clang::Type::DependentAddressSpace:
     break;
+  case clang::Type::MacroQualified:
+    break;
   }
   // We don't know hot to display this type...
   return lldb::eTypeClassOther;
@@ -4292,9 +4501,7 @@ unsigned ClangASTContext::GetTypeQualifiers(lldb::opaque_compiler_type_t type) {
   return 0;
 }
 
-//----------------------------------------------------------------------
 // Creating related types
-//----------------------------------------------------------------------
 
 CompilerType
 ClangASTContext::GetArrayElementType(lldb::opaque_compiler_type_t type,
@@ -4313,7 +4520,8 @@ ClangASTContext::GetArrayElementType(lldb::opaque_compiler_type_t type,
 
     // TODO: the real stride will be >= this value.. find the real one!
     if (stride)
-      *stride = element_type.GetByteSize(nullptr);
+      if (Optional<uint64_t> size = element_type.GetByteSize(nullptr))
+        *stride = *size;
 
     return element_type;
   }
@@ -4665,6 +4873,8 @@ CompilerType ClangASTContext::CreateTypedefType(
 
     decl->setAccess(clang::AS_public); // TODO respect proper access specifier
 
+    decl_ctx->addDecl(decl);
+
     // Get a uniqued clang::QualType for the typedef decl type
     return CompilerType(clang_ast, clang_ast->getTypedefType(decl));
   }
@@ -4803,19 +5013,16 @@ ClangASTContext::GetTypedefedType(lldb::opaque_compiler_type_t type) {
   return CompilerType();
 }
 
-//----------------------------------------------------------------------
 // Create related types using the current type's AST
-//----------------------------------------------------------------------
 
 CompilerType ClangASTContext::GetBasicTypeFromAST(lldb::BasicType basic_type) {
   return ClangASTContext::GetBasicType(getASTContext(), basic_type);
 }
-//----------------------------------------------------------------------
 // Exploring the type
-//----------------------------------------------------------------------
 
-uint64_t ClangASTContext::GetBitSize(lldb::opaque_compiler_type_t type,
-                                     ExecutionContextScope *exe_scope) {
+Optional<uint64_t>
+ClangASTContext::GetBitSize(lldb::opaque_compiler_type_t type,
+                            ExecutionContextScope *exe_scope) {
   if (GetCompleteType(type)) {
     clang::QualType qual_type(GetCanonicalQualType(type));
     const clang::Type::TypeClass type_class = qual_type->getTypeClass();
@@ -4824,7 +5031,7 @@ uint64_t ClangASTContext::GetBitSize(lldb::opaque_compiler_type_t type,
       if (GetCompleteType(type))
         return getASTContext()->getTypeSize(qual_type);
       else
-        return 0;
+        return None;
       break;
 
     case clang::Type::ObjCInterface:
@@ -4832,7 +5039,7 @@ uint64_t ClangASTContext::GetBitSize(lldb::opaque_compiler_type_t type,
       ExecutionContext exe_ctx(exe_scope);
       Process *process = exe_ctx.GetProcessPtr();
       if (process) {
-        ObjCLanguageRuntime *objc_runtime = process->GetObjCLanguageRuntime();
+        ObjCLanguageRuntime *objc_runtime = ObjCLanguageRuntime::Get(*process);
         if (objc_runtime) {
           uint64_t bit_size = 0;
           if (objc_runtime->GetTypeBitSize(
@@ -4869,10 +5076,14 @@ uint64_t ClangASTContext::GetBitSize(lldb::opaque_compiler_type_t type,
         return bit_size +
                getASTContext()->getTypeSize(
                    getASTContext()->ObjCBuiltinClassTy);
-      return bit_size;
+      // Function types actually have a size of 0, that's not an error.
+      if (qual_type->isFunctionProtoType())
+        return bit_size;
+      if (bit_size)
+        return bit_size;
     }
   }
-  return 0;
+  return None;
 }
 
 size_t ClangASTContext::GetTypeBitAlign(lldb::opaque_compiler_type_t type) {
@@ -5032,6 +5243,20 @@ lldb::Encoding ClangASTContext::GetEncoding(lldb::opaque_compiler_type_t type,
     case clang::BuiltinType::Kind::PseudoObject:
     case clang::BuiltinType::Kind::UnknownAny:
       break;
+
+    case clang::BuiltinType::OCLIntelSubgroupAVCMcePayload:
+    case clang::BuiltinType::OCLIntelSubgroupAVCImePayload:
+    case clang::BuiltinType::OCLIntelSubgroupAVCRefPayload:
+    case clang::BuiltinType::OCLIntelSubgroupAVCSicPayload:
+    case clang::BuiltinType::OCLIntelSubgroupAVCMceResult:
+    case clang::BuiltinType::OCLIntelSubgroupAVCImeResult:
+    case clang::BuiltinType::OCLIntelSubgroupAVCRefResult:
+    case clang::BuiltinType::OCLIntelSubgroupAVCSicResult:
+    case clang::BuiltinType::OCLIntelSubgroupAVCImeResultSingleRefStreamout:
+    case clang::BuiltinType::OCLIntelSubgroupAVCImeResultDualRefStreamout:
+    case clang::BuiltinType::OCLIntelSubgroupAVCImeSingleRefStreamin:
+    case clang::BuiltinType::OCLIntelSubgroupAVCImeDualRefStreamin:
+      break;
     }
     break;
   // All pointer types are represented as unsigned integer encodings. We may
@@ -5132,6 +5357,8 @@ lldb::Encoding ClangASTContext::GetEncoding(lldb::opaque_compiler_type_t type,
     break;
 
   case clang::Type::DependentAddressSpace:
+    break;
+  case clang::Type::MacroQualified:
     break;
   }
   count = 0;
@@ -5300,6 +5527,8 @@ lldb::Format ClangASTContext::GetFormat(lldb::opaque_compiler_type_t type) {
 
   case clang::Type::DependentAddressSpace:
     break;
+  case clang::Type::MacroQualified:
+    break;
   }
   // We don't know hot to display this type...
   return lldb::eFormatBytes;
@@ -5319,8 +5548,20 @@ static bool ObjCDeclHasIVars(clang::ObjCInterfaceDecl *class_interface_decl,
   return false;
 }
 
+static Optional<SymbolFile::ArrayInfo>
+GetDynamicArrayInfo(ClangASTContext &ast, SymbolFile *sym_file,
+                    clang::QualType qual_type,
+                    const ExecutionContext *exe_ctx) {
+  if (qual_type->isIncompleteArrayType())
+    if (auto *metadata = ast.GetMetadata(qual_type.getAsOpaquePtr()))
+      return sym_file->GetDynamicArrayInfoForUID(metadata->GetUserID(),
+                                                 exe_ctx);
+  return llvm::None;
+}
+
 uint32_t ClangASTContext::GetNumChildren(lldb::opaque_compiler_type_t type,
-                                         bool omit_empty_base_classes) {
+                                         bool omit_empty_base_classes,
+                                         const ExecutionContext *exe_ctx) {
   if (!type)
     return 0;
 
@@ -5342,7 +5583,6 @@ uint32_t ClangASTContext::GetNumChildren(lldb::opaque_compiler_type_t type,
 
   case clang::Type::Complex:
     return 0;
-
   case clang::Type::Record:
     if (GetCompleteQualType(getASTContext(), qual_type)) {
       const clang::RecordType *record_type =
@@ -5368,7 +5608,7 @@ uint32_t ClangASTContext::GetNumChildren(lldb::opaque_compiler_type_t type,
                         ->getDecl());
 
             // Skip empty base classes
-            if (ClangASTContext::RecordHasFields(base_class_decl) == false)
+            if (!ClangASTContext::RecordHasFields(base_class_decl))
               continue;
 
             num_children++;
@@ -5420,7 +5660,7 @@ uint32_t ClangASTContext::GetNumChildren(lldb::opaque_compiler_type_t type,
     clang::QualType pointee_type = pointer_type->getPointeeType();
     uint32_t num_pointee_children =
         CompilerType(getASTContext(), pointee_type)
-            .GetNumChildren(omit_empty_base_classes);
+            .GetNumChildren(omit_empty_base_classes, exe_ctx);
     // If this type points to a simple type, then it has 1 child
     if (num_pointee_children == 0)
       num_children = 1;
@@ -5439,6 +5679,14 @@ uint32_t ClangASTContext::GetNumChildren(lldb::opaque_compiler_type_t type,
                        ->getSize()
                        .getLimitedValue();
     break;
+  case clang::Type::IncompleteArray:
+    if (auto array_info =
+            GetDynamicArrayInfo(*this, GetSymbolFile(), qual_type, exe_ctx))
+      // Only 1-dimensional arrays are supported.
+      num_children = array_info->element_orders.size()
+                         ? array_info->element_orders.back()
+                         : 0;
+    break;
 
   case clang::Type::Pointer: {
     const clang::PointerType *pointer_type =
@@ -5446,7 +5694,7 @@ uint32_t ClangASTContext::GetNumChildren(lldb::opaque_compiler_type_t type,
     clang::QualType pointee_type(pointer_type->getPointeeType());
     uint32_t num_pointee_children =
         CompilerType(getASTContext(), pointee_type)
-            .GetNumChildren(omit_empty_base_classes);
+      .GetNumChildren(omit_empty_base_classes, exe_ctx);
     if (num_pointee_children == 0) {
       // We have a pointer to a pointee type that claims it has no children. We
       // will want to look at
@@ -5462,7 +5710,7 @@ uint32_t ClangASTContext::GetNumChildren(lldb::opaque_compiler_type_t type,
     clang::QualType pointee_type = reference_type->getPointeeType();
     uint32_t num_pointee_children =
         CompilerType(getASTContext(), pointee_type)
-            .GetNumChildren(omit_empty_base_classes);
+            .GetNumChildren(omit_empty_base_classes, exe_ctx);
     // If this type points to a simple type, then it has 1 child
     if (num_pointee_children == 0)
       num_children = 1;
@@ -5475,14 +5723,14 @@ uint32_t ClangASTContext::GetNumChildren(lldb::opaque_compiler_type_t type,
         CompilerType(getASTContext(), llvm::cast<clang::TypedefType>(qual_type)
                                           ->getDecl()
                                           ->getUnderlyingType())
-            .GetNumChildren(omit_empty_base_classes);
+            .GetNumChildren(omit_empty_base_classes, exe_ctx);
     break;
 
   case clang::Type::Auto:
     num_children =
         CompilerType(getASTContext(),
                      llvm::cast<clang::AutoType>(qual_type)->getDeducedType())
-            .GetNumChildren(omit_empty_base_classes);
+            .GetNumChildren(omit_empty_base_classes, exe_ctx);
     break;
 
   case clang::Type::Elaborated:
@@ -5490,14 +5738,14 @@ uint32_t ClangASTContext::GetNumChildren(lldb::opaque_compiler_type_t type,
         CompilerType(
             getASTContext(),
             llvm::cast<clang::ElaboratedType>(qual_type)->getNamedType())
-            .GetNumChildren(omit_empty_base_classes);
+            .GetNumChildren(omit_empty_base_classes, exe_ctx);
     break;
 
   case clang::Type::Paren:
     num_children =
         CompilerType(getASTContext(),
                      llvm::cast<clang::ParenType>(qual_type)->desugar())
-            .GetNumChildren(omit_empty_base_classes);
+            .GetNumChildren(omit_empty_base_classes, exe_ctx);
     break;
   default:
     break;
@@ -5505,7 +5753,7 @@ uint32_t ClangASTContext::GetNumChildren(lldb::opaque_compiler_type_t type,
   return num_children;
 }
 
-CompilerType ClangASTContext::GetBuiltinTypeByName(const ConstString &name) {
+CompilerType ClangASTContext::GetBuiltinTypeByName(ConstString name) {
   return GetBasicType(GetBasicTypeEnumeration(name));
 }
 
@@ -5585,7 +5833,7 @@ ClangASTContext::GetBasicTypeEnumeration(lldb::opaque_compiler_type_t type) {
 void ClangASTContext::ForEachEnumerator(
     lldb::opaque_compiler_type_t type,
     std::function<bool(const CompilerType &integer_type,
-                       const ConstString &name,
+                       ConstString name,
                        const llvm::APSInt &value)> const &callback) {
   const clang::EnumType *enum_type =
       llvm::dyn_cast<clang::EnumType>(GetCanonicalQualType(type));
@@ -5735,10 +5983,10 @@ GetObjCFieldAtIndex(clang::ASTContext *ast,
 
             if (is_bitfield && ast) {
               clang::Expr *bitfield_bit_size_expr = ivar_pos->getBitWidth();
-              llvm::APSInt bitfield_apsint;
+              clang::Expr::EvalResult result;
               if (bitfield_bit_size_expr &&
-                  bitfield_bit_size_expr->EvaluateAsInt(bitfield_apsint,
-                                                        *ast)) {
+                  bitfield_bit_size_expr->EvaluateAsInt(result, *ast)) {
+                llvm::APSInt bitfield_apsint = result.Val.getInt();
                 *bitfield_bit_size_ptr = bitfield_apsint.getLimitedValue();
               }
             }
@@ -5795,10 +6043,11 @@ CompilerType ClangASTContext::GetFieldAtIndex(lldb::opaque_compiler_type_t type,
 
             if (is_bitfield) {
               clang::Expr *bitfield_bit_size_expr = field->getBitWidth();
-              llvm::APSInt bitfield_apsint;
+              clang::Expr::EvalResult result;
               if (bitfield_bit_size_expr &&
-                  bitfield_bit_size_expr->EvaluateAsInt(bitfield_apsint,
+                  bitfield_bit_size_expr->EvaluateAsInt(result,
                                                         *getASTContext())) {
+                llvm::APSInt bitfield_apsint = result.Val.getInt();
                 *bitfield_bit_size_ptr = bitfield_apsint.getLimitedValue();
               }
             }
@@ -6366,6 +6615,10 @@ CompilerType ClangASTContext::GetChildCompilerTypeAtIndex(
   if (!type)
     return CompilerType();
 
+  auto get_exe_scope = [&exe_ctx]() {
+    return exe_ctx ? exe_ctx->GetBestExecutionContextScope() : nullptr;
+  };
+
   clang::QualType parent_qual_type(GetCanonicalQualType(type));
   const clang::Type::TypeClass parent_type_class =
       parent_qual_type->getTypeClass();
@@ -6374,8 +6627,9 @@ CompilerType ClangASTContext::GetChildCompilerTypeAtIndex(
   child_is_base_class = false;
   language_flags = 0;
 
-  const bool idx_is_valid = idx < GetNumChildren(type, omit_empty_base_classes);
-  uint32_t bit_offset;
+  const bool idx_is_valid =
+      idx < GetNumChildren(type, omit_empty_base_classes, exe_ctx);
+  int32_t bit_offset;
   switch (parent_type_class) {
   case clang::Type::Builtin:
     if (idx_is_valid) {
@@ -6420,7 +6674,7 @@ CompilerType ClangASTContext::GetChildCompilerTypeAtIndex(
           if (omit_empty_base_classes) {
             base_class_decl = llvm::cast<clang::CXXRecordDecl>(
                 base_class->getType()->getAs<clang::RecordType>()->getDecl());
-            if (ClangASTContext::RecordHasFields(base_class_decl) == false)
+            if (!ClangASTContext::RecordHasFields(base_class_decl))
               continue;
           }
 
@@ -6432,80 +6686,12 @@ CompilerType ClangASTContext::GetChildCompilerTypeAtIndex(
             if (base_class->isVirtual()) {
               bool handled = false;
               if (valobj) {
-                Status err;
-                AddressType addr_type = eAddressTypeInvalid;
-                lldb::addr_t vtable_ptr_addr =
-                    valobj->GetCPPVTableAddress(addr_type);
-
-                if (vtable_ptr_addr != LLDB_INVALID_ADDRESS &&
-                    addr_type == eAddressTypeLoad) {
-
-                  ExecutionContext exe_ctx(valobj->GetExecutionContextRef());
-                  Process *process = exe_ctx.GetProcessPtr();
-                  if (process) {
-                    clang::VTableContextBase *vtable_ctx =
-                        getASTContext()->getVTableContext();
-                    if (vtable_ctx) {
-                      if (vtable_ctx->isMicrosoft()) {
-                        clang::MicrosoftVTableContext *msoft_vtable_ctx =
-                            static_cast<clang::MicrosoftVTableContext *>(
-                                vtable_ctx);
-
-                        if (vtable_ptr_addr) {
-                          const lldb::addr_t vbtable_ptr_addr =
-                              vtable_ptr_addr +
-                              record_layout.getVBPtrOffset().getQuantity();
-
-                          const lldb::addr_t vbtable_ptr =
-                              process->ReadPointerFromMemory(vbtable_ptr_addr,
-                                                             err);
-                          if (vbtable_ptr != LLDB_INVALID_ADDRESS) {
-                            // Get the index into the virtual base table. The
-                            // index is the index in uint32_t from vbtable_ptr
-                            const unsigned vbtable_index =
-                                msoft_vtable_ctx->getVBTableIndex(
-                                    cxx_record_decl, base_class_decl);
-                            const lldb::addr_t base_offset_addr =
-                                vbtable_ptr + vbtable_index * 4;
-                            const uint32_t base_offset =
-                                process->ReadUnsignedIntegerFromMemory(
-                                    base_offset_addr, 4, UINT32_MAX, err);
-                            if (base_offset != UINT32_MAX) {
-                              handled = true;
-                              bit_offset = base_offset * 8;
-                            }
-                          }
-                        }
-                      } else {
-                        clang::ItaniumVTableContext *itanium_vtable_ctx =
-                            static_cast<clang::ItaniumVTableContext *>(
-                                vtable_ctx);
-                        if (vtable_ptr_addr) {
-                          const lldb::addr_t vtable_ptr =
-                              process->ReadPointerFromMemory(vtable_ptr_addr,
-                                                             err);
-                          if (vtable_ptr != LLDB_INVALID_ADDRESS) {
-                            clang::CharUnits base_offset_offset =
-                                itanium_vtable_ctx->getVirtualBaseOffsetOffset(
-                                    cxx_record_decl, base_class_decl);
-                            const lldb::addr_t base_offset_addr =
-                                vtable_ptr + base_offset_offset.getQuantity();
-                            const uint32_t base_offset_size =
-                                process->GetAddressByteSize();
-                            const uint64_t base_offset =
-                                process->ReadUnsignedIntegerFromMemory(
-                                    base_offset_addr, base_offset_size,
-                                    UINT32_MAX, err);
-                            if (base_offset < UINT32_MAX) {
-                              handled = true;
-                              bit_offset = base_offset * 8;
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
+                clang::VTableContextBase *vtable_ctx =
+                    getASTContext()->getVTableContext();
+                if (vtable_ctx)
+                  handled = GetVBaseBitOffset(*vtable_ctx, *valobj,
+                                              record_layout, cxx_record_decl,
+                                              base_class_decl, bit_offset);
               }
               if (!handled)
                 bit_offset = record_layout.getVBaseClassOffset(base_class_decl)
@@ -6521,9 +6707,11 @@ CompilerType ClangASTContext::GetChildCompilerTypeAtIndex(
             CompilerType base_class_clang_type(getASTContext(),
                                                base_class->getType());
             child_name = base_class_clang_type.GetTypeName().AsCString("");
-            uint64_t base_class_clang_type_bit_size =
-                base_class_clang_type.GetBitSize(
-                    exe_ctx ? exe_ctx->GetBestExecutionContextScope() : NULL);
+            Optional<uint64_t> size =
+                base_class_clang_type.GetBitSize(get_exe_scope());
+            if (!size)
+              return {};
+            uint64_t base_class_clang_type_bit_size = *size;
 
             // Base classes bit sizes should be a multiple of 8 bits in size
             assert(base_class_clang_type_bit_size % 8 == 0);
@@ -6551,8 +6739,11 @@ CompilerType ClangASTContext::GetChildCompilerTypeAtIndex(
           // alignment (field_type_info.second) from the AST context.
           CompilerType field_clang_type(getASTContext(), field->getType());
           assert(field_idx < record_layout.getFieldCount());
-          child_byte_size = field_clang_type.GetByteSize(
-              exe_ctx ? exe_ctx->GetBestExecutionContextScope() : NULL);
+          Optional<uint64_t> size =
+              field_clang_type.GetByteSize(get_exe_scope());
+          if (!size)
+            return {};
+          child_byte_size = *size;
           const uint32_t child_bit_size = child_byte_size * 8;
 
           // Figure out the field offset within the current struct/union/class
@@ -6596,8 +6787,8 @@ CompilerType ClangASTContext::GetChildCompilerTypeAtIndex(
               CompilerType base_class_clang_type(
                   getASTContext(), getASTContext()->getObjCInterfaceType(
                                        superclass_interface_decl));
-              if (base_class_clang_type.GetNumChildren(
-                      omit_empty_base_classes) > 0) {
+              if (base_class_clang_type.GetNumChildren(omit_empty_base_classes,
+                                                       exe_ctx) > 0) {
                 if (idx == 0) {
                   clang::QualType ivar_qual_type(
                       getASTContext()->getObjCInterfaceType(
@@ -6655,7 +6846,7 @@ CompilerType ClangASTContext::GetChildCompilerTypeAtIndex(
                   process = exe_ctx->GetProcessPtr();
                 if (process) {
                   ObjCLanguageRuntime *objc_runtime =
-                      process->GetObjCLanguageRuntime();
+                      ObjCLanguageRuntime::Get(*process);
                   if (objc_runtime != nullptr) {
                     CompilerType parent_ast_type(getASTContext(),
                                                  parent_qual_type);
@@ -6664,9 +6855,9 @@ CompilerType ClangASTContext::GetChildCompilerTypeAtIndex(
                   }
                 }
 
-                // Setting this to UINT32_MAX to make sure we don't compute it
+                // Setting this to INT32_MAX to make sure we don't compute it
                 // twice...
-                bit_offset = UINT32_MAX;
+                bit_offset = INT32_MAX;
 
                 if (child_byte_offset ==
                     static_cast<int32_t>(LLDB_INVALID_IVAR_OFFSET)) {
@@ -6683,7 +6874,7 @@ CompilerType ClangASTContext::GetChildCompilerTypeAtIndex(
 
                 if (ClangASTContext::FieldIsBitfield(getASTContext(), ivar_decl,
                                                      child_bitfield_bit_size)) {
-                  if (bit_offset == UINT32_MAX)
+                  if (bit_offset == INT32_MAX)
                     bit_offset = interface_layout.getFieldOffset(
                         child_idx - superclass_idx);
 
@@ -6715,7 +6906,7 @@ CompilerType ClangASTContext::GetChildCompilerTypeAtIndex(
       } else {
         child_is_deref_of_parent = true;
         const char *parent_name =
-            valobj ? valobj->GetName().GetCString() : NULL;
+            valobj ? valobj->GetName().GetCString() : nullptr;
         if (parent_name) {
           child_name.assign(1, '*');
           child_name += parent_name;
@@ -6723,10 +6914,12 @@ CompilerType ClangASTContext::GetChildCompilerTypeAtIndex(
 
         // We have a pointer to an simple type
         if (idx == 0 && pointee_clang_type.GetCompleteType()) {
-          child_byte_size = pointee_clang_type.GetByteSize(
-              exe_ctx ? exe_ctx->GetBestExecutionContextScope() : NULL);
-          child_byte_offset = 0;
-          return pointee_clang_type;
+          if (Optional<uint64_t> size =
+                  pointee_clang_type.GetByteSize(get_exe_scope())) {
+            child_byte_size = *size;
+            child_byte_offset = 0;
+            return pointee_clang_type;
+          }
         }
       }
     }
@@ -6744,10 +6937,12 @@ CompilerType ClangASTContext::GetChildCompilerTypeAtIndex(
           ::snprintf(element_name, sizeof(element_name), "[%" PRIu64 "]",
                      static_cast<uint64_t>(idx));
           child_name.assign(element_name);
-          child_byte_size = element_type.GetByteSize(
-              exe_ctx ? exe_ctx->GetBestExecutionContextScope() : NULL);
-          child_byte_offset = (int32_t)idx * (int32_t)child_byte_size;
-          return element_type;
+          if (Optional<uint64_t> size =
+                  element_type.GetByteSize(get_exe_scope())) {
+            child_byte_size = *size;
+            child_byte_offset = (int32_t)idx * (int32_t)child_byte_size;
+            return element_type;
+          }
         }
       }
     }
@@ -6761,10 +6956,12 @@ CompilerType ClangASTContext::GetChildCompilerTypeAtIndex(
         CompilerType element_type(getASTContext(), array->getElementType());
         if (element_type.GetCompleteType()) {
           child_name = llvm::formatv("[{0}]", idx);
-          child_byte_size = element_type.GetByteSize(
-              exe_ctx ? exe_ctx->GetBestExecutionContextScope() : NULL);
-          child_byte_offset = (int32_t)idx * (int32_t)child_byte_size;
-          return element_type;
+          if (Optional<uint64_t> size =
+                  element_type.GetByteSize(get_exe_scope())) {
+            child_byte_size = *size;
+            child_byte_offset = (int32_t)idx * (int32_t)child_byte_size;
+            return element_type;
+          }
         }
       }
     }
@@ -6790,7 +6987,7 @@ CompilerType ClangASTContext::GetChildCompilerTypeAtIndex(
       child_is_deref_of_parent = true;
 
       const char *parent_name =
-          valobj ? valobj->GetName().GetCString() : NULL;
+          valobj ? valobj->GetName().GetCString() : nullptr;
       if (parent_name) {
         child_name.assign(1, '*');
         child_name += parent_name;
@@ -6798,10 +6995,12 @@ CompilerType ClangASTContext::GetChildCompilerTypeAtIndex(
 
       // We have a pointer to an simple type
       if (idx == 0) {
-        child_byte_size = pointee_clang_type.GetByteSize(
-            exe_ctx ? exe_ctx->GetBestExecutionContextScope() : NULL);
-        child_byte_offset = 0;
-        return pointee_clang_type;
+        if (Optional<uint64_t> size =
+                pointee_clang_type.GetByteSize(get_exe_scope())) {
+          child_byte_size = *size;
+          child_byte_offset = 0;
+          return pointee_clang_type;
+        }
       }
     }
     break;
@@ -6825,7 +7024,7 @@ CompilerType ClangASTContext::GetChildCompilerTypeAtIndex(
             language_flags);
       } else {
         const char *parent_name =
-            valobj ? valobj->GetName().GetCString() : NULL;
+            valobj ? valobj->GetName().GetCString() : nullptr;
         if (parent_name) {
           child_name.assign(1, '&');
           child_name += parent_name;
@@ -6833,10 +7032,12 @@ CompilerType ClangASTContext::GetChildCompilerTypeAtIndex(
 
         // We have a pointer to an simple type
         if (idx == 0) {
-          child_byte_size = pointee_clang_type.GetByteSize(
-              exe_ctx ? exe_ctx->GetBestExecutionContextScope() : NULL);
-          child_byte_offset = 0;
-          return pointee_clang_type;
+          if (Optional<uint64_t> size =
+                  pointee_clang_type.GetByteSize(get_exe_scope())) {
+            child_byte_size = *size;
+            child_byte_offset = 0;
+            return pointee_clang_type;
+          }
         }
       }
     }
@@ -7283,14 +7484,14 @@ ClangASTContext::GetIndexOfChildWithName(lldb::opaque_compiler_type_t type,
                         ->getAs<clang::RecordType>()
                         ->getDecl());
             if (omit_empty_base_classes &&
-                ClangASTContext::RecordHasFields(base_class_decl) == false)
+                !ClangASTContext::RecordHasFields(base_class_decl))
               continue;
 
             CompilerType base_class_clang_type(getASTContext(),
                                                base_class->getType());
             std::string base_class_type_name(
                 base_class_clang_type.GetTypeName().AsCString(""));
-            if (base_class_type_name.compare(name) == 0)
+            if (base_class_type_name == name)
               return child_idx;
             ++child_idx;
           }
@@ -7625,7 +7826,7 @@ ClangASTContext::GetTypeTemplateArgument(lldb::opaque_compiler_type_t type,
   return CompilerType(getASTContext(), template_arg.getAsType());
 }
 
-llvm::Optional<CompilerType::IntegralTemplateArgument>
+Optional<CompilerType::IntegralTemplateArgument>
 ClangASTContext::GetIntegralTemplateArgument(lldb::opaque_compiler_type_t type,
                                              size_t idx) {
   const clang::ClassTemplateSpecializationDecl *template_decl =
@@ -7653,7 +7854,7 @@ clang::EnumDecl *ClangASTContext::GetAsEnumDecl(const CompilerType &type) {
       llvm::dyn_cast<clang::EnumType>(ClangUtil::GetCanonicalQualType(type));
   if (enutype)
     return enutype->getDecl();
-  return NULL;
+  return nullptr;
 }
 
 clang::RecordDecl *ClangASTContext::GetAsRecordDecl(const CompilerType &type) {
@@ -7665,11 +7866,16 @@ clang::RecordDecl *ClangASTContext::GetAsRecordDecl(const CompilerType &type) {
 }
 
 clang::TagDecl *ClangASTContext::GetAsTagDecl(const CompilerType &type) {
-  clang::QualType qual_type = ClangUtil::GetCanonicalQualType(type);
-  if (qual_type.isNull())
-    return nullptr;
-  else
-    return qual_type->getAsTagDecl();
+  return ClangUtil::GetAsTagDecl(type);
+}
+
+clang::TypedefNameDecl *
+ClangASTContext::GetAsTypedefDecl(const CompilerType &type) {
+  const clang::TypedefType *typedef_type =
+      llvm::dyn_cast<clang::TypedefType>(ClangUtil::GetQualType(type));
+  if (typedef_type)
+    return typedef_type->getDecl();
+  return nullptr;
 }
 
 clang::CXXRecordDecl *
@@ -7688,7 +7894,7 @@ ClangASTContext::GetAsObjCInterfaceDecl(const CompilerType &type) {
 }
 
 clang::FieldDecl *ClangASTContext::AddFieldToRecordType(
-    const CompilerType &type, const char *name,
+    const CompilerType &type, llvm::StringRef name,
     const CompilerType &field_clang_type, AccessType access,
     uint32_t bitfield_bit_size) {
   if (!type.IsValid() || !field_clang_type.IsValid())
@@ -7698,6 +7904,9 @@ clang::FieldDecl *ClangASTContext::AddFieldToRecordType(
   if (!ast)
     return nullptr;
   clang::ASTContext *clang_ast = ast->getASTContext();
+  clang::IdentifierInfo *ident = nullptr;
+  if (!name.empty())
+    ident = &clang_ast->Idents.get(name);
 
   clang::FieldDecl *field = nullptr;
 
@@ -7715,14 +7924,14 @@ clang::FieldDecl *ClangASTContext::AddFieldToRecordType(
     field = clang::FieldDecl::Create(
         *clang_ast, record_decl, clang::SourceLocation(),
         clang::SourceLocation(),
-        name ? &clang_ast->Idents.get(name) : nullptr, // Identifier
-        ClangUtil::GetQualType(field_clang_type),      // Field type
-        nullptr,                                       // TInfo *
-        bit_width,                                     // BitWidth
-        false,                                         // Mutable
-        clang::ICIS_NoInit);                           // HasInit
+        ident,                                    // Identifier
+        ClangUtil::GetQualType(field_clang_type), // Field type
+        nullptr,                                  // TInfo *
+        bit_width,                                // BitWidth
+        false,                                    // Mutable
+        clang::ICIS_NoInit);                      // HasInit
 
-    if (!name) {
+    if (name.empty()) {
       // Determine whether this field corresponds to an anonymous struct or
       // union.
       if (const clang::TagType *TagT =
@@ -7758,9 +7967,9 @@ clang::FieldDecl *ClangASTContext::AddFieldToRecordType(
       field = clang::ObjCIvarDecl::Create(
           *clang_ast, class_interface_decl, clang::SourceLocation(),
           clang::SourceLocation(),
-          name ? &clang_ast->Idents.get(name) : nullptr, // Identifier
-          ClangUtil::GetQualType(field_clang_type),      // Field type
-          nullptr,                                       // TypeSourceInfo *
+          ident,                                    // Identifier
+          ClangUtil::GetQualType(field_clang_type), // Field type
+          nullptr,                                  // TypeSourceInfo *
           ConvertAccessTypeToObjCIvarAccessControl(access), bit_width,
           is_synthesized);
 
@@ -7899,38 +8108,44 @@ void ClangASTContext::SetIsPacked(const CompilerType &type) {
 }
 
 clang::VarDecl *ClangASTContext::AddVariableToRecordType(
-    const CompilerType &type, const char *name, const CompilerType &var_type,
-    AccessType access) {
-  clang::VarDecl *var_decl = nullptr;
-
+    const CompilerType &type, llvm::StringRef name,
+    const CompilerType &var_type, AccessType access) {
   if (!type.IsValid() || !var_type.IsValid())
     return nullptr;
+
   ClangASTContext *ast = llvm::dyn_cast<ClangASTContext>(type.GetTypeSystem());
   if (!ast)
     return nullptr;
 
   clang::RecordDecl *record_decl = ast->GetAsRecordDecl(type);
-  if (record_decl) {
-    var_decl = clang::VarDecl::Create(
-        *ast->getASTContext(),   // ASTContext &
-        record_decl,             // DeclContext *
-        clang::SourceLocation(), // clang::SourceLocation StartLoc
-        clang::SourceLocation(), // clang::SourceLocation IdLoc
-        name ? &ast->getASTContext()->Idents.get(name)
-             : nullptr,                   // clang::IdentifierInfo *
-        ClangUtil::GetQualType(var_type), // Variable clang::QualType
-        nullptr,                          // TypeSourceInfo *
-        clang::SC_Static);                // StorageClass
-    if (var_decl) {
-      var_decl->setAccess(
-          ClangASTContext::ConvertAccessTypeToAccessSpecifier(access));
-      record_decl->addDecl(var_decl);
+  if (!record_decl)
+    return nullptr;
+
+  clang::VarDecl *var_decl = nullptr;
+  clang::IdentifierInfo *ident = nullptr;
+  if (!name.empty())
+    ident = &ast->getASTContext()->Idents.get(name);
+
+  var_decl = clang::VarDecl::Create(
+      *ast->getASTContext(),            // ASTContext &
+      record_decl,                      // DeclContext *
+      clang::SourceLocation(),          // clang::SourceLocation StartLoc
+      clang::SourceLocation(),          // clang::SourceLocation IdLoc
+      ident,                            // clang::IdentifierInfo *
+      ClangUtil::GetQualType(var_type), // Variable clang::QualType
+      nullptr,                          // TypeSourceInfo *
+      clang::SC_Static);                // StorageClass
+  if (!var_decl)
+    return nullptr;
+
+  var_decl->setAccess(
+      ClangASTContext::ConvertAccessTypeToAccessSpecifier(access));
+  record_decl->addDecl(var_decl);
 
 #ifdef LLDB_CONFIGURATION_DEBUG
-      VerifyDecl(var_decl);
+  VerifyDecl(var_decl);
 #endif
-    }
-  }
+
   return var_decl;
 }
 
@@ -7977,6 +8192,10 @@ clang::CXXMethodDecl *ClangASTContext::AddMethodToCXXRecordType(
   if (is_artificial)
     return nullptr; // skip everything artificial
 
+  const clang::ExplicitSpecifier explicit_spec(
+      nullptr /*expr*/, is_explicit
+                            ? clang::ExplicitSpecKind::ResolvedTrue
+                            : clang::ExplicitSpecKind::ResolvedFalse);
   if (name[0] == '~') {
     cxx_dtor_decl = clang::CXXDestructorDecl::Create(
         *getASTContext(), cxx_record_decl, clang::SourceLocation(),
@@ -7995,7 +8214,7 @@ clang::CXXMethodDecl *ClangASTContext::AddMethodToCXXRecordType(
             clang::SourceLocation()),
         method_qual_type,
         nullptr, // TypeSourceInfo *
-        is_explicit, is_inline, is_artificial, false /*is_constexpr*/);
+        explicit_spec, is_inline, is_artificial, CSK_unspecified);
     cxx_method_decl = cxx_ctor_decl;
   } else {
     clang::StorageClass SC = is_static ? clang::SC_Static : clang::SC_None;
@@ -8018,7 +8237,7 @@ clang::CXXMethodDecl *ClangASTContext::AddMethodToCXXRecordType(
                 clang::SourceLocation()),
             method_qual_type,
             nullptr, // TypeSourceInfo *
-            SC, is_inline, false /*is_constexpr*/, clang::SourceLocation());
+            SC, is_inline, CSK_unspecified, clang::SourceLocation());
       } else if (num_params == 0) {
         // Conversion operators don't take params...
         cxx_method_decl = clang::CXXConversionDecl::Create(
@@ -8030,7 +8249,7 @@ clang::CXXMethodDecl *ClangASTContext::AddMethodToCXXRecordType(
                 clang::SourceLocation()),
             method_qual_type,
             nullptr, // TypeSourceInfo *
-            is_inline, is_explicit, false /*is_constexpr*/,
+            is_inline, explicit_spec, CSK_unspecified,
             clang::SourceLocation());
       }
     }
@@ -8041,7 +8260,7 @@ clang::CXXMethodDecl *ClangASTContext::AddMethodToCXXRecordType(
           clang::DeclarationNameInfo(decl_name, clang::SourceLocation()),
           method_qual_type,
           nullptr, // TypeSourceInfo *
-          SC, is_inline, false /*is_constexpr*/, clang::SourceLocation());
+          SC, is_inline, CSK_unspecified, clang::SourceLocation());
     }
   }
 
@@ -8054,7 +8273,7 @@ clang::CXXMethodDecl *ClangASTContext::AddMethodToCXXRecordType(
   if (is_attr_used)
     cxx_method_decl->addAttr(clang::UsedAttr::CreateImplicit(*getASTContext()));
 
-  if (mangled_name != NULL) {
+  if (mangled_name != nullptr) {
     cxx_method_decl->addAttr(
         clang::AsmLabelAttr::CreateImplicit(*getASTContext(), mangled_name));
   }
@@ -8131,41 +8350,46 @@ clang::CXXMethodDecl *ClangASTContext::AddMethodToCXXRecordType(
   return cxx_method_decl;
 }
 
+void ClangASTContext::AddMethodOverridesForCXXRecordType(
+    lldb::opaque_compiler_type_t type) {
+  if (auto *record = GetAsCXXRecordDecl(type))
+    for (auto *method : record->methods())
+      addOverridesForMethod(method);
+}
+
 #pragma mark C++ Base Classes
 
-clang::CXXBaseSpecifier *
+std::unique_ptr<clang::CXXBaseSpecifier>
 ClangASTContext::CreateBaseClassSpecifier(lldb::opaque_compiler_type_t type,
                                           AccessType access, bool is_virtual,
                                           bool base_of_class) {
-  if (type)
-    return new clang::CXXBaseSpecifier(
-        clang::SourceRange(), is_virtual, base_of_class,
-        ClangASTContext::ConvertAccessTypeToAccessSpecifier(access),
-        getASTContext()->getTrivialTypeSourceInfo(GetQualType(type)),
-        clang::SourceLocation());
-  return nullptr;
+  if (!type)
+    return nullptr;
+
+  return llvm::make_unique<clang::CXXBaseSpecifier>(
+      clang::SourceRange(), is_virtual, base_of_class,
+      ClangASTContext::ConvertAccessTypeToAccessSpecifier(access),
+      getASTContext()->getTrivialTypeSourceInfo(GetQualType(type)),
+      clang::SourceLocation());
 }
 
-void ClangASTContext::DeleteBaseClassSpecifiers(
-    clang::CXXBaseSpecifier **base_classes, unsigned num_base_classes) {
-  for (unsigned i = 0; i < num_base_classes; ++i) {
-    delete base_classes[i];
-    base_classes[i] = nullptr;
-  }
-}
-
-bool ClangASTContext::SetBaseClassesForClassType(
+bool ClangASTContext::TransferBaseClasses(
     lldb::opaque_compiler_type_t type,
-    clang::CXXBaseSpecifier const *const *base_classes,
-    unsigned num_base_classes) {
-  if (type) {
-    clang::CXXRecordDecl *cxx_record_decl = GetAsCXXRecordDecl(type);
-    if (cxx_record_decl) {
-      cxx_record_decl->setBases(base_classes, num_base_classes);
-      return true;
-    }
-  }
-  return false;
+    std::vector<std::unique_ptr<clang::CXXBaseSpecifier>> bases) {
+  if (!type)
+    return false;
+  clang::CXXRecordDecl *cxx_record_decl = GetAsCXXRecordDecl(type);
+  if (!cxx_record_decl)
+    return false;
+  std::vector<clang::CXXBaseSpecifier *> raw_bases;
+  raw_bases.reserve(bases.size());
+
+  // Clang will make a copy of them, so it's ok that we pass pointers that we're
+  // about to destroy.
+  for (auto &b : bases)
+    raw_bases.push_back(b.get());
+  cxx_record_decl->setBases(raw_bases.data(), raw_bases.size());
+  return true;
 }
 
 bool ClangASTContext::SetObjCSuperClass(
@@ -8750,44 +8974,63 @@ bool ClangASTContext::CompleteTagDeclarationDefinition(
   return false;
 }
 
-bool ClangASTContext::AddEnumerationValueToEnumerationType(
-    lldb::opaque_compiler_type_t type,
-    const CompilerType &enumerator_clang_type, const Declaration &decl,
-    const char *name, int64_t enum_value, uint32_t enum_value_bit_size) {
-  if (type && enumerator_clang_type.IsValid() && name && name[0]) {
-    clang::QualType enum_qual_type(GetCanonicalQualType(type));
+clang::EnumConstantDecl *ClangASTContext::AddEnumerationValueToEnumerationType(
+    const CompilerType &enum_type, const Declaration &decl, const char *name,
+    const llvm::APSInt &value) {
 
-    bool is_signed = false;
-    enumerator_clang_type.IsIntegerType(is_signed);
-    const clang::Type *clang_type = enum_qual_type.getTypePtr();
-    if (clang_type) {
-      const clang::EnumType *enutype =
-          llvm::dyn_cast<clang::EnumType>(clang_type);
+  if (!enum_type || ConstString(name).IsEmpty())
+    return nullptr;
 
-      if (enutype) {
-        llvm::APSInt enum_llvm_apsint(enum_value_bit_size, is_signed);
-        enum_llvm_apsint = enum_value;
-        clang::EnumConstantDecl *enumerator_decl =
-            clang::EnumConstantDecl::Create(
-                *getASTContext(), enutype->getDecl(), clang::SourceLocation(),
-                name ? &getASTContext()->Idents.get(name)
-                     : nullptr, // Identifier
-                ClangUtil::GetQualType(enumerator_clang_type),
-                nullptr, enum_llvm_apsint);
+  lldbassert(enum_type.GetTypeSystem() == static_cast<TypeSystem *>(this));
 
-        if (enumerator_decl) {
-          enutype->getDecl()->addDecl(enumerator_decl);
+  lldb::opaque_compiler_type_t enum_opaque_compiler_type =
+      enum_type.GetOpaqueQualType();
+
+  if (!enum_opaque_compiler_type)
+    return nullptr;
+
+  clang::QualType enum_qual_type(
+      GetCanonicalQualType(enum_opaque_compiler_type));
+
+  const clang::Type *clang_type = enum_qual_type.getTypePtr();
+
+  if (!clang_type)
+    return nullptr;
+
+  const clang::EnumType *enutype = llvm::dyn_cast<clang::EnumType>(clang_type);
+
+  if (!enutype)
+    return nullptr;
+
+  clang::EnumConstantDecl *enumerator_decl = clang::EnumConstantDecl::Create(
+      *getASTContext(), enutype->getDecl(), clang::SourceLocation(),
+      name ? &getASTContext()->Idents.get(name) : nullptr, // Identifier
+      clang::QualType(enutype, 0), nullptr, value);
+
+  if (!enumerator_decl)
+    return nullptr;
+
+  enutype->getDecl()->addDecl(enumerator_decl);
 
 #ifdef LLDB_CONFIGURATION_DEBUG
-          VerifyDecl(enumerator_decl);
+  VerifyDecl(enumerator_decl);
 #endif
 
-          return true;
-        }
-      }
-    }
-  }
-  return false;
+  return enumerator_decl;
+}
+
+clang::EnumConstantDecl *ClangASTContext::AddEnumerationValueToEnumerationType(
+    const CompilerType &enum_type, const Declaration &decl, const char *name,
+    int64_t enum_value, uint32_t enum_value_bit_size) {
+  CompilerType underlying_type =
+      GetEnumerationIntegerType(enum_type.GetOpaqueQualType());
+  bool is_signed = false;
+  underlying_type.IsIntegerType(is_signed);
+
+  llvm::APSInt value(enum_value_bit_size, is_signed);
+  value = enum_value;
+
+  return AddEnumerationValueToEnumerationType(enum_type, decl, name, value);
 }
 
 CompilerType
@@ -8856,10 +9099,23 @@ ClangASTContext::ConvertStringToFloatValue(lldb::opaque_compiler_type_t type,
   return 0;
 }
 
-//----------------------------------------------------------------------
 // Dumping types
-//----------------------------------------------------------------------
 #define DEPTH_INCREMENT 2
+
+#ifndef NDEBUG
+LLVM_DUMP_METHOD void
+ClangASTContext::dump(lldb::opaque_compiler_type_t type) const {
+  if (!type)
+    return;
+  clang::QualType qual_type(GetQualType(type));
+  qual_type.dump();
+}
+#endif
+
+void ClangASTContext::Dump(Stream &s) {
+  Decl *tu = Decl::castFromDeclContext(GetTranslationUnitDecl());
+  tu->dump(s.AsRawOstream());
+}
 
 void ClangASTContext::DumpValue(
     lldb::opaque_compiler_type_t type, ExecutionContext *exe_ctx, Stream *s,
@@ -8898,8 +9154,7 @@ void ClangASTContext::DumpValue(
                   base_class->getType()->getAs<clang::RecordType>()->getDecl());
 
           // Skip empty base classes
-          if (verbose == false &&
-              ClangASTContext::RecordHasFields(base_class_decl) == false)
+          if (!verbose && !ClangASTContext::RecordHasFields(base_class_decl))
             continue;
 
           if (base_class->isVirtual())
@@ -9386,7 +9641,7 @@ bool ClangASTContext::DumpTypeValue(
       break;
     }
   }
-  return 0;
+  return false;
 }
 
 void ClangASTContext::DumpSummary(lldb::opaque_compiler_type_t type,
@@ -9625,7 +9880,7 @@ clang::ClassTemplateDecl *ClangASTContext::ParseClassTemplateDecl(
                                    template_basename.c_str(), tag_decl_kind,
                                    template_param_infos);
   }
-  return NULL;
+  return nullptr;
 }
 
 void ClangASTContext::CompleteTagDecl(void *baton, clang::TagDecl *decl) {
@@ -9650,16 +9905,16 @@ void ClangASTContext::CompleteObjCInterfaceDecl(
 }
 
 DWARFASTParser *ClangASTContext::GetDWARFParser() {
-  if (!m_dwarf_ast_parser_ap)
-    m_dwarf_ast_parser_ap.reset(new DWARFASTParserClang(*this));
-  return m_dwarf_ast_parser_ap.get();
+  if (!m_dwarf_ast_parser_up)
+    m_dwarf_ast_parser_up.reset(new DWARFASTParserClang(*this));
+  return m_dwarf_ast_parser_up.get();
 }
 
 #ifdef LLDB_ENABLE_ALL
 PDBASTParser *ClangASTContext::GetPDBParser() {
-  if (!m_pdb_ast_parser_ap)
-    m_pdb_ast_parser_ap.reset(new PDBASTParser(*this));
-  return m_pdb_ast_parser_ap.get();
+  if (!m_pdb_ast_parser_up)
+    m_pdb_ast_parser_up.reset(new PDBASTParser(*this));
+  return m_pdb_ast_parser_up.get();
 }
 #endif // LLDB_ENABLE_ALL
 
@@ -9672,16 +9927,21 @@ bool ClangASTContext::LayoutRecordType(
     llvm::DenseMap<const clang::CXXRecordDecl *, clang::CharUnits>
         &vbase_offsets) {
   ClangASTContext *ast = (ClangASTContext *)baton;
-  DWARFASTParserClang *dwarf_ast_parser =
-      (DWARFASTParserClang *)ast->GetDWARFParser();
-  return dwarf_ast_parser->GetClangASTImporter().LayoutRecordType(
-      record_decl, bit_size, alignment, field_offsets, base_offsets,
-      vbase_offsets);
+  lldb_private::ClangASTImporter *importer = nullptr;
+  if (ast->m_dwarf_ast_parser_up)
+    importer = &ast->m_dwarf_ast_parser_up->GetClangASTImporter();
+#ifdef LLDB_ENABLE_ALL
+  if (!importer && ast->m_pdb_ast_parser_up)
+    importer = &ast->m_pdb_ast_parser_up->GetClangASTImporter();
+#endif // LLDB_ENABLE_ALL
+  if (!importer)
+    return false;
+
+  return importer->LayoutRecordType(record_decl, bit_size, alignment,
+                                    field_offsets, base_offsets, vbase_offsets);
 }
 
-//----------------------------------------------------------------------
 // CompilerDecl override functions
-//----------------------------------------------------------------------
 
 ConstString ClangASTContext::DeclGetName(void *opaque_decl) {
   if (opaque_decl) {
@@ -9769,9 +10029,7 @@ CompilerType ClangASTContext::DeclGetFunctionArgumentType(void *opaque_decl,
   return CompilerType();
 }
 
-//----------------------------------------------------------------------
 // CompilerDeclContext functions
-//----------------------------------------------------------------------
 
 std::vector<CompilerDecl> ClangASTContext::DeclContextFindDeclByName(
     void *opaque_decl_ctx, ConstString name, const bool ignore_using_decls) {
@@ -10022,6 +10280,23 @@ bool ClangASTContext::DeclContextIsClassMethod(
   return false;
 }
 
+bool ClangASTContext::DeclContextIsContainedInLookup(
+    void *opaque_decl_ctx, void *other_opaque_decl_ctx) {
+  auto *decl_ctx = (clang::DeclContext *)opaque_decl_ctx;
+  auto *other = (clang::DeclContext *)other_opaque_decl_ctx;
+
+  do {
+    // A decl context always includes its own contents in its lookup.
+    if (decl_ctx == other)
+      return true;
+
+    // If we have an inline namespace, then the lookup of the parent context
+    // also includes the inline namespace contents.
+  } while (other->isInlineNamespace() && (other = other->getParent()));
+
+  return false;
+}
+
 clang::DeclContext *
 ClangASTContext::DeclContextGetAsDeclContext(const CompilerDeclContext &dc) {
   if (dc.IsClang())
@@ -10087,13 +10362,14 @@ ClangASTContextForExpressions::ClangASTContextForExpressions(Target &target)
 UserExpression *ClangASTContextForExpressions::GetUserExpression(
     llvm::StringRef expr, llvm::StringRef prefix, lldb::LanguageType language,
     Expression::ResultType desired_type,
-    const EvaluateExpressionOptions &options) {
+    const EvaluateExpressionOptions &options,
+    ValueObject *ctx_obj) {
   TargetSP target_sp = m_target_wp.lock();
   if (!target_sp)
     return nullptr;
 
   return new ClangUserExpression(*target_sp.get(), expr, prefix, language,
-                                 desired_type, options);
+                                 desired_type, options, ctx_obj);
 }
 
 FunctionCaller *ClangASTContextForExpressions::GetFunctionCaller(
@@ -10128,6 +10404,6 @@ ClangASTContextForExpressions::GetPersistentExpressionState() {
 
 clang::ExternalASTMerger &
 ClangASTContextForExpressions::GetMergerUnchecked() {
-  lldbassert(m_scratch_ast_source_ap != nullptr);
-  return m_scratch_ast_source_ap->GetMergerUnchecked();
+  lldbassert(m_scratch_ast_source_up != nullptr);
+  return m_scratch_ast_source_up->GetMergerUnchecked();
 }

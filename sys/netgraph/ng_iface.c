@@ -68,6 +68,7 @@
 #include <sys/rmlock.h>
 #include <sys/sockio.h>
 #include <sys/socket.h>
+#include <sys/sysctl.h>
 #include <sys/syslog.h>
 #include <sys/libkern.h>
 
@@ -91,6 +92,13 @@ static MALLOC_DEFINE(M_NETGRAPH_IFACE, "netgraph_iface", "netgraph iface node");
 #else
 #define M_NETGRAPH_IFACE M_NETGRAPH
 #endif
+
+static SYSCTL_NODE(_net_graph, OID_AUTO, iface, CTLFLAG_RW, 0,
+    "Point to point netgraph interface");
+VNET_DEFINE_STATIC(int, ng_iface_max_nest) = 2;
+#define	V_ng_iface_max_nest	VNET(ng_iface_max_nest)
+SYSCTL_INT(_net_graph_iface, OID_AUTO, max_nesting, CTLFLAG_VNET | CTLFLAG_RW,
+    &VNET_NAME(ng_iface_max_nest), 0, "Max nested tunnels");
 
 /* This struct describes one address family */
 struct iffam {
@@ -355,7 +363,8 @@ ng_iface_output(struct ifnet *ifp, struct mbuf *m,
 	}
 
 	/* Protect from deadly infinite recursion. */
-	error = if_tunnel_check_nesting(ifp, m, NGM_IFACE_COOKIE, 1);
+	error = if_tunnel_check_nesting(ifp, m, NGM_IFACE_COOKIE,
+	    V_ng_iface_max_nest);
 	if (error) {
 		m_freem(m);
 		return (error);
@@ -681,6 +690,7 @@ ng_iface_rcvdata(hook_p hook, item_p item)
 	const priv_p priv = NG_NODE_PRIVATE(NG_HOOK_NODE(hook));
 	const iffam_p iffam = get_iffam_from_hook(priv, hook);
 	struct ifnet *const ifp = priv->ifp;
+	struct epoch_tracker et;
 	struct mbuf *m;
 	int isr;
 
@@ -722,7 +732,9 @@ ng_iface_rcvdata(hook_p hook, item_p item)
 	}
 	random_harvest_queue(m, sizeof(*m), RANDOM_NET_NG);
 	M_SETFIB(m, ifp->if_fib);
+	NET_EPOCH_ENTER(et);
 	netisr_dispatch(isr, m);
+	NET_EPOCH_EXIT(et);
 	return (0);
 }
 

@@ -1,9 +1,8 @@
 //===-- sanitizer_libc.cc -------------------------------------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -73,6 +72,18 @@ void *internal_memmove(void *dest, const void *src, uptr n) {
 }
 
 void *internal_memset(void* s, int c, uptr n) {
+  // Optimize for the most performance-critical case:
+  if ((reinterpret_cast<uptr>(s) % 16) == 0 && (n % 16) == 0) {
+    u64 *p = reinterpret_cast<u64*>(s);
+    u64 *e = p + n / 8;
+    u64 v = c;
+    v |= v << 8;
+    v |= v << 16;
+    v |= v << 32;
+    for (; p < e; p += 2)
+      p[0] = p[1] = v;
+    return s;
+  }
   // The next line prevents Clang from making a call to memset() instead of the
   // loop below.
   // FIXME: building the runtime with -ffreestanding is a better idea. However

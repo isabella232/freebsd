@@ -134,6 +134,12 @@ struct vm_operations_struct {
 	int	(*access) (struct vm_area_struct *, unsigned long, void *, int, int);
 };
 
+struct sysinfo {
+	uint64_t totalram;
+	uint64_t totalhigh;
+	uint32_t mem_unit;
+};
+
 /*
  * Compute log2 of the power of two rounded up count of pages
  * needed for size bytes.
@@ -180,12 +186,8 @@ apply_to_page_range(struct mm_struct *mm, unsigned long address,
 	return (-ENOTSUP);
 }
 
-static inline int
-zap_vma_ptes(struct vm_area_struct *vma, unsigned long address,
-    unsigned long size)
-{
-	return (-ENOTSUP);
-}
+int zap_vma_ptes(struct vm_area_struct *vma, unsigned long address,
+    unsigned long size);
 
 static inline int
 remap_pfn_range(struct vm_area_struct *vma, unsigned long addr,
@@ -225,9 +227,7 @@ mark_page_accessed(struct vm_page *page)
 static inline void
 get_page(struct vm_page *page)
 {
-	vm_page_lock(page);
 	vm_page_wire(page);
-	vm_page_unlock(page);
 }
 
 extern long
@@ -248,10 +248,7 @@ get_user_pages_remote(struct task_struct *, struct mm_struct *,
 static inline void
 put_page(struct vm_page *page)
 {
-	vm_page_lock(page);
-	if (vm_page_unwire(page, PQ_ACTIVE) && page->object == NULL)
-		vm_page_free(page);
-	vm_page_unlock(page);
+	vm_page_unwire(page, PQ_ACTIVE);
 }
 
 #define	copy_highpage(to, from) pmap_copy_page(from, to)
@@ -272,5 +269,6 @@ vmalloc_to_page(const void *addr)
 }
 
 extern int is_vmalloc_addr(const void *addr);
+void si_meminfo(struct sysinfo *si);
 
 #endif					/* _LINUX_MM_H_ */

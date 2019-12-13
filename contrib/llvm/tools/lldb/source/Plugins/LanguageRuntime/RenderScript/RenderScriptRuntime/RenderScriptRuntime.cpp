@@ -1,18 +1,11 @@
 //===-- RenderScriptRuntime.cpp ---------------------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
-// C Includes
-// C++ Includes
-// Other libraries and framework includes
-#include "llvm/ADT/StringSwitch.h"
-
-// Project includes
 #include "RenderScriptRuntime.h"
 #include "RenderScriptScriptGroup.h"
 
@@ -20,7 +13,6 @@
 #include "lldb/Core/Debugger.h"
 #include "lldb/Core/DumpDataExtractor.h"
 #include "lldb/Core/PluginManager.h"
-#include "lldb/Core/RegisterValue.h"
 #include "lldb/Core/ValueObjectVariable.h"
 #include "lldb/DataFormatters/DumpValueObjectOptions.h"
 #include "lldb/Expression/UserExpression.h"
@@ -41,16 +33,22 @@
 #include "lldb/Target/Thread.h"
 #include "lldb/Utility/Args.h"
 #include "lldb/Utility/ConstString.h"
-#include "lldb/Utility/DataBufferLLVM.h"
 #include "lldb/Utility/Log.h"
+#include "lldb/Utility/RegisterValue.h"
 #include "lldb/Utility/RegularExpression.h"
 #include "lldb/Utility/Status.h"
+
+#include "llvm/ADT/StringSwitch.h"
+
+#include <memory>
 
 using namespace lldb;
 using namespace lldb_private;
 using namespace lldb_renderscript;
 
 #define FMT_COORD "(%" PRIu32 ", %" PRIu32 ", %" PRIu32 ")"
+
+char RenderScriptRuntime::ID = 0;
 
 namespace {
 
@@ -596,7 +594,7 @@ struct RenderScriptRuntime::Element {
       array_size;        // Number of items in array, only needed for structs
   ConstString type_name; // Name of type, only needed for structs
 
-  static const ConstString &
+  static ConstString 
   GetFallbackStructName(); // Print this as the type name of a struct Element
                            // If we can't resolve the actual struct name
 
@@ -696,7 +694,7 @@ struct RenderScriptRuntime::AllocationDetails {
   }
 };
 
-const ConstString &RenderScriptRuntime::Element::GetFallbackStructName() {
+ConstString RenderScriptRuntime::Element::GetFallbackStructName() {
   static const ConstString FallbackStructName("struct");
   return FallbackStructName;
 }
@@ -794,9 +792,7 @@ const uint32_t RenderScriptRuntime::AllocationDetails::RSTypeToFormat[][3] = {
     // RS_TYPE_MATRIX_2X2
     {eFormatVectorOfFloat32, eFormatVectorOfFloat32, sizeof(float) * 4}};
 
-//------------------------------------------------------------------
 // Static Functions
-//------------------------------------------------------------------
 LanguageRuntime *
 RenderScriptRuntime::CreateInstance(Process *process,
                                     lldb::LanguageType language) {
@@ -1034,16 +1030,12 @@ void RenderScriptRuntime::ModulesDidLoad(const ModuleList &module_list) {
   }
 }
 
-//------------------------------------------------------------------
 // PluginInterface protocol
-//------------------------------------------------------------------
 lldb_private::ConstString RenderScriptRuntime::GetPluginName() {
   return GetPluginNameStatic();
 }
 
 uint32_t RenderScriptRuntime::GetPluginVersion() { return 1; }
-
-bool RenderScriptRuntime::IsVTableName(const char *name) { return false; }
 
 bool RenderScriptRuntime::GetDynamicTypeAndAddress(
     ValueObject &in_value, lldb::DynamicValueType use_dynamic,
@@ -1131,9 +1123,9 @@ bool RenderScriptRuntime::HookCallback(void *baton,
   RuntimeHook *hook = (RuntimeHook *)baton;
   ExecutionContext exe_ctx(ctx->exe_ctx_ref);
 
-  RenderScriptRuntime *lang_rt =
-      (RenderScriptRuntime *)exe_ctx.GetProcessPtr()->GetLanguageRuntime(
-          eLanguageTypeExtRenderScript);
+  RenderScriptRuntime *lang_rt = llvm::cast<RenderScriptRuntime>(
+      exe_ctx.GetProcessPtr()->GetLanguageRuntime(
+          eLanguageTypeExtRenderScript));
 
   lang_rt->HookCallback(hook, exe_ctx);
 
@@ -1217,7 +1209,7 @@ void RenderScriptRuntime::CaptureDebugHintScriptGroup2(
       }
     }
     if (!group) {
-      group.reset(new RSScriptGroupDescriptor);
+      group = std::make_shared<RSScriptGroupDescriptor>();
       group->m_name = group_name;
       m_scriptGroups.push_back(group);
     } else {
@@ -1506,9 +1498,9 @@ void RenderScriptRuntime::CaptureAllocationDestroy(RuntimeHook *hook,
                 uint64_t(args[eRsContext]), uint64_t(args[eRsAlloc]));
 
   for (auto iter = m_allocations.begin(); iter != m_allocations.end(); ++iter) {
-    auto &allocation_ap = *iter; // get the unique pointer
-    if (allocation_ap->address.isValid() &&
-        *allocation_ap->address.get() == addr_t(args[eRsAlloc])) {
+    auto &allocation_up = *iter; // get the unique pointer
+    if (allocation_up->address.isValid() &&
+        *allocation_up->address.get() == addr_t(args[eRsAlloc])) {
       m_allocations.erase(iter);
       if (log)
         log->Printf("%s - deleted allocation entry.", __FUNCTION__);
@@ -1980,8 +1972,8 @@ bool RenderScriptRuntime::JITTypePacked(AllocationDetails *alloc,
 
   // We want 4 elements from packed data
   const uint32_t num_exprs = 4;
-  assert(num_exprs == (eExprTypeElemPtr - eExprTypeDimX + 1) &&
-         "Invalid number of expressions");
+  static_assert(num_exprs == (eExprTypeElemPtr - eExprTypeDimX + 1),
+                "Invalid number of expressions");
 
   char expr_bufs[num_exprs][jit_max_expr_size];
   uint64_t results[num_exprs];
@@ -2039,8 +2031,8 @@ bool RenderScriptRuntime::JITElementPacked(Element &elem,
 
   // We want 4 elements from packed data
   const uint32_t num_exprs = 4;
-  assert(num_exprs == (eExprElementFieldCount - eExprElementType + 1) &&
-         "Invalid number of expressions");
+  static_assert(num_exprs == (eExprElementFieldCount - eExprElementType + 1),
+                "Invalid number of expressions");
 
   char expr_bufs[num_exprs][jit_max_expr_size];
   uint64_t results[num_exprs];
@@ -2079,10 +2071,8 @@ bool RenderScriptRuntime::JITElementPacked(Element &elem,
 
   // If this Element has subelements then JIT rsaElementGetSubElements() for
   // details about its fields
-  if (*elem.field_count.get() > 0 && !JITSubelements(elem, context, frame_ptr))
-    return false;
-
-  return true;
+  return !(*elem.field_count.get() > 0 &&
+           !JITSubelements(elem, context, frame_ptr));
 }
 
 // JITs the RS runtime for information about the subelements/fields of a struct
@@ -2100,8 +2090,8 @@ bool RenderScriptRuntime::JITSubelements(Element &elem,
   }
 
   const short num_exprs = 3;
-  assert(num_exprs == (eExprSubelementsArrSize - eExprSubelementsId + 1) &&
-         "Invalid number of expressions");
+  static_assert(num_exprs == (eExprSubelementsArrSize - eExprSubelementsId + 1),
+                "Invalid number of expressions");
 
   char expr_buffer[jit_max_expr_size];
   uint64_t results;
@@ -2305,10 +2295,7 @@ bool RenderScriptRuntime::RefreshAllocation(AllocationDetails *alloc,
   SetElementSize(alloc->element);
 
   // Use GetOffsetPointer() to infer size of the allocation
-  if (!JITAllocationSize(alloc, frame_ptr))
-    return false;
-
-  return true;
+  return JITAllocationSize(alloc, frame_ptr);
 }
 
 // Function attempts to set the type_name member of the paramaterised Element
@@ -2372,7 +2359,7 @@ void RenderScriptRuntime::FindStructTypeName(Element &elem,
                     size_diff);
 
       for (uint32_t i = 0; i < size_diff; ++i) {
-        const ConstString &name = elem.children[num_children + i].type_name;
+        ConstString name = elem.children[num_children + i].type_name;
         if (strcmp(name.AsCString(), "#rs_padding") < 0)
           found = false;
       }
@@ -2529,21 +2516,22 @@ bool RenderScriptRuntime::LoadAllocation(Stream &strm, const uint32_t alloc_id,
          "Allocation information not available");
 
   // Check we can read from file
-  FileSpec file(path, true);
-  if (!file.Exists()) {
+  FileSpec file(path);
+  FileSystem::Instance().Resolve(file);
+  if (!FileSystem::Instance().Exists(file)) {
     strm.Printf("Error: File %s does not exist", path);
     strm.EOL();
     return false;
   }
 
-  if (!file.Readable()) {
+  if (!FileSystem::Instance().Readable(file)) {
     strm.Printf("Error: File %s does not have readable permissions", path);
     strm.EOL();
     return false;
   }
 
   // Read file into data buffer
-  auto data_sp = DataBufferLLVM::CreateFromPath(file.GetPath());
+  auto data_sp = FileSystem::Instance().CreateDataBuffer(file.GetPath());
 
   // Cast start of buffer to FileHeader and use pointer to read metadata
   void *file_buf = data_sp->GetBytes();
@@ -2753,9 +2741,14 @@ bool RenderScriptRuntime::SaveAllocation(Stream &strm, const uint32_t alloc_id,
          "Allocation information not available");
 
   // Check we can create writable file
-  FileSpec file_spec(path, true);
-  File file(file_spec, File::eOpenOptionWrite | File::eOpenOptionCanCreate |
-                           File::eOpenOptionTruncate);
+  FileSpec file_spec(path);
+  FileSystem::Instance().Resolve(file_spec);
+  File file;
+  FileSystem::Instance().Open(file, file_spec,
+                              File::eOpenOptionWrite |
+                                  File::eOpenOptionCanCreate |
+                                  File::eOpenOptionTruncate);
+
   if (!file) {
     strm.Printf("Error: Failed to open '%s' for writing", path);
     strm.EOL();
@@ -2859,7 +2852,7 @@ bool RenderScriptRuntime::LoadModule(const lldb::ModuleSP &module_sp) {
     switch (GetModuleKind(module_sp)) {
     case eModuleKindKernelObj: {
       RSModuleDescriptorSP module_desc;
-      module_desc.reset(new RSModuleDescriptor(module_sp));
+      module_desc = std::make_shared<RSModuleDescriptor>(module_sp);
       if (module_desc->ParseRSInfo()) {
         m_rsmodules.push_back(module_desc);
         module_desc->WarnIfVersionMismatch(GetProcess()
@@ -3079,7 +3072,8 @@ bool RSModuleDescriptor::ParseRSInfo() {
   const addr_t size = info_sym->GetByteSize();
   const FileSpec fs = m_module->GetFileSpec();
 
-  auto buffer = DataBufferLLVM::CreateSliceFromPath(fs.GetPath(), size, addr);
+  auto buffer =
+      FileSystem::Instance().CreateDataBuffer(fs.GetPath(), size, addr);
   if (!buffer)
     return false;
 
@@ -3596,7 +3590,7 @@ void RenderScriptRuntime::SetBreakAllKernels(bool do_break, TargetSP target) {
 // Given the name of a kernel this function creates a breakpoint using our own
 // breakpoint resolver, and returns the Breakpoint shared pointer.
 BreakpointSP
-RenderScriptRuntime::CreateKernelBreakpoint(const ConstString &name) {
+RenderScriptRuntime::CreateKernelBreakpoint(ConstString name) {
   Log *log(
       GetLogIfAnyCategoriesSet(LIBLLDB_LOG_LANGUAGE | LIBLLDB_LOG_BREAKPOINTS));
 
@@ -3624,7 +3618,7 @@ RenderScriptRuntime::CreateKernelBreakpoint(const ConstString &name) {
 }
 
 BreakpointSP
-RenderScriptRuntime::CreateReductionBreakpoint(const ConstString &name,
+RenderScriptRuntime::CreateReductionBreakpoint(ConstString name,
                                                int kernel_types) {
   Log *log(
       GetLogIfAnyCategoriesSet(LIBLLDB_LOG_LANGUAGE | LIBLLDB_LOG_BREAKPOINTS));
@@ -3718,7 +3712,8 @@ bool RenderScriptRuntime::GetKernelCoordinate(RSCoordinate &coord,
       continue;
 
     // Find the function name
-    const SymbolContext sym_ctx = frame_sp->GetSymbolContext(false);
+    const SymbolContext sym_ctx =
+        frame_sp->GetSymbolContext(eSymbolContextFunction);
     const ConstString func_name = sym_ctx.GetFunctionName();
     if (!func_name)
       continue;
@@ -3864,7 +3859,7 @@ bool RenderScriptRuntime::PlaceBreakpointOnKernel(TargetSP target,
 }
 
 BreakpointSP
-RenderScriptRuntime::CreateScriptGroupBreakpoint(const ConstString &name,
+RenderScriptRuntime::CreateScriptGroupBreakpoint(ConstString name,
                                                  bool stop_on_all) {
   Log *log(
       GetLogIfAnyCategoriesSet(LIBLLDB_LOG_LANGUAGE | LIBLLDB_LOG_BREAKPOINTS));
@@ -3894,7 +3889,7 @@ RenderScriptRuntime::CreateScriptGroupBreakpoint(const ConstString &name,
 
 bool RenderScriptRuntime::PlaceBreakpointOnScriptGroup(TargetSP target,
                                                        Stream &strm,
-                                                       const ConstString &name,
+                                                       ConstString name,
                                                        bool multi) {
   InitSearchFilter(target);
   BreakpointSP bp = CreateScriptGroupBreakpoint(name, multi);
@@ -4127,9 +4122,9 @@ public:
   ~CommandObjectRenderScriptRuntimeModuleDump() override = default;
 
   bool DoExecute(Args &command, CommandReturnObject &result) override {
-    RenderScriptRuntime *runtime =
-        (RenderScriptRuntime *)m_exe_ctx.GetProcessPtr()->GetLanguageRuntime(
-            eLanguageTypeExtRenderScript);
+    RenderScriptRuntime *runtime = llvm::cast<RenderScriptRuntime>(
+        m_exe_ctx.GetProcessPtr()->GetLanguageRuntime(
+            eLanguageTypeExtRenderScript));
     runtime->DumpModules(result.GetOutputStream());
     result.SetStatus(eReturnStatusSuccessFinishResult);
     return true;
@@ -4162,22 +4157,22 @@ public:
   ~CommandObjectRenderScriptRuntimeKernelList() override = default;
 
   bool DoExecute(Args &command, CommandReturnObject &result) override {
-    RenderScriptRuntime *runtime =
-        (RenderScriptRuntime *)m_exe_ctx.GetProcessPtr()->GetLanguageRuntime(
-            eLanguageTypeExtRenderScript);
+    RenderScriptRuntime *runtime = llvm::cast<RenderScriptRuntime>(
+        m_exe_ctx.GetProcessPtr()->GetLanguageRuntime(
+            eLanguageTypeExtRenderScript));
     runtime->DumpKernels(result.GetOutputStream());
     result.SetStatus(eReturnStatusSuccessFinishResult);
     return true;
   }
 };
 
-static OptionDefinition g_renderscript_reduction_bp_set_options[] = {
+static constexpr OptionDefinition g_renderscript_reduction_bp_set_options[] = {
     {LLDB_OPT_SET_1, false, "function-role", 't',
-     OptionParser::eRequiredArgument, nullptr, nullptr, 0, eArgTypeOneLiner,
+     OptionParser::eRequiredArgument, nullptr, {}, 0, eArgTypeOneLiner,
      "Break on a comma separated set of reduction kernel types "
      "(accumulator,outcoverter,combiner,initializer"},
     {LLDB_OPT_SET_1, false, "coordinate", 'c', OptionParser::eRequiredArgument,
-     nullptr, nullptr, 0, eArgTypeValue,
+     nullptr, {}, 0, eArgTypeValue,
      "Set a breakpoint on a single invocation of the kernel with specified "
      "coordinate.\n"
      "Coordinate takes the form 'x[,y][,z] where x,y,z are positive "
@@ -4330,9 +4325,9 @@ private:
   CommandOptions m_options;
 };
 
-static OptionDefinition g_renderscript_kernel_bp_set_options[] = {
+static constexpr OptionDefinition g_renderscript_kernel_bp_set_options[] = {
     {LLDB_OPT_SET_1, false, "coordinate", 'c', OptionParser::eRequiredArgument,
-     nullptr, nullptr, 0, eArgTypeValue,
+     nullptr, {}, 0, eArgTypeValue,
      "Set a breakpoint on a single invocation of the kernel with specified "
      "coordinate.\n"
      "Coordinate takes the form 'x[,y][,z] where x,y,z are positive "
@@ -4409,9 +4404,9 @@ public:
       return false;
     }
 
-    RenderScriptRuntime *runtime =
-        (RenderScriptRuntime *)m_exe_ctx.GetProcessPtr()->GetLanguageRuntime(
-            eLanguageTypeExtRenderScript);
+    RenderScriptRuntime *runtime = llvm::cast<RenderScriptRuntime>(
+        m_exe_ctx.GetProcessPtr()->GetLanguageRuntime(
+            eLanguageTypeExtRenderScript));
 
     auto &outstream = result.GetOutputStream();
     auto &target = m_exe_ctx.GetTargetSP();
@@ -4593,18 +4588,18 @@ public:
   ~CommandObjectRenderScriptRuntimeContextDump() override = default;
 
   bool DoExecute(Args &command, CommandReturnObject &result) override {
-    RenderScriptRuntime *runtime =
-        (RenderScriptRuntime *)m_exe_ctx.GetProcessPtr()->GetLanguageRuntime(
-            eLanguageTypeExtRenderScript);
+    RenderScriptRuntime *runtime = llvm::cast<RenderScriptRuntime>(
+        m_exe_ctx.GetProcessPtr()->GetLanguageRuntime(
+            eLanguageTypeExtRenderScript));
     runtime->DumpContexts(result.GetOutputStream());
     result.SetStatus(eReturnStatusSuccessFinishResult);
     return true;
   }
 };
 
-static OptionDefinition g_renderscript_runtime_alloc_dump_options[] = {
+static constexpr OptionDefinition g_renderscript_runtime_alloc_dump_options[] = {
     {LLDB_OPT_SET_1, false, "file", 'f', OptionParser::eRequiredArgument,
-     nullptr, nullptr, 0, eArgTypeFilename,
+     nullptr, {}, 0, eArgTypeFilename,
      "Print results to specified file instead of command line."}};
 
 class CommandObjectRenderScriptRuntimeContext : public CommandObjectMultiword {
@@ -4650,8 +4645,9 @@ public:
 
       switch (short_option) {
       case 'f':
-        m_outfile.SetFile(option_arg, true, FileSpec::Style::native);
-        if (m_outfile.Exists()) {
+        m_outfile.SetFile(option_arg, FileSpec::Style::native);
+        FileSystem::Instance().Resolve(m_outfile);
+        if (FileSystem::Instance().Exists(m_outfile)) {
           m_outfile.Clear();
           err.SetErrorStringWithFormat("file already exists: '%s'",
                                        option_arg.str().c_str());
@@ -4706,16 +4702,17 @@ public:
         m_options.m_outfile; // Dump allocation to file instead
     if (outfile_spec) {
       // Open output file
-      char path[256];
-      outfile_spec.GetPath(path, sizeof(path));
-      if (outfile_stream.GetFile()
-              .Open(path, File::eOpenOptionWrite | File::eOpenOptionCanCreate)
-              .Success()) {
+      std::string path = outfile_spec.GetPath();
+      auto error = FileSystem::Instance().Open(
+          outfile_stream.GetFile(), outfile_spec,
+          File::eOpenOptionWrite | File::eOpenOptionCanCreate);
+      if (error.Success()) {
         output_strm = &outfile_stream;
-        result.GetOutputStream().Printf("Results written to '%s'", path);
+        result.GetOutputStream().Printf("Results written to '%s'",
+                                        path.c_str());
         result.GetOutputStream().EOL();
       } else {
-        result.AppendErrorWithFormat("Couldn't open file '%s'", path);
+        result.AppendErrorWithFormat("Couldn't open file '%s'", path.c_str());
         result.SetStatus(eReturnStatusFailed);
         return false;
       }
@@ -4738,9 +4735,9 @@ private:
   CommandOptions m_options;
 };
 
-static OptionDefinition g_renderscript_runtime_alloc_list_options[] = {
+static constexpr OptionDefinition g_renderscript_runtime_alloc_list_options[] = {
     {LLDB_OPT_SET_1, false, "id", 'i', OptionParser::eRequiredArgument, nullptr,
-     nullptr, 0, eArgTypeIndex,
+     {}, 0, eArgTypeIndex,
      "Only show details of a single allocation with specified id."}};
 
 class CommandObjectRenderScriptRuntimeAllocationList
@@ -4983,9 +4980,9 @@ public:
   ~CommandObjectRenderScriptRuntimeStatus() override = default;
 
   bool DoExecute(Args &command, CommandReturnObject &result) override {
-    RenderScriptRuntime *runtime =
-        (RenderScriptRuntime *)m_exe_ctx.GetProcessPtr()->GetLanguageRuntime(
-            eLanguageTypeExtRenderScript);
+    RenderScriptRuntime *runtime = llvm::cast<RenderScriptRuntime>(
+        m_exe_ctx.GetProcessPtr()->GetLanguageRuntime(
+            eLanguageTypeExtRenderScript));
     runtime->DumpStatus(result.GetOutputStream());
     result.SetStatus(eReturnStatusSuccessFinishResult);
     return true;

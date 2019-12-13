@@ -1,9 +1,8 @@
 //===- LowerTypeTests.cpp - type metadata lowering pass -------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -549,10 +548,10 @@ ByteArrayInfo *LowerTypeTestsModule::createByteArray(BitSetInfo &BSI) {
 }
 
 void LowerTypeTestsModule::allocateByteArrays() {
-  std::stable_sort(ByteArrayInfos.begin(), ByteArrayInfos.end(),
-                   [](const ByteArrayInfo &BAI1, const ByteArrayInfo &BAI2) {
-                     return BAI1.BitSize > BAI2.BitSize;
-                   });
+  llvm::stable_sort(ByteArrayInfos,
+                    [](const ByteArrayInfo &BAI1, const ByteArrayInfo &BAI2) {
+                      return BAI1.BitSize > BAI2.BitSize;
+                    });
 
   std::vector<uint64_t> ByteArrayOffsets(ByteArrayInfos.size());
 
@@ -619,7 +618,7 @@ Value *LowerTypeTestsModule::createBitSetTest(IRBuilder<> &B,
     }
 
     Value *ByteAddr = B.CreateGEP(Int8Ty, ByteArray, BitOffset);
-    Value *Byte = B.CreateLoad(ByteAddr);
+    Value *Byte = B.CreateLoad(Int8Ty, ByteAddr);
 
     Value *ByteAndMask =
         B.CreateAnd(Byte, ConstantExpr::getPtrToInt(TIL.BitMask, Int8Ty));
@@ -989,6 +988,7 @@ void LowerTypeTestsModule::importFunction(Function *F, bool isDefinition) {
     if (F->isDSOLocal()) {
       Function *RealF = Function::Create(F->getFunctionType(),
                                          GlobalValue::ExternalLinkage,
+                                         F->getAddressSpace(),
                                          Name + ".cfi", &M);
       RealF->setVisibility(GlobalVariable::HiddenVisibility);
       replaceDirectCalls(F, RealF);
@@ -1000,13 +1000,13 @@ void LowerTypeTestsModule::importFunction(Function *F, bool isDefinition) {
   if (F->isDeclarationForLinker() && !isDefinition) {
     // Declaration of an external function.
     FDecl = Function::Create(F->getFunctionType(), GlobalValue::ExternalLinkage,
-                             Name + ".cfi_jt", &M);
+                             F->getAddressSpace(), Name + ".cfi_jt", &M);
     FDecl->setVisibility(GlobalValue::HiddenVisibility);
   } else if (isDefinition) {
     F->setName(Name + ".cfi");
     F->setLinkage(GlobalValue::ExternalLinkage);
     FDecl = Function::Create(F->getFunctionType(), GlobalValue::ExternalLinkage,
-                             Name, &M);
+                             F->getAddressSpace(), Name, &M);
     FDecl->setVisibility(Visibility);
     Visibility = GlobalValue::HiddenVisibility;
 
@@ -1016,7 +1016,8 @@ void LowerTypeTestsModule::importFunction(Function *F, bool isDefinition) {
     for (auto &U : F->uses()) {
       if (auto *A = dyn_cast<GlobalAlias>(U.getUser())) {
         Function *AliasDecl = Function::Create(
-            F->getFunctionType(), GlobalValue::ExternalLinkage, "", &M);
+            F->getFunctionType(), GlobalValue::ExternalLinkage,
+            F->getAddressSpace(), "", &M);
         AliasDecl->takeName(A);
         A->replaceAllUsesWith(AliasDecl);
         ToErase.push_back(A);
@@ -1191,7 +1192,9 @@ void LowerTypeTestsModule::moveInitializerToModuleConstructor(
     WeakInitializerFn = Function::Create(
         FunctionType::get(Type::getVoidTy(M.getContext()),
                           /* IsVarArg */ false),
-        GlobalValue::InternalLinkage, "__cfi_global_var_init", &M);
+        GlobalValue::InternalLinkage,
+        M.getDataLayout().getProgramAddressSpace(),
+        "__cfi_global_var_init", &M);
     BasicBlock *BB =
         BasicBlock::Create(M.getContext(), "entry", WeakInitializerFn);
     ReturnInst::Create(M.getContext(), BB);
@@ -1234,7 +1237,8 @@ void LowerTypeTestsModule::replaceWeakDeclarationWithJumpTablePtr(
   // placeholder first.
   Function *PlaceholderFn =
       Function::Create(cast<FunctionType>(F->getValueType()),
-                       GlobalValue::ExternalWeakLinkage, "", &M);
+                       GlobalValue::ExternalWeakLinkage,
+                       F->getAddressSpace(), "", &M);
   replaceCfiUses(F, PlaceholderFn, IsDefinition);
 
   Constant *Target = ConstantExpr::getSelect(
@@ -1424,7 +1428,9 @@ void LowerTypeTestsModule::buildBitSetsFromFunctionsNative(
   Function *JumpTableFn =
       Function::Create(FunctionType::get(Type::getVoidTy(M.getContext()),
                                          /* IsVarArg */ false),
-                       GlobalValue::PrivateLinkage, ".cfi.jumptable", &M);
+                       GlobalValue::PrivateLinkage,
+                       M.getDataLayout().getProgramAddressSpace(),
+                       ".cfi.jumptable", &M);
   ArrayType *JumpTableType =
       ArrayType::get(getJumpTableEntryType(), Functions.size());
   auto JumpTable =
@@ -1546,11 +1552,10 @@ void LowerTypeTestsModule::buildBitSetsFromDisjointSet(
 
   // Order the sets of indices by size. The GlobalLayoutBuilder works best
   // when given small index sets first.
-  std::stable_sort(
-      TypeMembers.begin(), TypeMembers.end(),
-      [](const std::set<uint64_t> &O1, const std::set<uint64_t> &O2) {
-        return O1.size() < O2.size();
-      });
+  llvm::stable_sort(TypeMembers, [](const std::set<uint64_t> &O1,
+                                    const std::set<uint64_t> &O2) {
+    return O1.size() < O2.size();
+  });
 
   // Create a GlobalLayoutBuilder and provide it with index sets as layout
   // fragments. The GlobalLayoutBuilder tries to lay out members of fragments as
@@ -1686,6 +1691,14 @@ void LowerTypeTestsModule::replaceDirectCalls(Value *Old, Value *New) {
 }
 
 bool LowerTypeTestsModule::lower() {
+  // If only some of the modules were split, we cannot correctly perform
+  // this transformation. We already checked for the presense of type tests
+  // with partially split modules during the thin link, and would have emitted
+  // an error if any were found, so here we can simply return.
+  if ((ExportSummary && ExportSummary->partiallySplitLTOUnits()) ||
+      (ImportSummary && ImportSummary->partiallySplitLTOUnits()))
+    return false;
+
   Function *TypeTestFunc =
       M.getFunction(Intrinsic::getName(Intrinsic::type_test));
   Function *ICallBranchFunnelFunc =
@@ -1813,7 +1826,8 @@ bool LowerTypeTestsModule::lower() {
         if (!F)
           F = Function::Create(
               FunctionType::get(Type::getVoidTy(M.getContext()), false),
-              GlobalVariable::ExternalLinkage, FunctionName, &M);
+              GlobalVariable::ExternalLinkage,
+              M.getDataLayout().getProgramAddressSpace(), FunctionName, &M);
 
         // If the function is available_externally, remove its definition so
         // that it is handled the same way as a declaration. Later we will try
@@ -1997,7 +2011,7 @@ bool LowerTypeTestsModule::lower() {
     }
     Sets.emplace_back(I, MaxUniqueId);
   }
-  llvm::sort(Sets.begin(), Sets.end(),
+  llvm::sort(Sets,
              [](const std::pair<GlobalClassesTy::iterator, unsigned> &S1,
                 const std::pair<GlobalClassesTy::iterator, unsigned> &S2) {
                return S1.second < S2.second;
@@ -2022,12 +2036,12 @@ bool LowerTypeTestsModule::lower() {
 
     // Order type identifiers by unique ID for determinism. This ordering is
     // stable as there is a one-to-one mapping between metadata and unique IDs.
-    llvm::sort(TypeIds.begin(), TypeIds.end(), [&](Metadata *M1, Metadata *M2) {
+    llvm::sort(TypeIds, [&](Metadata *M1, Metadata *M2) {
       return TypeIdInfo[M1].UniqueId < TypeIdInfo[M2].UniqueId;
     });
 
     // Same for the branch funnels.
-    llvm::sort(ICallBranchFunnels.begin(), ICallBranchFunnels.end(),
+    llvm::sort(ICallBranchFunnels,
                [&](ICallBranchFunnel *F1, ICallBranchFunnel *F2) {
                  return F1->UniqueId < F2->UniqueId;
                });

@@ -144,6 +144,26 @@ the last one takes effect.
     Due to the chaotic nature of dynamic adaptation, compressed result is not reproducible.
     _note_ : at the time of this writing, `--adapt` can remain stuck at low speed
     when combined with multiple worker threads (>=2).
+* `--stream-size=#` :
+    Sets the pledged source size of input coming from a stream. This value must be exact, as it
+    will be included in the produced frame header. Incorrect stream sizes will cause an error.
+    This information will be used to better optimize compression parameters, resulting in
+    better and potentially faster compression, especially for smaller source sizes.
+* `--size-hint=#`:
+    When handling input from a stream, `zstd` must guess how large the source size
+    will be when optimizing compression parameters. If the stream size is relatively
+    small, this guess may be a poor one, resulting in a higher compression ratio than
+    expected. This feature allows for controlling the guess when needed.
+    Exact guesses result in better compression ratios. Overestimates result in slightly
+    degraded compression ratios, while underestimates may result in significant degradation.
+* `--rsyncable` :
+    `zstd` will periodically synchronize the compression state to make the
+    compressed file more rsync-friendly. There is a negligible impact to
+    compression ratio, and the faster compression levels will see a small
+    compression speed hit.
+    This feature does not work with `--single-thread`. You probably don't want
+    to use it with long range mode, since it will decrease the effectiveness of
+    the synchronization points, but your milage may vary.
 * `-D file`:
     use `file` as Dictionary to compress or decompress FILE(s)
 * `--no-dictID`:
@@ -170,7 +190,14 @@ the last one takes effect.
     keep source file(s) after successful compression or decompression.
     This is the default behavior.
 * `-r`:
-    operate recursively on dictionaries
+    operate recursively on directories
+* `--output-dir-flat[=dir]`:
+    resulting files are stored into target `dir` directory,
+    instead of same directory as origin file.
+    Be aware that this command can introduce name collision issues,
+    if multiple files, from different directories, end up having the same name.
+    Collision resolution ensures first file with a given name will be present in `dir`,
+    while in combination with `-f`, the last file will be present instead.
 * `--format=FORMAT`:
     compress and decompress in other formats. If compiled with
     support, zstd can compress to or decompress from other compression algorithm
@@ -187,10 +214,22 @@ the last one takes effect.
 * `-q`, `--quiet`:
     suppress warnings, interactivity, and notifications.
     specify twice to suppress errors too.
+* `--no-progress`:
+    do not display the progress bar, but keep all other messages.
 * `-C`, `--[no-]check`:
     add integrity check computed from uncompressed data (default: enabled)
 * `--`:
     All arguments after `--` are treated as files
+
+### Restricted usage of Environment Variables
+
+Using environment variables to set parameters has security implications.
+Therefore, this avenue is intentionally restricted.
+Only `ZSTD_CLEVEL` is supported currently, for setting compression level.
+`ZSTD_CLEVEL` can be used to set the level between 1 and 19 (the "normal" range).
+If the value of `ZSTD_CLEVEL` is not a valid integer, it will be ignored with a warning message.
+`ZSTD_CLEVEL` just replaces the default compression level (`3`).
+It can be overridden by corresponding command line arguments.
 
 
 DICTIONARY BUILDER
@@ -234,13 +273,15 @@ Compression of small files similar to the sample set will be greatly improved.
     This compares favorably to 4 bytes default.
     However, it's up to the dictionary manager to not assign twice the same ID to
     2 different dictionaries.
-* `--train-cover[=k#,d=#,steps=#,split=#]`:
+* `--train-cover[=k#,d=#,steps=#,split=#,shrink[=#]]`:
     Select parameters for the default dictionary builder algorithm named cover.
     If _d_ is not specified, then it tries _d_ = 6 and _d_ = 8.
     If _k_ is not specified, then it tries _steps_ values in the range [50, 2000].
     If _steps_ is not specified, then the default value of 40 is used.
     If _split_ is not specified or split <= 0, then the default value of 100 is used.
     Requires that _d_ <= _k_.
+    If _shrink_ flag is not used, then the default value for _shrinkDict_ of 0 is used.
+    If _shrink_ is not specified, then the default value for _shrinkDictMaxRegression_ of 1 is used.
 
     Selects segments of size _k_ with highest score to put in the dictionary.
     The score of a segment is computed by the sum of the frequencies of all the
@@ -252,6 +293,9 @@ Compression of small files similar to the sample set will be greatly improved.
     If _split_ is 100, all input samples are used for both training and testing
     to find optimal _d_ and _k_ to build dictionary.
     Supports multithreading if `zstd` is compiled with threading support.
+    Having _shrink_ enabled takes a truncated dictionary of minimum size and doubles
+    in size until compression ratio of the truncated dictionary is at most
+    _shrinkDictMaxRegression%_ worse than the compression ratio of the largest dictionary.
 
     Examples:
 
@@ -264,6 +308,10 @@ Compression of small files similar to the sample set will be greatly improved.
     `zstd --train-cover=k=50 FILEs`
 
     `zstd --train-cover=k=50,split=60 FILEs`
+
+    `zstd --train-cover=shrink FILEs`
+
+    `zstd --train-cover=shrink=2 FILEs`
 
 * `--train-fastcover[=k#,d=#,f=#,steps=#,split=#,accel=#]`:
     Same as cover but with extra parameters _f_ and _accel_ and different default value of split
@@ -331,9 +379,10 @@ The list of available _options_:
 - `strategy`=_strat_, `strat`=_strat_:
     Specify a strategy used by a match finder.
 
-    There are 8 strategies numbered from 1 to 8, from faster to stronger:
-    1=ZSTD\_fast, 2=ZSTD\_dfast, 3=ZSTD\_greedy, 4=ZSTD\_lazy,
-    5=ZSTD\_lazy2, 6=ZSTD\_btlazy2, 7=ZSTD\_btopt, 8=ZSTD\_btultra.
+    There are 9 strategies numbered from 1 to 9, from faster to stronger:
+    1=ZSTD\_fast, 2=ZSTD\_dfast, 3=ZSTD\_greedy,
+    4=ZSTD\_lazy, 5=ZSTD\_lazy2, 6=ZSTD\_btlazy2,
+    7=ZSTD\_btopt, 8=ZSTD\_btultra, 9=ZSTD\_btultra2.
 
 - `windowLog`=_wlog_, `wlog`=_wlog_:
     Specify the maximum number of bits for a match distance.
@@ -375,19 +424,19 @@ The list of available _options_:
 
     The minimum _slog_ is 1 and the maximum is 26.
 
-- `searchLength`=_slen_, `slen`=_slen_:
+- `minMatch`=_mml_, `mml`=_mml_:
     Specify the minimum searched length of a match in a hash table.
 
     Larger search lengths usually decrease compression ratio but improve
     decompression speed.
 
-    The minimum _slen_ is 3 and the maximum is 7.
+    The minimum _mml_ is 3 and the maximum is 7.
 
 - `targetLen`=_tlen_, `tlen`=_tlen_:
     The impact of this field vary depending on selected strategy.
 
-    For ZSTD\_btopt and ZSTD\_btultra, it specifies the minimum match length
-    that causes match finder to stop searching for better matches.
+    For ZSTD\_btopt, ZSTD\_btultra and ZSTD\_btultra2, it specifies
+    the minimum match length that causes match finder to stop searching.
     A larger `targetLen` usually improves compression ratio
     but decreases compression speed.
 
@@ -406,13 +455,14 @@ The list of available _options_:
     Reloading more data improves compression ratio, but decreases speed.
 
     The minimum _ovlog_ is 0, and the maximum is 9.
-    0 means "no overlap", hence completely independent jobs.
+    1 means "no overlap", hence completely independent jobs.
     9 means "full overlap", meaning up to `windowSize` is reloaded from previous job.
-    Reducing _ovlog_ by 1 reduces the amount of reload by a factor 2.
-    Default _ovlog_ is 6, which means "reload `windowSize / 8`".
-    Exception : the maximum compression level (22) has a default _ovlog_ of 9.
+    Reducing _ovlog_ by 1 reduces the reloaded amount by a factor 2.
+    For example, 8 means "windowSize/2", and 6 means "windowSize/8".
+    Value 0 is special and means "default" : _ovlog_ is automatically determined by `zstd`.
+    In which case, _ovlog_ will range from 6 to 9, depending on selected _strat_.
 
-- `ldmHashLog`=_ldmhlog_, `ldmhlog`=_ldmhlog_:
+- `ldmHashLog`=_lhlog_, `lhlog`=_lhlog_:
     Specify the maximum size for a hash table used for long distance matching.
 
     This option is ignored unless long distance matching is enabled.
@@ -420,18 +470,18 @@ The list of available _options_:
     Bigger hash tables usually improve compression ratio at the expense of more
     memory during compression and a decrease in compression speed.
 
-    The minimum _ldmhlog_ is 6 and the maximum is 26 (default: 20).
+    The minimum _lhlog_ is 6 and the maximum is 26 (default: 20).
 
-- `ldmSearchLength`=_ldmslen_, `ldmslen`=_ldmslen_:
+- `ldmMinMatch`=_lmml_, `lmml`=_lmml_:
     Specify the minimum searched length of a match for long distance matching.
 
     This option is ignored unless long distance matching is enabled.
 
     Larger/very small values usually decrease compression ratio.
 
-    The minimum _ldmslen_ is 4 and the maximum is 4096 (default: 64).
+    The minimum _lmml_ is 4 and the maximum is 4096 (default: 64).
 
-- `ldmBucketSizeLog`=_ldmblog_, `ldmblog`=_ldmblog_:
+- `ldmBucketSizeLog`=_lblog_, `lblog`=_lblog_:
     Specify the size of each bucket for the hash table used for long distance
     matching.
 
@@ -440,9 +490,9 @@ The list of available _options_:
     Larger bucket sizes improve collision resolution but decrease compression
     speed.
 
-    The minimum _ldmblog_ is 0 and the maximum is 8 (default: 3).
+    The minimum _lblog_ is 0 and the maximum is 8 (default: 3).
 
-- `ldmHashEveryLog`=_ldmhevery_, `ldmhevery`=_ldmhevery_:
+- `ldmHashRateLog`=_lhrlog_, `lhrlog`=_lhrlog_:
     Specify the frequency of inserting entries into the long distance matching
     hash table.
 
@@ -451,13 +501,13 @@ The list of available _options_:
     Larger values will improve compression speed. Deviating far from the
     default value will likely result in a decrease in compression ratio.
 
-    The default value is `wlog - ldmhlog`.
+    The default value is `wlog - lhlog`.
 
 ### Example
 The following parameters sets advanced compression options to something
 similar to predefined level 19 for files bigger than 256 KB:
 
-`--zstd`=wlog=23,clog=23,hlog=22,slog=6,slen=3,tlen=48,strat=6
+`--zstd`=wlog=23,clog=23,hlog=22,slog=6,mml=3,tlen=48,strat=6
 
 ### -B#:
 Select the size of each compression job.

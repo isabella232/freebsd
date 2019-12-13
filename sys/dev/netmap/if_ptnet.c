@@ -68,7 +68,6 @@
 #include <netinet6/ip6_var.h>
 #include <netinet/udp.h>
 #include <netinet/tcp.h>
-#include <netinet/sctp.h>
 
 #include <machine/bus.h>
 #include <machine/resource.h>
@@ -281,9 +280,8 @@ static inline void ptnet_kick(struct ptnet_queue *pq)
 #define PTNET_HDR_SIZE		sizeof(struct virtio_net_hdr_mrg_rxbuf)
 #define PTNET_MAX_PKT_SIZE	65536
 
-#define PTNET_CSUM_OFFLOAD	(CSUM_TCP | CSUM_UDP | CSUM_SCTP)
-#define PTNET_CSUM_OFFLOAD_IPV6	(CSUM_TCP_IPV6 | CSUM_UDP_IPV6 |\
-				 CSUM_SCTP_IPV6)
+#define PTNET_CSUM_OFFLOAD	(CSUM_TCP | CSUM_UDP)
+#define PTNET_CSUM_OFFLOAD_IPV6	(CSUM_TCP_IPV6 | CSUM_UDP_IPV6)
 #define PTNET_ALL_OFFLOAD	(CSUM_TSO | PTNET_CSUM_OFFLOAD |\
 				 PTNET_CSUM_OFFLOAD_IPV6)
 
@@ -1151,10 +1149,10 @@ ptnet_sync_from_csb(struct ptnet_softc *sc, struct netmap_adapter *na)
 		kring->nr_hwtail = kring->rtail =
 			kring->ring->tail = ktoa->hwtail;
 
-		ND("%d,%d: csb {hc %u h %u c %u ht %u}", t, i,
+		nm_prdis("%d,%d: csb {hc %u h %u c %u ht %u}", t, i,
 		   ktoa->hwcur, atok->head, atok->cur,
 		   ktoa->hwtail);
-		ND("%d,%d: kring {hc %u rh %u rc %u h %u c %u ht %u rt %u t %u}",
+		nm_prdis("%d,%d: kring {hc %u rh %u rc %u h %u c %u ht %u rt %u t %u}",
 		   t, i, kring->nr_hwcur, kring->rhead, kring->rcur,
 		   kring->ring->head, kring->ring->cur, kring->nr_hwtail,
 		   kring->rtail, kring->ring->tail);
@@ -1179,7 +1177,6 @@ ptnet_nm_register(struct netmap_adapter *na, int onoff)
 	struct ptnet_softc *sc = if_getsoftc(ifp);
 	int native = (na == &sc->ptna->hwup.up);
 	struct ptnet_queue *pq;
-	enum txrx t;
 	int ret = 0;
 	int i;
 
@@ -1194,7 +1191,7 @@ ptnet_nm_register(struct netmap_adapter *na, int onoff)
 	 * in the RX rings, since we will not receive further interrupts
 	 * until these will be processed. */
 	if (native && !onoff && na->active_fds == 0) {
-		D("Exit netmap mode, re-enable interrupts");
+		nm_prinf("Exit netmap mode, re-enable interrupts");
 		for (i = 0; i < sc->num_rings; i++) {
 			pq = sc->queues + i;
 			pq->atok->appl_need_kick = 1;
@@ -1230,30 +1227,14 @@ ptnet_nm_register(struct netmap_adapter *na, int onoff)
 		/* If not native, don't call nm_set_native_flags, since we don't want
 		 * to replace if_transmit method, nor set NAF_NETMAP_ON */
 		if (native) {
-			for_rx_tx(t) {
-				for (i = 0; i <= nma_get_nrings(na, t); i++) {
-					struct netmap_kring *kring = NMR(na, t)[i];
-
-					if (nm_kring_pending_on(kring)) {
-						kring->nr_mode = NKR_NETMAP_ON;
-					}
-				}
-			}
+			netmap_krings_mode_commit(na, onoff);
 			nm_set_native_flags(na);
 		}
 
 	} else {
 		if (native) {
 			nm_clear_native_flags(na);
-			for_rx_tx(t) {
-				for (i = 0; i <= nma_get_nrings(na, t); i++) {
-					struct netmap_kring *kring = NMR(na, t)[i];
-
-					if (nm_kring_pending_off(kring)) {
-						kring->nr_mode = NKR_NETMAP_OFF;
-					}
-				}
-			}
+			netmap_krings_mode_commit(na, onoff);
 		}
 
 		if (sc->ptna->backend_users == 0) {
@@ -1354,150 +1335,6 @@ ptnet_rx_intr(void *opaque)
 	ptnet_rx_eof(pq, PTNET_RX_BUDGET, true);
 }
 
-/* The following offloadings-related functions are taken from the vtnet
- * driver, but the same functionality is required for the ptnet driver.
- * As a temporary solution, I copied this code from vtnet and I started
- * to generalize it (taking away driver-specific statistic accounting),
- * making as little modifications as possible.
- * In the future we need to share these functions between vtnet and ptnet.
- */
-static int
-ptnet_tx_offload_ctx(struct mbuf *m, int *etype, int *proto, int *start)
-{
-	struct ether_vlan_header *evh;
-	int offset;
-
-	evh = mtod(m, struct ether_vlan_header *);
-	if (evh->evl_encap_proto == htons(ETHERTYPE_VLAN)) {
-		/* BMV: We should handle nested VLAN tags too. */
-		*etype = ntohs(evh->evl_proto);
-		offset = sizeof(struct ether_vlan_header);
-	} else {
-		*etype = ntohs(evh->evl_encap_proto);
-		offset = sizeof(struct ether_header);
-	}
-
-	switch (*etype) {
-#if defined(INET)
-	case ETHERTYPE_IP: {
-		struct ip *ip, iphdr;
-		if (__predict_false(m->m_len < offset + sizeof(struct ip))) {
-			m_copydata(m, offset, sizeof(struct ip),
-			    (caddr_t) &iphdr);
-			ip = &iphdr;
-		} else
-			ip = (struct ip *)(m->m_data + offset);
-		*proto = ip->ip_p;
-		*start = offset + (ip->ip_hl << 2);
-		break;
-	}
-#endif
-#if defined(INET6)
-	case ETHERTYPE_IPV6:
-		*proto = -1;
-		*start = ip6_lasthdr(m, offset, IPPROTO_IPV6, proto);
-		/* Assert the network stack sent us a valid packet. */
-		KASSERT(*start > offset,
-		    ("%s: mbuf %p start %d offset %d proto %d", __func__, m,
-		    *start, offset, *proto));
-		break;
-#endif
-	default:
-		/* Here we should increment the tx_csum_bad_ethtype counter. */
-		return (EINVAL);
-	}
-
-	return (0);
-}
-
-static int
-ptnet_tx_offload_tso(if_t ifp, struct mbuf *m, int eth_type,
-		     int offset, bool allow_ecn, struct virtio_net_hdr *hdr)
-{
-	static struct timeval lastecn;
-	static int curecn;
-	struct tcphdr *tcp, tcphdr;
-
-	if (__predict_false(m->m_len < offset + sizeof(struct tcphdr))) {
-		m_copydata(m, offset, sizeof(struct tcphdr), (caddr_t) &tcphdr);
-		tcp = &tcphdr;
-	} else
-		tcp = (struct tcphdr *)(m->m_data + offset);
-
-	hdr->hdr_len = offset + (tcp->th_off << 2);
-	hdr->gso_size = m->m_pkthdr.tso_segsz;
-	hdr->gso_type = eth_type == ETHERTYPE_IP ? VIRTIO_NET_HDR_GSO_TCPV4 :
-	    VIRTIO_NET_HDR_GSO_TCPV6;
-
-	if (tcp->th_flags & TH_CWR) {
-		/*
-		 * Drop if VIRTIO_NET_F_HOST_ECN was not negotiated. In FreeBSD,
-		 * ECN support is not on a per-interface basis, but globally via
-		 * the net.inet.tcp.ecn.enable sysctl knob. The default is off.
-		 */
-		if (!allow_ecn) {
-			if (ppsratecheck(&lastecn, &curecn, 1))
-				if_printf(ifp,
-				    "TSO with ECN not negotiated with host\n");
-			return (ENOTSUP);
-		}
-		hdr->gso_type |= VIRTIO_NET_HDR_GSO_ECN;
-	}
-
-	/* Here we should increment tx_tso counter. */
-
-	return (0);
-}
-
-static struct mbuf *
-ptnet_tx_offload(if_t ifp, struct mbuf *m, bool allow_ecn,
-		 struct virtio_net_hdr *hdr)
-{
-	int flags, etype, csum_start, proto, error;
-
-	flags = m->m_pkthdr.csum_flags;
-
-	error = ptnet_tx_offload_ctx(m, &etype, &proto, &csum_start);
-	if (error)
-		goto drop;
-
-	if ((etype == ETHERTYPE_IP && flags & PTNET_CSUM_OFFLOAD) ||
-	    (etype == ETHERTYPE_IPV6 && flags & PTNET_CSUM_OFFLOAD_IPV6)) {
-		/*
-		 * We could compare the IP protocol vs the CSUM_ flag too,
-		 * but that really should not be necessary.
-		 */
-		hdr->flags |= VIRTIO_NET_HDR_F_NEEDS_CSUM;
-		hdr->csum_start = csum_start;
-		hdr->csum_offset = m->m_pkthdr.csum_data;
-		/* Here we should increment the tx_csum counter. */
-	}
-
-	if (flags & CSUM_TSO) {
-		if (__predict_false(proto != IPPROTO_TCP)) {
-			/* Likely failed to correctly parse the mbuf.
-			 * Here we should increment the tx_tso_not_tcp
-			 * counter. */
-			goto drop;
-		}
-
-		KASSERT(hdr->flags & VIRTIO_NET_HDR_F_NEEDS_CSUM,
-		    ("%s: mbuf %p TSO without checksum offload %#x",
-		    __func__, m, flags));
-
-		error = ptnet_tx_offload_tso(ifp, m, etype, csum_start,
-					     allow_ecn, hdr);
-		if (error)
-			goto drop;
-	}
-
-	return (m);
-
-drop:
-	m_freem(m);
-	return (NULL);
-}
-
 static void
 ptnet_vlan_tag_remove(struct mbuf *m)
 {
@@ -1512,165 +1349,6 @@ ptnet_vlan_tag_remove(struct mbuf *m)
 	    ETHER_HDR_LEN - ETHER_TYPE_LEN);
 	m_adj(m, ETHER_VLAN_ENCAP_LEN);
 }
-
-/*
- * Use the checksum offset in the VirtIO header to set the
- * correct CSUM_* flags.
- */
-static int
-ptnet_rx_csum_by_offset(struct mbuf *m, uint16_t eth_type, int ip_start,
-			struct virtio_net_hdr *hdr)
-{
-#if defined(INET) || defined(INET6)
-	int offset = hdr->csum_start + hdr->csum_offset;
-#endif
-
-	/* Only do a basic sanity check on the offset. */
-	switch (eth_type) {
-#if defined(INET)
-	case ETHERTYPE_IP:
-		if (__predict_false(offset < ip_start + sizeof(struct ip)))
-			return (1);
-		break;
-#endif
-#if defined(INET6)
-	case ETHERTYPE_IPV6:
-		if (__predict_false(offset < ip_start + sizeof(struct ip6_hdr)))
-			return (1);
-		break;
-#endif
-	default:
-		/* Here we should increment the rx_csum_bad_ethtype counter. */
-		return (1);
-	}
-
-	/*
-	 * Use the offset to determine the appropriate CSUM_* flags. This is
-	 * a bit dirty, but we can get by with it since the checksum offsets
-	 * happen to be different. We assume the host host does not do IPv4
-	 * header checksum offloading.
-	 */
-	switch (hdr->csum_offset) {
-	case offsetof(struct udphdr, uh_sum):
-	case offsetof(struct tcphdr, th_sum):
-		m->m_pkthdr.csum_flags |= CSUM_DATA_VALID | CSUM_PSEUDO_HDR;
-		m->m_pkthdr.csum_data = 0xFFFF;
-		break;
-	case offsetof(struct sctphdr, checksum):
-		m->m_pkthdr.csum_flags |= CSUM_SCTP_VALID;
-		break;
-	default:
-		/* Here we should increment the rx_csum_bad_offset counter. */
-		return (1);
-	}
-
-	return (0);
-}
-
-static int
-ptnet_rx_csum_by_parse(struct mbuf *m, uint16_t eth_type, int ip_start,
-		       struct virtio_net_hdr *hdr)
-{
-	int offset, proto;
-
-	switch (eth_type) {
-#if defined(INET)
-	case ETHERTYPE_IP: {
-		struct ip *ip;
-		if (__predict_false(m->m_len < ip_start + sizeof(struct ip)))
-			return (1);
-		ip = (struct ip *)(m->m_data + ip_start);
-		proto = ip->ip_p;
-		offset = ip_start + (ip->ip_hl << 2);
-		break;
-	}
-#endif
-#if defined(INET6)
-	case ETHERTYPE_IPV6:
-		if (__predict_false(m->m_len < ip_start +
-		    sizeof(struct ip6_hdr)))
-			return (1);
-		offset = ip6_lasthdr(m, ip_start, IPPROTO_IPV6, &proto);
-		if (__predict_false(offset < 0))
-			return (1);
-		break;
-#endif
-	default:
-		/* Here we should increment the rx_csum_bad_ethtype counter. */
-		return (1);
-	}
-
-	switch (proto) {
-	case IPPROTO_TCP:
-		if (__predict_false(m->m_len < offset + sizeof(struct tcphdr)))
-			return (1);
-		m->m_pkthdr.csum_flags |= CSUM_DATA_VALID | CSUM_PSEUDO_HDR;
-		m->m_pkthdr.csum_data = 0xFFFF;
-		break;
-	case IPPROTO_UDP:
-		if (__predict_false(m->m_len < offset + sizeof(struct udphdr)))
-			return (1);
-		m->m_pkthdr.csum_flags |= CSUM_DATA_VALID | CSUM_PSEUDO_HDR;
-		m->m_pkthdr.csum_data = 0xFFFF;
-		break;
-	case IPPROTO_SCTP:
-		if (__predict_false(m->m_len < offset + sizeof(struct sctphdr)))
-			return (1);
-		m->m_pkthdr.csum_flags |= CSUM_SCTP_VALID;
-		break;
-	default:
-		/*
-		 * For the remaining protocols, FreeBSD does not support
-		 * checksum offloading, so the checksum will be recomputed.
-		 */
-#if 0
-		if_printf(ifp, "cksum offload of unsupported "
-		    "protocol eth_type=%#x proto=%d csum_start=%d "
-		    "csum_offset=%d\n", __func__, eth_type, proto,
-		    hdr->csum_start, hdr->csum_offset);
-#endif
-		break;
-	}
-
-	return (0);
-}
-
-/*
- * Set the appropriate CSUM_* flags. Unfortunately, the information
- * provided is not directly useful to us. The VirtIO header gives the
- * offset of the checksum, which is all Linux needs, but this is not
- * how FreeBSD does things. We are forced to peek inside the packet
- * a bit.
- *
- * It would be nice if VirtIO gave us the L4 protocol or if FreeBSD
- * could accept the offsets and let the stack figure it out.
- */
-static int
-ptnet_rx_csum(struct mbuf *m, struct virtio_net_hdr *hdr)
-{
-	struct ether_header *eh;
-	struct ether_vlan_header *evh;
-	uint16_t eth_type;
-	int offset, error;
-
-	eh = mtod(m, struct ether_header *);
-	eth_type = ntohs(eh->ether_type);
-	if (eth_type == ETHERTYPE_VLAN) {
-		/* BMV: We should handle nested VLAN tags too. */
-		evh = mtod(m, struct ether_vlan_header *);
-		eth_type = ntohs(evh->evl_proto);
-		offset = sizeof(struct ether_vlan_header);
-	} else
-		offset = sizeof(struct ether_header);
-
-	if (hdr->flags & VIRTIO_NET_HDR_F_NEEDS_CSUM)
-		error = ptnet_rx_csum_by_offset(m, eth_type, offset, hdr);
-	else
-		error = ptnet_rx_csum_by_parse(m, eth_type, offset, hdr);
-
-	return (error);
-}
-/* End of offloading-related functions to be shared with vtnet. */
 
 static void
 ptnet_ring_update(struct ptnet_queue *pq, struct netmap_kring *kring,
@@ -1688,7 +1366,7 @@ ptnet_ring_update(struct ptnet_queue *pq, struct netmap_kring *kring,
 	/* Mimic nm_txsync_prologue/nm_rxsync_prologue. */
 	kring->rcur = kring->rhead = head;
 
-	ptnetmap_guest_write_kring_csb(atok, kring->rcur, kring->rhead);
+	nm_sync_kloop_appl_write(atok, kring->rcur, kring->rhead);
 
 	/* Kick the host if needed. */
 	if (NM_ACCESS_ONCE(ktoa->kern_need_kick)) {
@@ -1728,7 +1406,7 @@ ptnet_drain_transmit_queue(struct ptnet_queue *pq, unsigned int budget,
 
 	if (!PTNET_Q_TRYLOCK(pq)) {
 		/* We failed to acquire the lock, schedule the taskqueue. */
-		RD(1, "Deferring TX work");
+		nm_prlim(1, "Deferring TX work");
 		if (may_resched) {
 			taskqueue_enqueue(pq->taskq, &pq->task);
 		}
@@ -1738,7 +1416,7 @@ ptnet_drain_transmit_queue(struct ptnet_queue *pq, unsigned int budget,
 
 	if (unlikely(!(ifp->if_drv_flags & IFF_DRV_RUNNING))) {
 		PTNET_Q_UNLOCK(pq);
-		RD(1, "Interface is down");
+		nm_prlim(1, "Interface is down");
 		return ENETDOWN;
 	}
 
@@ -1764,14 +1442,19 @@ ptnet_drain_transmit_queue(struct ptnet_queue *pq, unsigned int budget,
 				 * the host. */
 				atok->appl_need_kick = 1;
 
-				/* Double-check. */
+				/* Double check. We need a full barrier to
+				 * prevent the store to atok->appl_need_kick
+				 * to be reordered with the load from
+				 * ktoa->hwcur and ktoa->hwtail (store-load
+				 * barrier). */
+				nm_stld_barrier();
 				ptnet_sync_tail(ktoa, kring);
 				if (likely(PTNET_TX_NOSPACE(head, kring,
 							    minspace))) {
 					break;
 				}
 
-				RD(1, "Found more slots by doublecheck");
+				nm_prlim(1, "Found more slots by doublecheck");
 				/* More slots were freed before reactivating
 				 * the interrupts. */
 				atok->appl_need_kick = 0;
@@ -1798,7 +1481,7 @@ ptnet_drain_transmit_queue(struct ptnet_queue *pq, unsigned int budget,
 			 * two 8-bytes-wide writes. */
 			memset(nmbuf, 0, PTNET_HDR_SIZE);
 			if (mhead->m_pkthdr.csum_flags & PTNET_ALL_OFFLOAD) {
-				mhead = ptnet_tx_offload(ifp, mhead, false,
+				mhead = virtio_net_tx_offload(ifp, mhead, false,
 							 vh);
 				if (unlikely(!mhead)) {
 					/* Packet dropped because errors
@@ -1810,7 +1493,7 @@ ptnet_drain_transmit_queue(struct ptnet_queue *pq, unsigned int budget,
 					continue;
 				}
 			}
-			ND(1, "%s: [csum_flags %lX] vnet hdr: flags %x "
+			nm_prdis(1, "%s: [csum_flags %lX] vnet hdr: flags %x "
 			      "csum_start %u csum_ofs %u hdr_len = %u "
 			      "gso_size %u gso_type %x", __func__,
 			      mhead->m_pkthdr.csum_flags, vh->flags,
@@ -1885,7 +1568,7 @@ ptnet_drain_transmit_queue(struct ptnet_queue *pq, unsigned int budget,
 	}
 
 	if (count >= budget && may_resched) {
-		DBG(RD(1, "out of budget: resched, %d mbufs pending\n",
+		DBG(nm_prlim(1, "out of budget: resched, %d mbufs pending\n",
 					drbr_inuse(ifp, pq->bufring)));
 		taskqueue_enqueue(pq->taskq, &pq->task);
 	}
@@ -1927,7 +1610,7 @@ ptnet_transmit(if_t ifp, struct mbuf *m)
 	err = drbr_enqueue(ifp, pq->bufring, m);
 	if (err) {
 		/* ENOBUFS when the bufring is full */
-		RD(1, "%s: drbr_enqueue() failed %d\n",
+		nm_prlim(1, "%s: drbr_enqueue() failed %d\n",
 			__func__, err);
 		pq->stats.errors ++;
 		return err;
@@ -2046,7 +1729,12 @@ host_sync:
 				 * last interrupt. */
 				atok->appl_need_kick = 1;
 
-				/* Double-check. */
+				/* Double check for more completed RX slots.
+				 * We need a full barrier to prevent the store
+				 * to atok->appl_need_kick to be reordered with
+				 * the load from ktoa->hwcur and ktoa->hwtail
+				 * (store-load barrier). */
+				nm_stld_barrier();
 				ptnet_sync_tail(ktoa, kring);
 				if (likely(head == ring->tail)) {
 					break;
@@ -2067,13 +1755,13 @@ host_sync:
 				/* There is no good reason why host should
 				 * put the header in multiple netmap slots.
 				 * If this is the case, discard. */
-				RD(1, "Fragmented vnet-hdr: dropping");
+				nm_prlim(1, "Fragmented vnet-hdr: dropping");
 				head = ptnet_rx_discard(kring, head);
 				pq->stats.iqdrops ++;
 				deliver = 0;
 				goto skip;
 			}
-			ND(1, "%s: vnet hdr: flags %x csum_start %u "
+			nm_prdis(1, "%s: vnet hdr: flags %x csum_start %u "
 			      "csum_ofs %u hdr_len = %u gso_size %u "
 			      "gso_type %x", __func__, vh->flags,
 			      vh->csum_start, vh->csum_offset, vh->hdr_len,
@@ -2137,7 +1825,7 @@ host_sync:
 				/* The very last slot prepared by the host has
 				 * the NS_MOREFRAG set. Drop it and continue
 				 * the outer cycle (to do the double-check). */
-				RD(1, "Incomplete packet: dropping");
+				nm_prlim(1, "Incomplete packet: dropping");
 				m_freem(mhead);
 				pq->stats.iqdrops ++;
 				goto host_sync;
@@ -2171,14 +1859,11 @@ host_sync:
 			}
 		}
 
-		if (have_vnet_hdr && (vh->flags & (VIRTIO_NET_HDR_F_NEEDS_CSUM
-					| VIRTIO_NET_HDR_F_DATA_VALID))) {
-			if (unlikely(ptnet_rx_csum(mhead, vh))) {
-				m_freem(mhead);
-				RD(1, "Csum offload error: dropping");
-				pq->stats.iqdrops ++;
-				deliver = 0;
-			}
+		if (unlikely(have_vnet_hdr && virtio_net_rx_csum(mhead, vh))) {
+			m_freem(mhead);
+			nm_prlim(1, "Csum offload error: dropping");
+			pq->stats.iqdrops ++;
+			deliver = 0;
 		}
 
 skip:
@@ -2221,7 +1906,7 @@ escape:
 	if (count >= budget && may_resched) {
 		/* If we ran out of budget or the double-check found new
 		 * slots to process, schedule the taskqueue. */
-		DBG(RD(1, "out of budget: resched h %u t %u\n",
+		DBG(nm_prlim(1, "out of budget: resched h %u t %u\n",
 					head, ring->tail));
 		taskqueue_enqueue(pq->taskq, &pq->task);
 	}
@@ -2236,7 +1921,7 @@ ptnet_rx_task(void *context, int pending)
 {
 	struct ptnet_queue *pq = context;
 
-	DBG(RD(1, "%s: pq #%u\n", __func__, pq->kring_id));
+	DBG(nm_prlim(1, "%s: pq #%u\n", __func__, pq->kring_id));
 	ptnet_rx_eof(pq, PTNET_RX_BUDGET, true);
 }
 
@@ -2245,7 +1930,7 @@ ptnet_tx_task(void *context, int pending)
 {
 	struct ptnet_queue *pq = context;
 
-	DBG(RD(1, "%s: pq #%u\n", __func__, pq->kring_id));
+	DBG(nm_prlim(1, "%s: pq #%u\n", __func__, pq->kring_id));
 	ptnet_drain_transmit_queue(pq, PTNET_TX_BUDGET, true);
 }
 
@@ -2263,7 +1948,7 @@ ptnet_poll(if_t ifp, enum poll_cmd cmd, int budget)
 
 	KASSERT(sc->num_rings > 0, ("Found no queues in while polling ptnet"));
 	queue_budget = MAX(budget / sc->num_rings, 1);
-	RD(1, "Per-queue budget is %d", queue_budget);
+	nm_prlim(1, "Per-queue budget is %d", queue_budget);
 
 	while (budget) {
 		unsigned int rcnt = 0;

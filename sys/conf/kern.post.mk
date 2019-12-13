@@ -8,6 +8,16 @@
 # should be defined in the kern.pre.mk so that port makefiles can
 # override or augment them.
 
+.if defined(DTS) || defined(DTSO) || defined(FDT_DTS_FILE)
+.include "dtb.build.mk"
+
+KERNEL_EXTRA+=	${DTB} ${DTBO}
+CLEAN+=		${DTB} ${DTBO}
+
+kernel-install: _dtbinstall
+.ORDER: beforeinstall _dtbinstall
+.endif
+
 # In case the config had a makeoptions DESTDIR...
 .if defined(DESTDIR)
 MKMODULESENV+=	DESTDIR="${DESTDIR}"
@@ -28,8 +38,16 @@ MKMODULESENV+=	WITH_CTF="${WITH_CTF}"
 MKMODULESENV+=	WITH_EXTRA_TCP_STACKS="${WITH_EXTRA_TCP_STACKS}"
 .endif
 
+.if defined(KCSAN_ENABLED)
+MKMODULESENV+=	KCSAN_ENABLED="yes"
+.endif
+
 .if defined(SAN_CFLAGS)
 MKMODULESENV+=	SAN_CFLAGS="${SAN_CFLAGS}"
+.endif
+
+.if defined(GCOV_CFLAGS)
+MKMODULESENV+=	GCOV_CFLAGS="${GCOV_CFLAGS}"
 .endif
 
 # Allow overriding the kernel debug directory, so kernel and user debug may be
@@ -47,7 +65,7 @@ LOCAL_MODULES_DIR?= ${LOCALBASE}/sys/modules
 
 # Default to installing all modules installed by ports unless overridden
 # by the user.
-.if !defined(LOCAL_MODULES) && exists($LOCAL_MODULES_DIR)
+.if !defined(LOCAL_MODULES) && exists(${LOCAL_MODULES_DIR})
 LOCAL_MODULES!= ls ${LOCAL_MODULES_DIR}
 .endif
 .endif
@@ -63,7 +81,9 @@ modules-${target}:
 	    ${target:S/^reinstall$/install/:S/^clobber$/cleandir/}
 .endif
 .for module in ${LOCAL_MODULES}
-	cd ${LOCAL_MODULES_DIR}/${module}; ${MKMODULESENV} ${MAKE} \
+	@${ECHODIR} "===> ${module} (${target:S/^reinstall$/install/:S/^clobber$/cleandir/})"
+	@cd ${LOCAL_MODULES_DIR}/${module}; ${MKMODULESENV} ${MAKE} \
+	    DIRPRFX="${module}/" \
 	    ${target:S/^reinstall$/install/:S/^clobber$/cleandir/}
 .endfor
 .endif
@@ -136,6 +156,8 @@ kernel-obj:
 
 .if !defined(NO_MODULES)
 modules: modules-all
+modules-depend: beforebuild
+modules-all: beforebuild
 
 .if !defined(NO_MODULES_OBJ)
 modules-all modules-depend: modules-obj
@@ -324,6 +346,11 @@ ${__obj}: ${OBJS_DEPEND_GUESS.${__obj}}
 
 .depend: .PRECIOUS ${SRCS}
 
+.if ${COMPILER_TYPE} == "clang" || \
+    (${COMPILER_TYPE} == "gcc" && ${COMPILER_VERSION} >= 60000)
+_MAP_DEBUG_PREFIX= yes
+.endif
+
 _ILINKS= machine
 .if ${MACHINE} != ${MACHINE_CPUARCH} && ${MACHINE} != "arm64"
 _ILINKS+= ${MACHINE_CPUARCH}
@@ -333,9 +360,17 @@ _ILINKS+= x86
 .endif
 
 # Ensure that the link exists without depending on it when it exists.
+# Ensure that debug info references the path in the source tree.
 .for _link in ${_ILINKS}
 .if !exists(${.OBJDIR}/${_link})
-${SRCS} ${CLEAN:M*.o}: ${_link}
+${SRCS} ${DEPENDOBJS}: ${_link}
+.endif
+.if defined(_MAP_DEBUG_PREFIX)
+.if ${_link} == "machine"
+CFLAGS+= -fdebug-prefix-map=./machine=${SYSDIR}/${MACHINE}/include
+.else
+CFLAGS+= -fdebug-prefix-map=./${_link}=${SYSDIR}/${_link}/include
+.endif
 .endif
 .endfor
 

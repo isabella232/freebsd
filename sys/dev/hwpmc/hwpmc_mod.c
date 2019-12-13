@@ -1884,7 +1884,7 @@ pmc_log_process_mappings(struct pmc_owner *po, struct proc *p)
 	map = &vm->vm_map;
 	vm_map_lock_read(map);
 
-	for (entry = map->header.next; entry != &map->header; entry = entry->next) {
+	VM_MAP_ENTRY_FOREACH(entry, map) {
 
 		if (entry == NULL) {
 			PMCDBG2(LOG,OPS,2, "hwpmc: vm_map entry unexpectedly "
@@ -1988,7 +1988,7 @@ pmc_log_process_mappings(struct pmc_owner *po, struct proc *p)
 		 * new lookup for this entry.  If there is no entry
 		 * for this address range, vm_map_lookup_entry() will
 		 * return the previous one, so we always want to go to
-		 * entry->next on the next loop iteration.
+		 * the next entry on the next loop iteration.
 		 * 
 		 * There is an edge condition here that can occur if
 		 * there is no entry at or before this address.  In
@@ -3512,6 +3512,7 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		struct pmc_classdep *pcd;
 		int cl;
 
+		memset(&gci, 0, sizeof(gci));
 		gci.pm_cputype = md->pmd_cputype;
 		gci.pm_ncpu    = pmc_cpu_max();
 		gci.pm_npmc    = md->pmd_npmc;
@@ -3661,7 +3662,7 @@ pmc_syscall_handler(struct thread *td, void *syscall_args)
 		npmc = md->pmd_npmc;
 
 		pmcinfo_size = npmc * sizeof(struct pmc_info);
-		pmcinfo = malloc(pmcinfo_size, M_PMC, M_WAITOK);
+		pmcinfo = malloc(pmcinfo_size, M_PMC, M_WAITOK | M_ZERO);
 
 		p = pmcinfo;
 
@@ -4827,7 +4828,7 @@ pmc_capture_user_callchain(int cpu, int ring, struct trapframe *tf)
 			nfree++;
 #endif
 		if (ps->ps_td != td ||
-		   ps->ps_nsamples == PMC_USER_CALLCHAIN_PENDING ||
+		   ps->ps_nsamples != PMC_USER_CALLCHAIN_PENDING ||
 		   ps->ps_pmc->pm_state != PMC_STATE_RUNNING)
 			continue;
 

@@ -1,9 +1,8 @@
 //===- CodeGen/MachineInstrBuilder.h - Simplify creation of MIs --*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -79,6 +78,11 @@ public:
   /// If conversion operators fail, use this method to get the MachineInstr
   /// explicitly.
   MachineInstr *getInstr() const { return MI; }
+
+  /// Get the register for the operand index.
+  /// The operand at the index should be a register (asserted by
+  /// MachineOperand).
+  Register getReg(unsigned Idx) const { return MI->getOperand(Idx).getReg(); }
 
   /// Add a new virtual register operand.
   const MachineInstrBuilder &addReg(unsigned RegNo, unsigned flags = 0,
@@ -191,15 +195,20 @@ public:
     return *this;
   }
 
-  const MachineInstrBuilder &setMemRefs(MachineInstr::mmo_iterator b,
-                                        MachineInstr::mmo_iterator e) const {
-    MI->setMemRefs(b, e);
+  const MachineInstrBuilder &
+  setMemRefs(ArrayRef<MachineMemOperand *> MMOs) const {
+    MI->setMemRefs(*MF, MMOs);
     return *this;
   }
 
-  const MachineInstrBuilder &setMemRefs(std::pair<MachineInstr::mmo_iterator,
-                                        unsigned> MemOperandsRef) const {
-    MI->setMemRefs(MemOperandsRef);
+  const MachineInstrBuilder &cloneMemRefs(const MachineInstr &OtherMI) const {
+    MI->cloneMemRefs(*MF, OtherMI);
+    return *this;
+  }
+
+  const MachineInstrBuilder &
+  cloneMergedMemRefs(ArrayRef<const MachineInstr *> OtherMIs) const {
+    MI->cloneMergedMemRefs(*MF, OtherMIs);
     return *this;
   }
 
@@ -278,6 +287,9 @@ public:
       case MachineOperand::MO_GlobalAddress:
         return addGlobalAddress(Disp.getGlobal(), Disp.getOffset() + off,
                                 TargetFlags);
+      case MachineOperand::MO_BlockAddress:
+        return addBlockAddress(Disp.getBlockAddress(), Disp.getOffset() + off,
+                               TargetFlags);
     }
   }
 

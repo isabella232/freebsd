@@ -110,6 +110,11 @@ int	tcp_msl;
 SYSCTL_PROC(_net_inet_tcp, OID_AUTO, msl, CTLTYPE_INT|CTLFLAG_RW,
     &tcp_msl, 0, sysctl_msec_to_ticks, "I", "Maximum segment lifetime");
 
+int	tcp_rexmit_initial;
+SYSCTL_PROC(_net_inet_tcp, OID_AUTO, rexmit_initial, CTLTYPE_INT|CTLFLAG_RW,
+    &tcp_rexmit_initial, 0, sysctl_msec_to_ticks, "I",
+    "Initial Retransmission Timeout");
+
 int	tcp_rexmit_min;
 SYSCTL_PROC(_net_inet_tcp, OID_AUTO, rexmit_min, CTLTYPE_INT|CTLFLAG_RW,
     &tcp_rexmit_min, 0, sysctl_msec_to_ticks, "I",
@@ -233,9 +238,6 @@ tcp_slowtimo(void)
 	VNET_LIST_RUNLOCK_NOSLEEP();
 }
 
-int	tcp_syn_backoff[TCP_MAXRXTSHIFT + 1] =
-    { 1, 1, 1, 1, 1, 2, 4, 8, 16, 32, 64, 64, 64 };
-
 int	tcp_backoff[TCP_MAXRXTSHIFT + 1] =
     { 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 512, 512, 512 };
 
@@ -337,9 +339,9 @@ tcp_timer_2msl(void *xtp)
 			tcp_inpinfo_lock_del(inp, tp);
 			goto out;
 		}
-		INP_INFO_RLOCK_ET(&V_tcbinfo, et);
+		NET_EPOCH_ENTER(et);
 		tp = tcp_close(tp);             
-		INP_INFO_RUNLOCK_ET(&V_tcbinfo, et);
+		NET_EPOCH_EXIT(et);
 		tcp_inpinfo_lock_del(inp, tp);
 		goto out;
 	} else {
@@ -351,9 +353,9 @@ tcp_timer_2msl(void *xtp)
 				tcp_inpinfo_lock_del(inp, tp);
 				goto out;
 			}
-			INP_INFO_RLOCK_ET(&V_tcbinfo, et);
+			NET_EPOCH_ENTER(et);
 			tp = tcp_close(tp);
-			INP_INFO_RUNLOCK_ET(&V_tcbinfo, et);
+			NET_EPOCH_EXIT(et);
 			tcp_inpinfo_lock_del(inp, tp);
 			goto out;
 		}
@@ -476,7 +478,7 @@ dropit:
 		tcp_inpinfo_lock_del(inp, tp);
 		goto out;
 	}
-	INP_INFO_RLOCK_ET(&V_tcbinfo, et);
+	NET_EPOCH_ENTER(et);
 	tp = tcp_drop(tp, ETIMEDOUT);
 
 #ifdef TCPDEBUG
@@ -485,7 +487,7 @@ dropit:
 			  PRU_SLOWTIMO);
 #endif
 	TCP_PROBE2(debug__user, tp, PRU_SLOWTIMO);
-	INP_INFO_RUNLOCK_ET(&V_tcbinfo, et);
+	NET_EPOCH_EXIT(et);
 	tcp_inpinfo_lock_del(inp, tp);
  out:
 	CURVNET_RESTORE();
@@ -540,9 +542,9 @@ tcp_timer_persist(void *xtp)
 			tcp_inpinfo_lock_del(inp, tp);
 			goto out;
 		}
-		INP_INFO_RLOCK_ET(&V_tcbinfo, et);
+		NET_EPOCH_ENTER(et);
 		tp = tcp_drop(tp, ETIMEDOUT);
-		INP_INFO_RUNLOCK_ET(&V_tcbinfo, et);
+		NET_EPOCH_EXIT(et);
 		tcp_inpinfo_lock_del(inp, tp);
 		goto out;
 	}
@@ -557,9 +559,9 @@ tcp_timer_persist(void *xtp)
 			tcp_inpinfo_lock_del(inp, tp);
 			goto out;
 		}
-		INP_INFO_RLOCK_ET(&V_tcbinfo, et);
+		NET_EPOCH_ENTER(et);
 		tp = tcp_drop(tp, ETIMEDOUT);
-		INP_INFO_RUNLOCK_ET(&V_tcbinfo, et);
+		NET_EPOCH_EXIT(et);
 		tcp_inpinfo_lock_del(inp, tp);
 		goto out;
 	}
@@ -626,9 +628,9 @@ tcp_timer_rexmt(void * xtp)
 			tcp_inpinfo_lock_del(inp, tp);
 			goto out;
 		}
-		INP_INFO_RLOCK_ET(&V_tcbinfo, et);
+		NET_EPOCH_ENTER(et);
 		tp = tcp_drop(tp, ETIMEDOUT);
-		INP_INFO_RUNLOCK_ET(&V_tcbinfo, et);
+		NET_EPOCH_EXIT(et);
 		tcp_inpinfo_lock_del(inp, tp);
 		goto out;
 	}
@@ -671,7 +673,7 @@ tcp_timer_rexmt(void * xtp)
 	TCPSTAT_INC(tcps_rexmttimeo);
 	if ((tp->t_state == TCPS_SYN_SENT) ||
 	    (tp->t_state == TCPS_SYN_RECEIVED))
-		rexmt = TCPTV_RTOBASE * tcp_syn_backoff[tp->t_rxtshift];
+		rexmt = tcp_rexmit_initial * tcp_backoff[tp->t_rxtshift];
 	else
 		rexmt = TCP_REXMTVAL(tp) * tcp_backoff[tp->t_rxtshift];
 	TCPT_RANGESET(tp->t_rxtcur, rexmt,
@@ -837,7 +839,7 @@ void
 tcp_timer_activate(struct tcpcb *tp, uint32_t timer_type, u_int delta)
 {
 	struct callout *t_callout;
-	timeout_t *f_callout;
+	callout_func_t *f_callout;
 	struct inpcb *inp = tp->t_inpcb;
 	int cpu = inp_to_cpuid(inp);
 

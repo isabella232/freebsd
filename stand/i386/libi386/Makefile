@@ -4,7 +4,7 @@
 
 LIB=			i386
 
-SRCS=	biosacpi.c biosdisk.c biosmem.c biospnp.c \
+SRCS=	bio.c biosacpi.c biosdisk.c biosmem.c biospnp.c \
 	biospci.c biossmap.c bootinfo.c bootinfo32.c bootinfo64.c \
 	comconsole.c devicename.c elf32_freebsd.c \
 	elf64_freebsd.c multiboot.c multiboot_tramp.S relocater_tramp.S \
@@ -13,6 +13,9 @@ SRCS=	biosacpi.c biosdisk.c biosmem.c biospnp.c \
 .PATH:	${ZFSSRC}
 SRCS+=  devicename_stubs.c
 CFLAGS+= -I${ZFSSRC}
+
+.PATH:	${SYSDIR}/teken
+SRCS+=	teken.c
 
 BOOT_COMCONSOLE_PORT?= 0x3f8
 CFLAGS+=	-DCOMPORT=${BOOT_COMCONSOLE_PORT}
@@ -37,8 +40,9 @@ CFLAGS+= -DSMBIOS_NETWORK_ENDIAN_UUID
 .endif
 .endif
 
-# Include simple terminal emulation (cons25-compatible)
-CFLAGS+= -DTERM_EMU
+# terminal emulation
+CFLAGS.vidconsole.c+= -I${SRCTOP}/sys/teken
+CFLAGS.teken.c+= -I${SRCTOP}/sys/teken
 
 # XXX: make alloca() useable
 CFLAGS+= -Dalloca=__builtin_alloca

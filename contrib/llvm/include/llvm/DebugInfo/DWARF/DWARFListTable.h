@@ -1,9 +1,8 @@
 //===- DWARFListTable.h -----------------------------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -13,6 +12,7 @@
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/DebugInfo/DIContext.h"
 #include "llvm/DebugInfo/DWARF/DWARFDataExtractor.h"
+#include "llvm/Support/Errc.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/raw_ostream.h"
@@ -43,10 +43,6 @@ protected:
   ListEntries Entries;
 
 public:
-  // FIXME: We need to consolidate the various verions of "createError"
-  // that are used in the DWARF consumer. Until then, this is a workaround.
-  Error createError(const char *, const char *, uint32_t);
-
   const ListEntries &getEntries() const { return Entries; }
   bool empty() const { return Entries.empty(); }
   void clear() { Entries.clear(); }
@@ -102,6 +98,7 @@ public:
   uint32_t getHeaderOffset() const { return HeaderOffset; }
   uint8_t getAddrSize() const { return HeaderData.AddrSize; }
   uint32_t getLength() const { return HeaderData.Length; }
+  uint16_t getVersion() const { return HeaderData.Version; }
   StringRef getSectionName() const { return SectionName; }
   StringRef getListTypeString() const { return ListTypeString; }
   dwarf::DwarfFormat getFormat() const { return Format; }
@@ -159,7 +156,10 @@ public:
   uint32_t getHeaderOffset() const { return Header.getHeaderOffset(); }
   uint8_t getAddrSize() const { return Header.getAddrSize(); }
 
-  void dump(raw_ostream &OS, DIDumpOptions DumpOpts = {}) const;
+  void dump(raw_ostream &OS,
+            llvm::function_ref<Optional<object::SectionedAddress>(uint32_t)>
+                LookupPooledAddress,
+            DIDumpOptions DumpOpts = {}) const;
 
   /// Return the contents of the offset entry designated by a given index.
   Optional<uint32_t> getOffsetEntry(uint32_t Index) const {
@@ -213,7 +213,8 @@ Error DWARFListType<ListEntryType>::extract(DWARFDataExtractor Data,
                                             StringRef SectionName,
                                             StringRef ListTypeString) {
   if (*OffsetPtr < HeaderOffset || *OffsetPtr >= End)
-    return createError("invalid %s list offset 0x%" PRIx32,
+    return createStringError(errc::invalid_argument,
+                       "invalid %s list offset 0x%" PRIx32,
                        ListTypeString.data(), *OffsetPtr);
   Entries.clear();
   while (*OffsetPtr < End) {
@@ -224,14 +225,18 @@ Error DWARFListType<ListEntryType>::extract(DWARFDataExtractor Data,
     if (Entry.isSentinel())
       return Error::success();
   }
-  return createError("no end of list marker detected at end of %s table "
+  return createStringError(errc::illegal_byte_sequence,
+                     "no end of list marker detected at end of %s table "
                      "starting at offset 0x%" PRIx32,
                      SectionName.data(), HeaderOffset);
 }
 
 template <typename DWARFListType>
-void DWARFListTableBase<DWARFListType>::dump(raw_ostream &OS,
-                                             DIDumpOptions DumpOpts) const {
+void DWARFListTableBase<DWARFListType>::dump(
+    raw_ostream &OS,
+    llvm::function_ref<Optional<object::SectionedAddress>(uint32_t)>
+        LookupPooledAddress,
+    DIDumpOptions DumpOpts) const {
   Header.dump(OS, DumpOpts);
   OS << HeaderString << "\n";
 
@@ -250,7 +255,7 @@ void DWARFListTableBase<DWARFListType>::dump(raw_ostream &OS,
   for (const auto &List : ListMap)
     for (const auto &Entry : List.second.getEntries())
       Entry.dump(OS, getAddrSize(), MaxEncodingStringLength, CurrentBase,
-                 DumpOpts);
+                 DumpOpts, LookupPooledAddress);
 }
 
 template <typename DWARFListType>

@@ -99,10 +99,10 @@
 #define	VM_NFREEORDER		12
 
 /*
- * Disable superpage reservations.
+ * Enable superpage reservations: 1 level.
  */
 #ifndef	VM_NRESERVLEVEL
-#define	VM_NRESERVLEVEL		0
+#define	VM_NRESERVLEVEL		1
 #endif
 
 /*
@@ -228,7 +228,6 @@
 extern vm_paddr_t dmap_phys_base;
 extern vm_paddr_t dmap_phys_max;
 extern vm_offset_t dmap_max_addr;
-extern u_int tsb_kernel_ldd_phys;
 extern vm_offset_t vm_max_kernel_address;
 extern vm_offset_t init_pt_va;
 #endif

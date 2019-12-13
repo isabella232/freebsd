@@ -1,18 +1,16 @@
 //===-- StructuredDataDarwinLog.cpp -----------------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
 #include "StructuredDataDarwinLog.h"
 
-// C includes
 #include <string.h>
 
-// C++ includes
+#include <memory>
 #include <sstream>
 
 #include "lldb/Breakpoint/StoppointCallbackContext.h"
@@ -41,9 +39,7 @@ using namespace lldb_private;
 #pragma mark -
 #pragma mark Anonymous Namespace
 
-// -----------------------------------------------------------------------------
 // Anonymous namespace
-// -----------------------------------------------------------------------------
 
 namespace sddarwinlog_private {
 const uint64_t NANOS_PER_MICRO = 1000;
@@ -54,13 +50,11 @@ const uint64_t NANOS_PER_HOUR = NANOS_PER_MINUTE * 60;
 
 static bool DEFAULT_FILTER_FALLTHROUGH_ACCEPTS = true;
 
-//------------------------------------------------------------------
 /// Global, sticky enable switch.  If true, the user has explicitly
 /// run the enable command.  When a process launches or is attached to,
 /// we will enable DarwinLog if either the settings for auto-enable is
 /// on, or if the user had explicitly run enable at some point prior
 /// to the launch/attach.
-//------------------------------------------------------------------
 static bool s_is_explicitly_enabled;
 
 class EnableOptions;
@@ -108,18 +102,16 @@ void SetGlobalEnableOptions(const DebuggerSP &debugger_sp,
 #pragma mark -
 #pragma mark Settings Handling
 
-//------------------------------------------------------------------
 /// Code to handle the StructuredDataDarwinLog settings
-//------------------------------------------------------------------
 
-static PropertyDefinition g_properties[] = {
+static constexpr PropertyDefinition g_properties[] = {
     {
         "enable-on-startup",       // name
         OptionValue::eTypeBoolean, // type
         true,                      // global
         false,                     // default uint value
         nullptr,                   // default cstring value
-        nullptr,                   // enum values
+        {},                        // enum values
         "Enable Darwin os_log collection when debugged process is launched "
         "or attached." // description
     },
@@ -129,13 +121,11 @@ static PropertyDefinition g_properties[] = {
         true,                     // global
         0,                        // default uint value
         "",                       // default cstring value
-        nullptr,                  // enum values
+        {},                       // enum values
         "Specify the options to 'plugin structured-data darwin-log enable' "
         "that should be applied when automatically enabling logging on "
         "startup/attach." // description
-    },
-    // Last entry sentinel.
-    {nullptr, OptionValue::eTypeInvalid, false, 0, nullptr, nullptr, nullptr}};
+    }};
 
 enum { ePropertyEnableOnStartup = 0, ePropertyAutoEnableOptions = 1 };
 
@@ -147,11 +137,11 @@ public:
   }
 
   StructuredDataDarwinLogProperties() : Properties() {
-    m_collection_sp.reset(new OptionValueProperties(GetSettingName()));
+    m_collection_sp = std::make_shared<OptionValueProperties>(GetSettingName());
     m_collection_sp->Initialize(g_properties);
   }
 
-  virtual ~StructuredDataDarwinLogProperties() {}
+  ~StructuredDataDarwinLogProperties() override {}
 
   bool GetEnableOnStartup() const {
     const uint32_t idx = ePropertyEnableOnStartup;
@@ -174,7 +164,7 @@ using StructuredDataDarwinLogPropertiesSP =
 static const StructuredDataDarwinLogPropertiesSP &GetGlobalProperties() {
   static StructuredDataDarwinLogPropertiesSP g_settings_sp;
   if (!g_settings_sp)
-    g_settings_sp.reset(new StructuredDataDarwinLogProperties());
+    g_settings_sp = std::make_shared<StructuredDataDarwinLogProperties>();
   return g_settings_sp;
 }
 
@@ -191,12 +181,12 @@ const char *const s_filter_attributes[] = {
     // used to format message text
 };
 
-static const ConstString &GetDarwinLogTypeName() {
+static ConstString GetDarwinLogTypeName() {
   static const ConstString s_key_name("DarwinLog");
   return s_key_name;
 }
 
-static const ConstString &GetLogEventType() {
+static ConstString GetLogEventType() {
   static const ConstString s_event_type("log");
   return s_event_type;
 }
@@ -212,13 +202,13 @@ public:
       std::function<FilterRuleSP(bool accept, size_t attribute_index,
                                  const std::string &op_arg, Status &error)>;
 
-  static void RegisterOperation(const ConstString &operation,
+  static void RegisterOperation(ConstString operation,
                                 const OperationCreationFunc &creation_func) {
     GetCreationFuncMap().insert(std::make_pair(operation, creation_func));
   }
 
   static FilterRuleSP CreateRule(bool match_accepts, size_t attribute,
-                                 const ConstString &operation,
+                                 ConstString operation,
                                  const std::string &op_arg, Status &error) {
     // Find the creation func for this type of filter rule.
     auto map = GetCreationFuncMap();
@@ -256,10 +246,10 @@ public:
 
   virtual void Dump(Stream &stream) const = 0;
 
-  const ConstString &GetOperationType() const { return m_operation; }
+  ConstString GetOperationType() const { return m_operation; }
 
 protected:
-  FilterRule(bool accept, size_t attribute_index, const ConstString &operation)
+  FilterRule(bool accept, size_t attribute_index, ConstString operation)
       : m_accept(accept), m_attribute_index(attribute_index),
         m_operation(operation) {}
 
@@ -328,7 +318,7 @@ private:
     return FilterRuleSP(new RegexFilterRule(accept, attribute_index, op_arg));
   }
 
-  static const ConstString &StaticGetOperation() {
+  static ConstString StaticGetOperation() {
     static ConstString s_operation("regex");
     return s_operation;
   }
@@ -373,7 +363,7 @@ private:
         new ExactMatchFilterRule(accept, attribute_index, op_arg));
   }
 
-  static const ConstString &StaticGetOperation() {
+  static ConstString StaticGetOperation() {
     static ConstString s_operation("match");
     return s_operation;
   }
@@ -395,30 +385,28 @@ static void RegisterFilterOperations() {
 // Commands
 // =========================================================================
 
-// -------------------------------------------------------------------------
 /// Provides the main on-off switch for enabling darwin logging.
 ///
 /// It is valid to run the enable command when logging is already enabled.
 /// This resets the logging with whatever settings are currently set.
-// -------------------------------------------------------------------------
 
-static OptionDefinition g_enable_option_table[] = {
+static constexpr OptionDefinition g_enable_option_table[] = {
     // Source stream include/exclude options (the first-level filter). This one
     // should be made as small as possible as everything that goes through here
     // must be processed by the process monitor.
     {LLDB_OPT_SET_ALL, false, "any-process", 'a', OptionParser::eNoArgument,
-     nullptr, nullptr, 0, eArgTypeNone,
+     nullptr, {}, 0, eArgTypeNone,
      "Specifies log messages from other related processes should be "
      "included."},
     {LLDB_OPT_SET_ALL, false, "debug", 'd', OptionParser::eNoArgument, nullptr,
-     nullptr, 0, eArgTypeNone,
+     {}, 0, eArgTypeNone,
      "Specifies debug-level log messages should be included.  Specifying"
      " --debug implies --info."},
     {LLDB_OPT_SET_ALL, false, "info", 'i', OptionParser::eNoArgument, nullptr,
-     nullptr, 0, eArgTypeNone,
+     {}, 0, eArgTypeNone,
      "Specifies info-level log messages should be included."},
     {LLDB_OPT_SET_ALL, false, "filter", 'f', OptionParser::eRequiredArgument,
-     nullptr, nullptr, 0, eArgRawInput,
+     nullptr, {}, 0, eArgRawInput,
      // There doesn't appear to be a great way for me to have these multi-line,
      // formatted tables in help.  This looks mostly right but there are extra
      // linefeeds added at seemingly random spots, and indentation isn't
@@ -452,52 +440,52 @@ static OptionDefinition g_enable_option_table[] = {
      "Prefer character classes like [[:digit:]] to \\d and the like, as "
      "getting the backslashes escaped through properly is error-prone."},
     {LLDB_OPT_SET_ALL, false, "live-stream", 'l',
-     OptionParser::eRequiredArgument, nullptr, nullptr, 0, eArgTypeBoolean,
+     OptionParser::eRequiredArgument, nullptr, {}, 0, eArgTypeBoolean,
      "Specify whether logging events are live-streamed or buffered.  "
      "True indicates live streaming, false indicates buffered.  The "
      "default is true (live streaming).  Live streaming will deliver "
      "log messages with less delay, but buffered capture mode has less "
      "of an observer effect."},
     {LLDB_OPT_SET_ALL, false, "no-match-accepts", 'n',
-     OptionParser::eRequiredArgument, nullptr, nullptr, 0, eArgTypeBoolean,
+     OptionParser::eRequiredArgument, nullptr, {}, 0, eArgTypeBoolean,
      "Specify whether a log message that doesn't match any filter rule "
      "is accepted or rejected, where true indicates accept.  The "
      "default is true."},
     {LLDB_OPT_SET_ALL, false, "echo-to-stderr", 'e',
-     OptionParser::eRequiredArgument, nullptr, nullptr, 0, eArgTypeBoolean,
+     OptionParser::eRequiredArgument, nullptr, {}, 0, eArgTypeBoolean,
      "Specify whether os_log()/NSLog() messages are echoed to the "
      "target program's stderr.  When DarwinLog is enabled, we shut off "
      "the mirroring of os_log()/NSLog() to the program's stderr.  "
      "Setting this flag to true will restore the stderr mirroring."
      "The default is false."},
     {LLDB_OPT_SET_ALL, false, "broadcast-events", 'b',
-     OptionParser::eRequiredArgument, nullptr, nullptr, 0, eArgTypeBoolean,
+     OptionParser::eRequiredArgument, nullptr, {}, 0, eArgTypeBoolean,
      "Specify if the plugin should broadcast events.  Broadcasting "
      "log events is a requirement for displaying the log entries in "
      "LLDB command-line.  It is also required if LLDB clients want to "
      "process log events.  The default is true."},
     // Message formatting options
     {LLDB_OPT_SET_ALL, false, "timestamp-relative", 'r',
-     OptionParser::eNoArgument, nullptr, nullptr, 0, eArgTypeNone,
+     OptionParser::eNoArgument, nullptr, {}, 0, eArgTypeNone,
      "Include timestamp in the message header when printing a log "
      "message.  The timestamp is relative to the first displayed "
      "message."},
     {LLDB_OPT_SET_ALL, false, "subsystem", 's', OptionParser::eNoArgument,
-     nullptr, nullptr, 0, eArgTypeNone,
-     "Include the subsystem in the the message header when displaying "
+     nullptr, {}, 0, eArgTypeNone,
+     "Include the subsystem in the message header when displaying "
      "a log message."},
     {LLDB_OPT_SET_ALL, false, "category", 'c', OptionParser::eNoArgument,
-     nullptr, nullptr, 0, eArgTypeNone,
+     nullptr, {}, 0, eArgTypeNone,
      "Include the category in the message header when displaying "
      "a log message."},
     {LLDB_OPT_SET_ALL, false, "activity-chain", 'C', OptionParser::eNoArgument,
-     nullptr, nullptr, 0, eArgTypeNone,
+     nullptr, {}, 0, eArgTypeNone,
      "Include the activity parent-child chain in the message header "
      "when displaying a log message.  The activity hierarchy is "
      "displayed as {grandparent-activity}:"
      "{parent-activity}:{activity}[:...]."},
     {LLDB_OPT_SET_ALL, false, "all-fields", 'A', OptionParser::eNoArgument,
-     nullptr, nullptr, 0, eArgTypeNone,
+     nullptr, {}, 0, eArgTypeNone,
      "Shortcut to specify that all header fields should be displayed."}};
 
 class EnableOptions : public Options {
@@ -860,7 +848,7 @@ protected:
       // that logging be enabled for a process before libtrace is initialized
       // results in a scenario where no errors occur, but no logging is
       // captured, either.  This step is to eliminate that possibility.
-      plugin.AddInitCompletionHook(*process_sp.get());
+      plugin.AddInitCompletionHook(*process_sp);
     }
 
     // Send configuration to the feature by way of the process. Construct the
@@ -894,9 +882,7 @@ private:
   EnableOptionsSP m_options_sp;
 };
 
-// -------------------------------------------------------------------------
 /// Provides the status command.
-// -------------------------------------------------------------------------
 class StatusCommand : public CommandObjectParsed {
 public:
   StatusCommand(CommandInterpreter &interpreter)
@@ -922,7 +908,7 @@ protected:
           process_sp->GetStructuredDataPlugin(GetDarwinLogTypeName());
       stream.Printf("Availability: %s\n",
                     plugin_sp ? "available" : "unavailable");
-      auto &plugin_name = StructuredDataDarwinLog::GetStaticPluginName();
+      ConstString plugin_name = StructuredDataDarwinLog::GetStaticPluginName();
       const bool enabled =
           plugin_sp ? plugin_sp->GetEnabled(plugin_name) : false;
       stream.Printf("Enabled: %s\n", enabled ? "true" : "false");
@@ -972,9 +958,7 @@ protected:
   }
 };
 
-// -------------------------------------------------------------------------
 /// Provides the darwin-log base command
-// -------------------------------------------------------------------------
 class BaseCommand : public CommandObjectMultiword {
 public:
   BaseCommand(CommandInterpreter &interpreter)
@@ -1086,9 +1070,7 @@ using namespace sddarwinlog_private;
 #pragma mark -
 #pragma mark Public static API
 
-// -----------------------------------------------------------------------------
 // Public static API
-// -----------------------------------------------------------------------------
 
 void StructuredDataDarwinLog::Initialize() {
   RegisterFilterOperations();
@@ -1101,7 +1083,7 @@ void StructuredDataDarwinLog::Terminate() {
   PluginManager::UnregisterPlugin(&CreateInstance);
 }
 
-const ConstString &StructuredDataDarwinLog::GetStaticPluginName() {
+ConstString StructuredDataDarwinLog::GetStaticPluginName() {
   static ConstString s_plugin_name("darwin-log");
   return s_plugin_name;
 }
@@ -1109,9 +1091,7 @@ const ConstString &StructuredDataDarwinLog::GetStaticPluginName() {
 #pragma mark -
 #pragma mark PluginInterface API
 
-// -----------------------------------------------------------------------------
 // PluginInterface API
-// -----------------------------------------------------------------------------
 
 ConstString StructuredDataDarwinLog::GetPluginName() {
   return GetStaticPluginName();
@@ -1122,17 +1102,15 @@ uint32_t StructuredDataDarwinLog::GetPluginVersion() { return 1; }
 #pragma mark -
 #pragma mark StructuredDataPlugin API
 
-// -----------------------------------------------------------------------------
 // StructuredDataPlugin API
-// -----------------------------------------------------------------------------
 
 bool StructuredDataDarwinLog::SupportsStructuredDataType(
-    const ConstString &type_name) {
+    ConstString type_name) {
   return type_name == GetDarwinLogTypeName();
 }
 
 void StructuredDataDarwinLog::HandleArrivalOfStructuredData(
-    Process &process, const ConstString &type_name,
+    Process &process, ConstString type_name,
     const StructuredData::ObjectSP &object_sp) {
   Log *log(lldb_private::GetLogIfAllCategoriesSet(LIBLLDB_LOG_PROCESS));
   if (log) {
@@ -1271,7 +1249,7 @@ Status StructuredDataDarwinLog::GetDescription(
   return error;
 }
 
-bool StructuredDataDarwinLog::GetEnabled(const ConstString &type_name) const {
+bool StructuredDataDarwinLog::GetEnabled(ConstString type_name) const {
   if (type_name == GetStaticPluginName())
     return m_is_enabled;
   else
@@ -1374,9 +1352,7 @@ void StructuredDataDarwinLog::ModulesDidLoad(Process &process,
   EnableNow();
 }
 
-// -----------------------------------------------------------------------------
 // public destructor
-// -----------------------------------------------------------------------------
 
 StructuredDataDarwinLog::~StructuredDataDarwinLog() {
   if (m_breakpoint_id != LLDB_INVALID_BREAK_ID) {
@@ -1391,9 +1367,7 @@ StructuredDataDarwinLog::~StructuredDataDarwinLog() {
 #pragma mark -
 #pragma mark Private instance methods
 
-// -----------------------------------------------------------------------------
 // Private constructors
-// -----------------------------------------------------------------------------
 
 StructuredDataDarwinLog::StructuredDataDarwinLog(const ProcessWP &process_wp)
     : StructuredDataPlugin(process_wp), m_recorded_first_timestamp(false),
@@ -1401,9 +1375,7 @@ StructuredDataDarwinLog::StructuredDataDarwinLog(const ProcessWP &process_wp)
       m_added_breakpoint_mutex(), m_added_breakpoint(),
       m_breakpoint_id(LLDB_INVALID_BREAK_ID) {}
 
-// -----------------------------------------------------------------------------
 // Private static methods
-// -----------------------------------------------------------------------------
 
 StructuredDataPluginSP
 StructuredDataDarwinLog::CreateInstance(Process &process) {
@@ -1638,8 +1610,8 @@ bool StructuredDataDarwinLog::InitCompletionHookCallback(
   }
 
   // Queue the thread plan.
-  auto thread_plan_sp = ThreadPlanSP(
-      new ThreadPlanCallOnFunctionExit(*thread_sp.get(), callback));
+  auto thread_plan_sp =
+      ThreadPlanSP(new ThreadPlanCallOnFunctionExit(*thread_sp, callback));
   const bool abort_other_plans = false;
   thread_sp->QueueThreadPlan(thread_plan_sp, abort_other_plans);
   if (log)
@@ -1679,7 +1651,7 @@ void StructuredDataDarwinLog::AddInitCompletionHook(Process &process) {
   // Build up the module list.
   FileSpecList module_spec_list;
   auto module_file_spec =
-      FileSpec(GetGlobalProperties()->GetLoggingModuleName(), false);
+      FileSpec(GetGlobalProperties()->GetLoggingModuleName());
   module_spec_list.Append(module_file_spec);
 
   // We aren't specifying a source file set.

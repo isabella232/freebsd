@@ -1,9 +1,8 @@
 //===- lib/MC/MCAsmStreamer.cpp - Text Assembly Output ----------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -108,10 +107,7 @@ public:
   void AddComment(const Twine &T, bool EOL = true) override;
 
   /// Add a comment showing the encoding of an instruction.
-  /// If PrintSchedInfo is true, then the comment sched:[x:y] will be added to
-  /// the output if supported by the target.
-  void AddEncodingComment(const MCInst &Inst, const MCSubtargetInfo &,
-                          bool PrintSchedInfo);
+  void AddEncodingComment(const MCInst &Inst, const MCSubtargetInfo &);
 
   /// Return a raw_ostream that comments can be written to.
   /// Unlike AddComment, you are required to terminate comments with \n if you
@@ -147,9 +143,9 @@ public:
   void EmitLinkerOptions(ArrayRef<std::string> Options) override;
   void EmitDataRegion(MCDataRegionType Kind) override;
   void EmitVersionMin(MCVersionMinType Kind, unsigned Major, unsigned Minor,
-                      unsigned Update) override;
+                      unsigned Update, VersionTuple SDKVersion) override;
   void EmitBuildVersion(unsigned Platform, unsigned Major, unsigned Minor,
-                        unsigned Update) override;
+                        unsigned Update, VersionTuple SDKVersion) override;
   void EmitThumbFunc(MCSymbol *Func) override;
 
   void EmitAssignment(MCSymbol *Symbol, const MCExpr *Value) override;
@@ -192,6 +188,7 @@ public:
   void EmitValueImpl(const MCExpr *Value, unsigned Size,
                      SMLoc Loc = SMLoc()) override;
   void EmitIntValue(uint64_t Value, unsigned Size) override;
+  void EmitIntValueInHex(uint64_t Value, unsigned Size) override;
 
   void EmitULEB128Value(const MCExpr *Value) override;
 
@@ -227,11 +224,11 @@ public:
   Expected<unsigned> tryEmitDwarfFileDirective(unsigned FileNo,
                                                StringRef Directory,
                                                StringRef Filename,
-                                               MD5::MD5Result *Checksum = 0,
+                                               Optional<MD5::MD5Result> Checksum = None,
                                                Optional<StringRef> Source = None,
                                                unsigned CUID = 0) override;
   void emitDwarfFile0Directive(StringRef Directory, StringRef Filename,
-                               MD5::MD5Result *Checksum,
+                               Optional<MD5::MD5Result> Checksum,
                                Optional<StringRef> Source,
                                unsigned CUID = 0) override;
   void EmitDwarfLocDirective(unsigned FileNo, unsigned Line,
@@ -266,6 +263,7 @@ public:
   void EmitCVFPOData(const MCSymbol *ProcSym, SMLoc L) override;
 
   void EmitIdent(StringRef IdentString) override;
+  void EmitCFIBKeyFrame() override;
   void EmitCFISections(bool EH, bool Debug) override;
   void EmitCFIDefCfa(int64_t Register, int64_t Offset) override;
   void EmitCFIDefCfaOffset(int64_t Offset) override;
@@ -285,10 +283,12 @@ public:
   void EmitCFIUndefined(int64_t Register) override;
   void EmitCFIRegister(int64_t Register1, int64_t Register2) override;
   void EmitCFIWindowSave() override;
+  void EmitCFINegateRAState() override;
   void EmitCFIReturnColumn(int64_t Register) override;
 
   void EmitWinCFIStartProc(const MCSymbol *Symbol, SMLoc Loc) override;
   void EmitWinCFIEndProc(SMLoc Loc) override;
+  void EmitWinCFIFuncletOrFuncEnd(SMLoc Loc) override;
   void EmitWinCFIStartChained(SMLoc Loc) override;
   void EmitWinCFIEndChained(SMLoc Loc) override;
   void EmitWinCFIPushReg(unsigned Register, SMLoc Loc) override;
@@ -309,8 +309,7 @@ public:
   void emitCGProfileEntry(const MCSymbolRefExpr *From,
                           const MCSymbolRefExpr *To, uint64_t Count) override;
 
-  void EmitInstruction(const MCInst &Inst, const MCSubtargetInfo &STI,
-                       bool PrintSchedInfo) override;
+  void EmitInstruction(const MCInst &Inst, const MCSubtargetInfo &STI) override;
 
   void EmitBundleAlignMode(unsigned AlignPow2) override;
   void EmitBundleLock(bool AlignToEnd) override;
@@ -513,31 +512,52 @@ static const char *getVersionMinDirective(MCVersionMinType Type) {
   llvm_unreachable("Invalid MC version min type");
 }
 
+static void EmitSDKVersionSuffix(raw_ostream &OS,
+                                 const VersionTuple &SDKVersion) {
+  if (SDKVersion.empty())
+    return;
+  OS << '\t' << "sdk_version " << SDKVersion.getMajor();
+  if (auto Minor = SDKVersion.getMinor()) {
+    OS << ", " << *Minor;
+    if (auto Subminor = SDKVersion.getSubminor()) {
+      OS << ", " << *Subminor;
+    }
+  }
+}
+
 void MCAsmStreamer::EmitVersionMin(MCVersionMinType Type, unsigned Major,
-                                   unsigned Minor, unsigned Update) {
+                                   unsigned Minor, unsigned Update,
+                                   VersionTuple SDKVersion) {
   OS << '\t' << getVersionMinDirective(Type) << ' ' << Major << ", " << Minor;
   if (Update)
     OS << ", " << Update;
+  EmitSDKVersionSuffix(OS, SDKVersion);
   EmitEOL();
 }
 
 static const char *getPlatformName(MachO::PlatformType Type) {
   switch (Type) {
-  case MachO::PLATFORM_MACOS:    return "macos";
-  case MachO::PLATFORM_IOS:      return "ios";
-  case MachO::PLATFORM_TVOS:     return "tvos";
-  case MachO::PLATFORM_WATCHOS:  return "watchos";
-  case MachO::PLATFORM_BRIDGEOS: return "bridgeos";
+  case MachO::PLATFORM_MACOS:            return "macos";
+  case MachO::PLATFORM_IOS:              return "ios";
+  case MachO::PLATFORM_TVOS:             return "tvos";
+  case MachO::PLATFORM_WATCHOS:          return "watchos";
+  case MachO::PLATFORM_BRIDGEOS:         return "bridgeos";
+  case MachO::PLATFORM_MACCATALYST:      return "macCatalyst";
+  case MachO::PLATFORM_IOSSIMULATOR:     return "iossimulator";
+  case MachO::PLATFORM_TVOSSIMULATOR:    return "tvossimulator";
+  case MachO::PLATFORM_WATCHOSSIMULATOR: return "watchossimulator";
   }
   llvm_unreachable("Invalid Mach-O platform type");
 }
 
 void MCAsmStreamer::EmitBuildVersion(unsigned Platform, unsigned Major,
-                                     unsigned Minor, unsigned Update) {
+                                     unsigned Minor, unsigned Update,
+                                     VersionTuple SDKVersion) {
   const char *PlatformName = getPlatformName((MachO::PlatformType)Platform);
   OS << "\t.build_version " << PlatformName << ", " << Major << ", " << Minor;
   if (Update)
     OS << ", " << Update;
+  EmitSDKVersionSuffix(OS, SDKVersion);
   EmitEOL();
 }
 
@@ -634,6 +654,9 @@ bool MCAsmStreamer::EmitSymbolAttribute(MCSymbol *Symbol,
       // .weak_reference
   case MCSA_WeakReference:  OS << MAI->getWeakRefDirective(); break;
   case MCSA_WeakDefAutoPrivate: OS << "\t.weak_def_can_be_hidden\t"; break;
+  case MCSA_Cold:
+    // Assemblers currently do not support a .cold directive.
+    return false;
   }
 
   Symbol->print(OS, MAI);
@@ -858,10 +881,14 @@ void MCAsmStreamer::EmitBytes(StringRef Data) {
   // supported, emit as vector of 8bits data.
   if (Data.size() == 1 ||
       !(MAI->getAscizDirective() || MAI->getAsciiDirective())) {
-    const char *Directive = MAI->getData8bitsDirective();
-    for (const unsigned char C : Data.bytes()) {
-      OS << Directive << (unsigned)C;
-      EmitEOL();
+    if (MCTargetStreamer *TS = getTargetStreamer()) {
+      TS->emitRawBytes(Data);
+    } else {
+      const char *Directive = MAI->getData8bitsDirective();
+      for (const unsigned char C : Data.bytes()) {
+        OS << Directive << (unsigned)C;
+        EmitEOL();
+      }
     }
     return;
   }
@@ -895,6 +922,10 @@ void MCAsmStreamer::EmitBinaryData(StringRef Data) {
 
 void MCAsmStreamer::EmitIntValue(uint64_t Value, unsigned Size) {
   EmitValue(MCConstantExpr::create(Value, getContext()), Size);
+}
+
+void MCAsmStreamer::EmitIntValueInHex(uint64_t Value, unsigned Size) {
+  EmitValue(MCConstantExpr::create(Value, getContext(), true), Size);
 }
 
 void MCAsmStreamer::EmitValueImpl(const MCExpr *Value, unsigned Size,
@@ -1126,7 +1157,7 @@ void MCAsmStreamer::EmitFileDirective(StringRef Filename) {
 
 static void printDwarfFileDirective(unsigned FileNo, StringRef Directory,
                                     StringRef Filename,
-                                    MD5::MD5Result *Checksum,
+                                    Optional<MD5::MD5Result> Checksum,
                                     Optional<StringRef> Source,
                                     bool UseDwarfDirectory,
                                     raw_svector_ostream &OS) {
@@ -1159,13 +1190,14 @@ static void printDwarfFileDirective(unsigned FileNo, StringRef Directory,
 
 Expected<unsigned> MCAsmStreamer::tryEmitDwarfFileDirective(
     unsigned FileNo, StringRef Directory, StringRef Filename,
-    MD5::MD5Result *Checksum, Optional<StringRef> Source, unsigned CUID) {
+    Optional<MD5::MD5Result> Checksum, Optional<StringRef> Source, unsigned CUID) {
   assert(CUID == 0 && "multiple CUs not supported by MCAsmStreamer");
 
   MCDwarfLineTable &Table = getContext().getMCDwarfLineTable(CUID);
   unsigned NumFiles = Table.getMCDwarfFiles().size();
   Expected<unsigned> FileNoOrErr =
-      Table.tryGetFile(Directory, Filename, Checksum, Source, FileNo);
+      Table.tryGetFile(Directory, Filename, Checksum, Source,
+                       getContext().getDwarfVersion(), FileNo);
   if (!FileNoOrErr)
     return FileNoOrErr.takeError();
   FileNo = FileNoOrErr.get();
@@ -1187,7 +1219,7 @@ Expected<unsigned> MCAsmStreamer::tryEmitDwarfFileDirective(
 
 void MCAsmStreamer::emitDwarfFile0Directive(StringRef Directory,
                                             StringRef Filename,
-                                            MD5::MD5Result *Checksum,
+                                            Optional<MD5::MD5Result> Checksum,
                                             Optional<StringRef> Source,
                                             unsigned CUID) {
   assert(CUID == 0);
@@ -1298,20 +1330,17 @@ void MCAsmStreamer::EmitCVLocDirective(unsigned FunctionId, unsigned FileNo,
                                        unsigned Line, unsigned Column,
                                        bool PrologueEnd, bool IsStmt,
                                        StringRef FileName, SMLoc Loc) {
+  // Validate the directive.
+  if (!checkCVLocSection(FunctionId, FileNo, Loc))
+    return;
+
   OS << "\t.cv_loc\t" << FunctionId << " " << FileNo << " " << Line << " "
      << Column;
   if (PrologueEnd)
     OS << " prologue_end";
 
-  unsigned OldIsStmt = getContext().getCVContext().getCurrentCVLoc().isStmt();
-  if (IsStmt != OldIsStmt) {
-    OS << " is_stmt ";
-
-    if (IsStmt)
-      OS << "1";
-    else
-      OS << "0";
-  }
+  if (IsStmt)
+    OS << " is_stmt 1";
 
   if (IsVerboseAsm) {
     OS.PadToColumn(MAI->getCommentColumn());
@@ -1319,8 +1348,6 @@ void MCAsmStreamer::EmitCVLocDirective(unsigned FunctionId, unsigned FileNo,
        << Column;
   }
   EmitEOL();
-  this->MCStreamer::EmitCVLocDirective(FunctionId, FileNo, Line, Column,
-                                       PrologueEnd, IsStmt, FileName, Loc);
 }
 
 void MCAsmStreamer::EmitCVLinetableDirective(unsigned FunctionId,
@@ -1569,9 +1596,21 @@ void MCAsmStreamer::EmitCFIWindowSave() {
   EmitEOL();
 }
 
+void MCAsmStreamer::EmitCFINegateRAState() {
+  MCStreamer::EmitCFINegateRAState();
+  OS << "\t.cfi_negate_ra_state";
+  EmitEOL();
+}
+
 void MCAsmStreamer::EmitCFIReturnColumn(int64_t Register) {
   MCStreamer::EmitCFIReturnColumn(Register);
   OS << "\t.cfi_return_column " << Register;
+  EmitEOL();
+}
+
+void MCAsmStreamer::EmitCFIBKeyFrame() {
+  MCStreamer::EmitCFIBKeyFrame();
+  OS << "\t.cfi_b_key_frame";
   EmitEOL();
 }
 
@@ -1588,6 +1627,10 @@ void MCAsmStreamer::EmitWinCFIEndProc(SMLoc Loc) {
 
   OS << "\t.seh_endproc";
   EmitEOL();
+}
+
+// TODO: Implement
+void MCAsmStreamer::EmitWinCFIFuncletOrFuncEnd(SMLoc Loc) {
 }
 
 void MCAsmStreamer::EmitWinCFIStartChained(SMLoc Loc) {
@@ -1699,8 +1742,7 @@ void MCAsmStreamer::emitCGProfileEntry(const MCSymbolRefExpr *From,
 }
 
 void MCAsmStreamer::AddEncodingComment(const MCInst &Inst,
-                                       const MCSubtargetInfo &STI,
-                                       bool PrintSchedInfo) {
+                                       const MCSubtargetInfo &STI) {
   raw_ostream &OS = GetCommentOS();
   SmallString<256> Code;
   SmallVector<MCFixup, 4> Fixups;
@@ -1779,11 +1821,7 @@ void MCAsmStreamer::AddEncodingComment(const MCInst &Inst,
       }
     }
   }
-  OS << "]";
-  // If we are not going to add fixup or schedule comments after this point
-  // then we have to end the current comment line with "\n".
-  if (Fixups.size() || !PrintSchedInfo)
-    OS << "\n";
+  OS << "]\n";
 
   for (unsigned i = 0, e = Fixups.size(); i != e; ++i) {
     MCFixup &F = Fixups[i];
@@ -1795,18 +1833,15 @@ void MCAsmStreamer::AddEncodingComment(const MCInst &Inst,
 }
 
 void MCAsmStreamer::EmitInstruction(const MCInst &Inst,
-                                    const MCSubtargetInfo &STI,
-                                    bool PrintSchedInfo) {
+                                    const MCSubtargetInfo &STI) {
   assert(getCurrentSectionOnly() &&
          "Cannot emit contents before setting section!");
 
   // Show the encoding in a comment if we have a code emitter.
-  AddEncodingComment(Inst, STI, PrintSchedInfo);
+  AddEncodingComment(Inst, STI);
 
   // Show the MCInst if enabled.
   if (ShowInst) {
-    if (PrintSchedInfo)
-      GetCommentOS() << "\n";
     Inst.dump_pretty(GetCommentOS(), InstPrinter.get(), "\n ");
     GetCommentOS() << "\n";
   }
@@ -1815,12 +1850,6 @@ void MCAsmStreamer::EmitInstruction(const MCInst &Inst,
     getTargetStreamer()->prettyPrintAsm(*InstPrinter, OS, Inst, STI);
   else
     InstPrinter->printInst(&Inst, OS, "", STI);
-
-  if (PrintSchedInfo) {
-    std::string SI = STI.getSchedInfoStr(Inst);
-    if (!SI.empty())
-      GetCommentOS() << SI;
-  }
 
   StringRef Comments = CommentToEmit;
   if (Comments.size() && Comments.back() != '\n')
@@ -1889,7 +1918,7 @@ void MCAsmStreamer::FinishImpl() {
   // Emit the label for the line table, if requested - since the rest of the
   // line table will be defined by .loc/.file directives, and not emitted
   // directly, the label is the only work required here.
-  auto &Tables = getContext().getMCDwarfLineTables();
+  const auto &Tables = getContext().getMCDwarfLineTables();
   if (!Tables.empty()) {
     assert(Tables.size() == 1 && "asm output only supports one line table");
     if (auto *Label = Tables.begin()->second.getLabel()) {

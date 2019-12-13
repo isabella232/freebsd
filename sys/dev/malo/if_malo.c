@@ -1051,13 +1051,9 @@ malo_tx_start(struct malo_softc *sc, struct ieee80211_node *ni,
 	copyhdrlen = hdrlen = ieee80211_anyhdrsize(wh);
 	pktlen = m0->m_pkthdr.len;
 	if (IEEE80211_QOS_HAS_SEQ(wh)) {
-		if (IEEE80211_IS_DSTODS(wh)) {
-			qos = *(uint16_t *)
-			    (((struct ieee80211_qosframe_addr4 *) wh)->i_qos);
+		qos = *(uint16_t *)ieee80211_getqos(wh);
+		if (IEEE80211_IS_DSTODS(wh))
 			copyhdrlen -= sizeof(qos);
-		} else
-			qos = *(uint16_t *)
-			    (((struct ieee80211_qosframe *) wh)->i_qos);
 	} else
 		qos = 0;
 
@@ -1514,49 +1510,46 @@ malo_init(void *arg)
 		ieee80211_start_all(ic);	/* start all vap's */
 }
 
+struct malo_copy_maddr_ctx {
+	uint8_t macs[IEEE80211_ADDR_LEN * MALO_HAL_MCAST_MAX];
+	int nmc;
+};
+
+static u_int
+malo_copy_maddr(void *arg, struct sockaddr_dl *sdl, u_int nmc)
+{
+	struct malo_copy_maddr_ctx *ctx = arg;
+
+	if (ctx->nmc == MALO_HAL_MCAST_MAX)
+		return (0);
+
+	IEEE80211_ADDR_COPY(ctx->macs + (ctx->nmc * IEEE80211_ADDR_LEN),
+	    LLADDR(sdl));
+	ctx->nmc++;
+
+	return (1);
+}
+
 /*
  * Set the multicast filter contents into the hardware.
  */
 static void
 malo_setmcastfilter(struct malo_softc *sc)
 {
+	struct malo_copy_maddr_ctx ctx;
 	struct ieee80211com *ic = &sc->malo_ic;
 	struct ieee80211vap *vap;
-	uint8_t macs[IEEE80211_ADDR_LEN * MALO_HAL_MCAST_MAX];
-	uint8_t *mp;
-	int nmc;
 
-	mp = macs;
-	nmc = 0;
 
 	if (ic->ic_opmode == IEEE80211_M_MONITOR || ic->ic_allmulti > 0 ||
 	    ic->ic_promisc > 0)
 		goto all;
 
-	TAILQ_FOREACH(vap, &ic->ic_vaps, iv_next) {
-		struct ifnet *ifp;
-		struct ifmultiaddr *ifma;
+	ctx.nmc = 0;
+	TAILQ_FOREACH(vap, &ic->ic_vaps, iv_next)
+		if_foreach_llmaddr(vap->iv_ifp, malo_copy_maddr, &ctx);
 
-		ifp = vap->iv_ifp;
-		if_maddr_rlock(ifp);
-		CK_STAILQ_FOREACH(ifma, &ifp->if_multiaddrs, ifma_link) {
-			if (ifma->ifma_addr->sa_family != AF_LINK)
-				continue;
-
-			if (nmc == MALO_HAL_MCAST_MAX) {
-				ifp->if_flags |= IFF_ALLMULTI;
-				if_maddr_runlock(ifp);
-				goto all;
-			}
-			IEEE80211_ADDR_COPY(mp,
-			    LLADDR((struct sockaddr_dl *)ifma->ifma_addr));
-
-			mp += IEEE80211_ADDR_LEN, nmc++;
-		}
-		if_maddr_runlock(ifp);
-	}
-
-	malo_hal_setmcast(sc->malo_mh, nmc, macs);
+	malo_hal_setmcast(sc->malo_mh, ctx.nmc, ctx.macs);
 
 all:
 	/*
@@ -1952,7 +1945,6 @@ malo_rx_proc(void *arg, int npending)
 	struct malo_rxdesc *ds;
 	struct mbuf *m, *mnew;
 	struct ieee80211_qosframe *wh;
-	struct ieee80211_qosframe_addr4 *wh4;
 	struct ieee80211_node *ni;
 	int off, len, hdrlen, pktlen, rssi, ntodo;
 	uint8_t *data, status;
@@ -2062,15 +2054,8 @@ malo_rx_proc(void *arg, int npending)
 		/* NB: don't need to do this sometimes but ... */
 		/* XXX special case so we can memcpy after m_devget? */
 		ovbcopy(data + sizeof(uint16_t), wh, hdrlen);
-		if (IEEE80211_QOS_HAS_SEQ(wh)) {
-			if (IEEE80211_IS_DSTODS(wh)) {
-				wh4 = mtod(m,
-				    struct ieee80211_qosframe_addr4*);
-				*(uint16_t *)wh4->i_qos = ds->qosctrl;
-			} else {
-				*(uint16_t *)wh->i_qos = ds->qosctrl;
-			}
-		}
+		if (IEEE80211_QOS_HAS_SEQ(wh))
+			*(uint16_t *)ieee80211_getqos(wh) = ds->qosctrl;
 		if (ieee80211_radiotap_active(ic)) {
 			sc->malo_rx_th.wr_flags = 0;
 			sc->malo_rx_th.wr_rate = ds->rate;

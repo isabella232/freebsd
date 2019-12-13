@@ -138,6 +138,17 @@
 # include <seccomp.h>
 #endif /* LIBSECCOMP and KERN_SECCOMP */
 
+#ifdef __FreeBSD__
+#include <sys/procctl.h>
+#ifndef PROC_STACKGAP_CTL
+/*
+ * Even if we compile on an older system we can still run on a newer one.
+ */
+#define	PROC_STACKGAP_CTL	17
+#define	PROC_STACKGAP_DISABLE	0x0002
+#endif
+#endif
+
 #ifdef HAVE_DNSREGISTRATION
 # include <dns_sd.h>
 DNSServiceRef mdns;
@@ -402,6 +413,18 @@ main(
 	char *argv[]
 	)
 {
+#ifdef __FreeBSD__
+	{
+		/*
+		 * We Must disable ASLR stack gap on FreeBSD to avoid a
+		 * segfault. See PR/241421 and PR/241960.
+		 */
+		int aslr_var = PROC_STACKGAP_DISABLE;
+
+		pid_t my_pid = getpid();
+		procctl(P_PID, my_pid, PROC_STACKGAP_CTL, &aslr_var); 
+	}
+#endif
 	return ntpdmain(argc, argv);
 }
 #endif /* !SYS_WINNT */
@@ -534,6 +557,7 @@ set_process_priority(void)
  * Detach from terminal (much like daemon())
  * Nothe that this function calls exit()
  */
+# ifdef HAVE_WORKING_FORK
 static void
 detach_from_terminal(
 	int pipe_fds[2],
@@ -617,6 +641,7 @@ detach_from_terminal(
 
 	return;
 }
+# endif /* HAVE_WORKING_FORK */
 
 #ifdef HAVE_DROPROOT
 /*
@@ -665,8 +690,7 @@ getuser:
  * Map group name/number to group ID
 */
 static int
-map_group(
-	)
+map_group(void)
 {
 	char *endp;
 
@@ -688,24 +712,9 @@ getgroup:
 	return 1;
 }
 
-/*
- * Change (effective) user and group IDs, also initialize the supplementary group access list
- */
-int
-set_user_group_ids(
-	)
+static int
+set_group_ids(void)
 {
-	/* If the the user was already mapped, no need to map it again */
-	if ((NULL != user) && (0 == sw_uid)) {
-		if (0 == map_user())
-			exit (-1);
-	}
-	/* same applies for the group */
-	if ((NULL != group) && (0 == sw_gid)) {
-		if (0 == map_group())
-			exit (-1);
-	}
-
 	if (user && initgroups(user, sw_gid)) {
 		msyslog(LOG_ERR, "Cannot initgroups() to user `%s': %m", user);
 		return 0;
@@ -729,6 +738,12 @@ set_user_group_ids(
 			msyslog(LOG_ERR, "initgroups(<%s>, %d) filed: %m", pw->pw_name, pw->pw_gid);
 			return 0;
 		}
+	return 1;
+}
+
+static int
+set_user_ids(void)
+{
 	if (user && setuid(sw_uid)) {
 		msyslog(LOG_ERR, "Cannot setuid() to user `%s': %m", user);
 		return 0;
@@ -737,6 +752,31 @@ set_user_group_ids(
 		msyslog(LOG_ERR, "Cannot seteuid() to user `%s': %m", user);
 		return 0;
 	}
+	return 1;
+}
+
+/*
+ * Change (effective) user and group IDs, also initialize the supplementary group access list
+ */
+int set_user_group_ids(void);
+int
+set_user_group_ids(void)
+{
+	/* If the the user was already mapped, no need to map it again */
+	if ((NULL != user) && (0 == sw_uid)) {
+		if (0 == map_user())
+			exit (-1);
+	}
+	/* same applies for the group */
+	if ((NULL != group) && (0 == sw_gid)) {
+		if (0 == map_group())
+			exit (-1);
+	}
+
+	if (getegid() != sw_gid && 0 == set_group_ids())
+		return 0;
+	if (geteuid() != sw_uid && 0 == set_user_ids())
+		return 0;
 
 	return 1;
 }
@@ -982,7 +1022,7 @@ ntpdmain(
 # if defined(HAVE_MLOCKALL)
 #  ifdef HAVE_SETRLIMIT
 	ntp_rlimit(RLIMIT_STACK, DFLT_RLIMIT_STACK * 4096, 4096, "4k");
-#   ifdef RLIMIT_MEMLOCK
+#   if defined(RLIMIT_MEMLOCK) && defined(DFLT_RLIMIT_MEMLOCK) && DFLT_RLIMIT_MEMLOCK != -1
 	/*
 	 * The default RLIMIT_MEMLOCK is very low on Linux systems.
 	 * Unless we increase this limit malloc calls are likely to

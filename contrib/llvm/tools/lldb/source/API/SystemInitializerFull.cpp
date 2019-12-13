@@ -1,15 +1,10 @@
 //===-- SystemInitializerFull.cpp -------------------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
-
-#if !defined(LLDB_DISABLE_PYTHON)
-#include "Plugins/ScriptInterpreter/Python/lldb-python.h"
-#endif
 
 #include "SystemInitializerFull.h"
 
@@ -24,11 +19,6 @@
 #include "lldb/Initialization/SystemInitializerCommon.h"
 #include "lldb/Interpreter/CommandInterpreter.h"
 #include "lldb/Symbol/ClangASTContext.h"
-#include "lldb/Symbol/GoASTContext.h"
-#ifdef LLDB_ENABLE_ALL
-#include "lldb/Symbol/JavaASTContext.h"
-#endif // LLDB_ENABLE_ALL
-#include "lldb/Symbol/OCamlASTContext.h"
 #include "lldb/Utility/Timer.h"
 
 #ifdef LLDB_ENABLE_ALL
@@ -50,7 +40,11 @@
 #include "Plugins/ABI/SysV-s390x/ABISysV_s390x.h"
 #endif // LLDB_ENABLE_ALL
 #include "Plugins/ABI/SysV-x86_64/ABISysV_x86_64.h"
+#ifdef LLDB_ENABLE_ALL
+#include "Plugins/ABI/Windows-x86_64/ABIWindows_x86_64.h"
+#endif // LLDB_ENABLE_ALL
 #include "Plugins/Architecture/Arm/ArchitectureArm.h"
+#include "Plugins/Architecture/Mips/ArchitectureMips.h"
 #include "Plugins/Architecture/PPC64/ArchitecturePPC64.h"
 #include "Plugins/Disassembler/llvm/DisassemblerLLVMC.h"
 #ifdef LLDB_ENABLE_ALL
@@ -62,7 +56,10 @@
 #ifdef LLDB_ENABLE_ALL
 #include "Plugins/DynamicLoader/Windows-DYLD/DynamicLoaderWindowsDYLD.h"
 #endif // LLDB_ENABLE_ALL
+#include "Plugins/Instruction/ARM/EmulateInstructionARM.h"
 #include "Plugins/Instruction/ARM64/EmulateInstructionARM64.h"
+#include "Plugins/Instruction/MIPS/EmulateInstructionMIPS.h"
+#include "Plugins/Instruction/MIPS64/EmulateInstructionMIPS64.h"
 #include "Plugins/Instruction/PPC64/EmulateInstructionPPC64.h"
 #include "Plugins/InstrumentationRuntime/ASan/ASanRuntime.h"
 #include "Plugins/InstrumentationRuntime/MainThreadChecker/MainThreadCheckerRuntime.h"
@@ -73,32 +70,30 @@
 #include "Plugins/JITLoader/GDB/JITLoaderGDB.h"
 #include "Plugins/Language/CPlusPlus/CPlusPlusLanguage.h"
 #ifdef LLDB_ENABLE_ALL
-#include "Plugins/Language/Go/GoLanguage.h"
-#include "Plugins/Language/Java/JavaLanguage.h"
-#include "Plugins/Language/OCaml/OCamlLanguage.h"
 #include "Plugins/Language/ObjC/ObjCLanguage.h"
 #include "Plugins/Language/ObjCPlusPlus/ObjCPlusPlusLanguage.h"
 #endif // LLDB_ENABLE_ALL
 #include "Plugins/LanguageRuntime/CPlusPlus/ItaniumABI/ItaniumABILanguageRuntime.h"
 #ifdef LLDB_ENABLE_ALL
-#include "Plugins/LanguageRuntime/Go/GoLanguageRuntime.h"
-#include "Plugins/LanguageRuntime/Java/JavaLanguageRuntime.h"
 #include "Plugins/LanguageRuntime/ObjC/AppleObjCRuntime/AppleObjCRuntimeV1.h"
 #include "Plugins/LanguageRuntime/ObjC/AppleObjCRuntime/AppleObjCRuntimeV2.h"
 #include "Plugins/LanguageRuntime/RenderScript/RenderScriptRuntime/RenderScriptRuntime.h"
 #endif // LLDB_ENABLE_ALL
 #include "Plugins/MemoryHistory/asan/MemoryHistoryASan.h"
+#include "Plugins/ObjectContainer/BSD-Archive/ObjectContainerBSDArchive.h"
+#ifdef LLDB_ENABLE_ALL
+#include "Plugins/ObjectContainer/Universal-Mach-O/ObjectContainerUniversalMachO.h"
+#endif // LLDB_ENABLE_ALL
+#include "Plugins/ObjectFile/Breakpad/ObjectFileBreakpad.h"
 #include "Plugins/ObjectFile/ELF/ObjectFileELF.h"
 #ifdef LLDB_ENABLE_ALL
 #include "Plugins/ObjectFile/Mach-O/ObjectFileMachO.h"
 #include "Plugins/ObjectFile/PECOFF/ObjectFilePECOFF.h"
-#include "Plugins/OperatingSystem/Go/OperatingSystemGo.h"
 #include "Plugins/OperatingSystem/Python/OperatingSystemPython.h"
 #include "Plugins/Platform/Android/PlatformAndroid.h"
 #endif // LLDB_ENABLE_ALL
 #include "Plugins/Platform/FreeBSD/PlatformFreeBSD.h"
 #ifdef LLDB_ENABLE_ALL
-#include "Plugins/Platform/Kalimba/PlatformKalimba.h"
 #include "Plugins/Platform/Linux/PlatformLinux.h"
 #include "Plugins/Platform/MacOSX/PlatformMacOSX.h"
 #include "Plugins/Platform/MacOSX/PlatformRemoteiOS.h"
@@ -114,6 +109,7 @@
 #include "Plugins/Process/minidump/ProcessMinidump.h"
 #endif // LLDB_ENABLE_ALL
 #include "Plugins/ScriptInterpreter/None/ScriptInterpreterNone.h"
+#include "Plugins/SymbolFile/Breakpad/SymbolFileBreakpad.h"
 #include "Plugins/SymbolFile/DWARF/SymbolFileDWARF.h"
 #include "Plugins/SymbolFile/DWARF/SymbolFileDWARFDebugMap.h"
 #ifdef LLDB_ENABLE_ALL
@@ -132,6 +128,7 @@
 #include "Plugins/Platform/MacOSX/PlatformAppleTVSimulator.h"
 #include "Plugins/Platform/MacOSX/PlatformAppleWatchSimulator.h"
 #include "Plugins/Platform/MacOSX/PlatformDarwinKernel.h"
+#include "Plugins/Platform/MacOSX/PlatformRemoteAppleBridge.h"
 #include "Plugins/Platform/MacOSX/PlatformRemoteAppleTV.h"
 #include "Plugins/Platform/MacOSX/PlatformRemoteAppleWatch.h"
 #include "Plugins/Platform/MacOSX/PlatformiOSSimulator.h"
@@ -153,142 +150,33 @@
 
 #include "llvm/Support/TargetSelect.h"
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wglobal-constructors"
+#include "llvm/ExecutionEngine/MCJIT.h"
+#pragma clang diagnostic pop
+
 #include <string>
 
 using namespace lldb_private;
-
-#ifndef LLDB_DISABLE_PYTHON
-
-// Defined in the SWIG source file
-#if PY_MAJOR_VERSION >= 3
-extern "C" PyObject *PyInit__lldb(void);
-
-#define LLDBSwigPyInit PyInit__lldb
-
-#else
-extern "C" void init_lldb(void);
-
-#define LLDBSwigPyInit init_lldb
-#endif
-
-// these are the Pythonic implementations of the required callbacks these are
-// scripting-language specific, which is why they belong here we still need to
-// use function pointers to them instead of relying on linkage-time resolution
-// because the SWIG stuff and this file get built at different times
-extern "C" bool LLDBSwigPythonBreakpointCallbackFunction(
-    const char *python_function_name, const char *session_dictionary_name,
-    const lldb::StackFrameSP &sb_frame,
-    const lldb::BreakpointLocationSP &sb_bp_loc);
-
-extern "C" bool LLDBSwigPythonWatchpointCallbackFunction(
-    const char *python_function_name, const char *session_dictionary_name,
-    const lldb::StackFrameSP &sb_frame, const lldb::WatchpointSP &sb_wp);
-
-extern "C" bool LLDBSwigPythonCallTypeScript(
-    const char *python_function_name, void *session_dictionary,
-    const lldb::ValueObjectSP &valobj_sp, void **pyfunct_wrapper,
-    const lldb::TypeSummaryOptionsSP &options_sp, std::string &retval);
-
-extern "C" void *
-LLDBSwigPythonCreateSyntheticProvider(const char *python_class_name,
-                                      const char *session_dictionary_name,
-                                      const lldb::ValueObjectSP &valobj_sp);
-
-extern "C" void *
-LLDBSwigPythonCreateCommandObject(const char *python_class_name,
-                                  const char *session_dictionary_name,
-                                  const lldb::DebuggerSP debugger_sp);
-
-extern "C" void *LLDBSwigPythonCreateScriptedThreadPlan(
-    const char *python_class_name, const char *session_dictionary_name,
-    const lldb::ThreadPlanSP &thread_plan_sp);
-
-extern "C" bool LLDBSWIGPythonCallThreadPlan(void *implementor,
-                                             const char *method_name,
-                                             Event *event_sp, bool &got_error);
-
-extern "C" size_t LLDBSwigPython_CalculateNumChildren(void *implementor,
-                                                      uint32_t max);
-
-extern "C" void *LLDBSwigPython_GetChildAtIndex(void *implementor,
-                                                uint32_t idx);
-
-extern "C" int LLDBSwigPython_GetIndexOfChildWithName(void *implementor,
-                                                      const char *child_name);
-
-extern "C" void *LLDBSWIGPython_CastPyObjectToSBValue(void *data);
-
-extern lldb::ValueObjectSP
-LLDBSWIGPython_GetValueObjectSPFromSBValue(void *data);
-
-extern "C" bool LLDBSwigPython_UpdateSynthProviderInstance(void *implementor);
-
-extern "C" bool
-LLDBSwigPython_MightHaveChildrenSynthProviderInstance(void *implementor);
-
-extern "C" void *
-LLDBSwigPython_GetValueSynthProviderInstance(void *implementor);
-
-extern "C" bool
-LLDBSwigPythonCallCommand(const char *python_function_name,
-                          const char *session_dictionary_name,
-                          lldb::DebuggerSP &debugger, const char *args,
-                          lldb_private::CommandReturnObject &cmd_retobj,
-                          lldb::ExecutionContextRefSP exe_ctx_ref_sp);
-
-extern "C" bool
-LLDBSwigPythonCallCommandObject(void *implementor, lldb::DebuggerSP &debugger,
-                                const char *args,
-                                lldb_private::CommandReturnObject &cmd_retobj,
-                                lldb::ExecutionContextRefSP exe_ctx_ref_sp);
-
-extern "C" bool
-LLDBSwigPythonCallModuleInit(const char *python_module_name,
-                             const char *session_dictionary_name,
-                             lldb::DebuggerSP &debugger);
-
-extern "C" void *
-LLDBSWIGPythonCreateOSPlugin(const char *python_class_name,
-                             const char *session_dictionary_name,
-                             const lldb::ProcessSP &process_sp);
-
-extern "C" bool LLDBSWIGPythonRunScriptKeywordProcess(
-    const char *python_function_name, const char *session_dictionary_name,
-    lldb::ProcessSP &process, std::string &output);
-
-extern "C" bool LLDBSWIGPythonRunScriptKeywordThread(
-    const char *python_function_name, const char *session_dictionary_name,
-    lldb::ThreadSP &thread, std::string &output);
-
-extern "C" bool LLDBSWIGPythonRunScriptKeywordTarget(
-    const char *python_function_name, const char *session_dictionary_name,
-    lldb::TargetSP &target, std::string &output);
-
-extern "C" bool LLDBSWIGPythonRunScriptKeywordFrame(
-    const char *python_function_name, const char *session_dictionary_name,
-    lldb::StackFrameSP &frame, std::string &output);
-
-extern "C" bool LLDBSWIGPythonRunScriptKeywordValue(
-    const char *python_function_name, const char *session_dictionary_name,
-    lldb::ValueObjectSP &value, std::string &output);
-
-extern "C" void *
-LLDBSWIGPython_GetDynamicSetting(void *module, const char *setting,
-                                 const lldb::TargetSP &target_sp);
-
-#endif
 
 SystemInitializerFull::SystemInitializerFull() {}
 
 SystemInitializerFull::~SystemInitializerFull() {}
 
-void SystemInitializerFull::Initialize() {
-  SystemInitializerCommon::Initialize();
+llvm::Error SystemInitializerFull::Initialize() {
+  if (auto e = SystemInitializerCommon::Initialize())
+    return e;
 
+  breakpad::ObjectFileBreakpad::Initialize();
   ObjectFileELF::Initialize();
 #ifdef LLDB_ENABLE_ALL
   ObjectFileMachO::Initialize();
   ObjectFilePECOFF::Initialize();
+#endif // LLDB_ENABLE_ALL
+
+  ObjectContainerBSDArchive::Initialize();
+#ifdef LLDB_ENABLE_ALL
+  ObjectContainerUniversalMachO::Initialize();
 #endif // LLDB_ENABLE_ALL
 
   ScriptInterpreterNone::Initialize();
@@ -296,16 +184,8 @@ void SystemInitializerFull::Initialize() {
 #ifndef LLDB_DISABLE_PYTHON
   OperatingSystemPython::Initialize();
 #endif
-#ifdef LLDB_ENABLE_ALL
-  OperatingSystemGo::Initialize();
-#endif // LLDB_ENABLE_ALL
 
 #if !defined(LLDB_DISABLE_PYTHON)
-  InitializeSWIG();
-
-  // ScriptInterpreterPython::Initialize() depends on things like HostInfo
-  // being initialized so it can compute the python directory etc, so we need
-  // to do this after SystemInitializerCommon::Initialize().
   ScriptInterpreterPython::Initialize();
 #endif
 
@@ -315,7 +195,6 @@ void SystemInitializerFull::Initialize() {
   platform_netbsd::PlatformNetBSD::Initialize();
   platform_openbsd::PlatformOpenBSD::Initialize();
   PlatformWindows::Initialize();
-  PlatformKalimba::Initialize();
   platform_android::PlatformAndroid::Initialize();
   PlatformRemoteiOS::Initialize();
   PlatformMacOSX::Initialize();
@@ -332,11 +211,8 @@ void SystemInitializerFull::Initialize() {
   llvm::InitializeAllDisassemblers();
 
   ClangASTContext::Initialize();
-#ifdef LLDB_ENABLE_ALL
-  GoASTContext::Initialize();
-  JavaASTContext::Initialize();
-  OCamlASTContext::Initialize();
 
+#ifdef LLDB_ENABLE_ALL
   ABIMacOSX_i386::Initialize();
   ABIMacOSX_arm::Initialize();
   ABIMacOSX_arm64::Initialize();
@@ -354,9 +230,11 @@ void SystemInitializerFull::Initialize() {
   ABISysV_mips64::Initialize();
 #ifdef LLDB_ENABLE_ALL
   ABISysV_s390x::Initialize();
+  ABIWindows_x86_64::Initialize();
 #endif // LLDB_ENABLE_ALL
 
   ArchitectureArm::Initialize();
+  ArchitectureMips::Initialize();
   ArchitecturePPC64::Initialize();
 
   DisassemblerLLVMC::Initialize();
@@ -376,6 +254,7 @@ void SystemInitializerFull::Initialize() {
   MainThreadCheckerRuntime::Initialize();
 
   SymbolVendorELF::Initialize();
+  breakpad::SymbolFileBreakpad::Initialize();
   SymbolFileDWARF::Initialize();
 #ifdef LLDB_ENABLE_ALL
   SymbolFilePDB::Initialize();
@@ -383,8 +262,13 @@ void SystemInitializerFull::Initialize() {
   SymbolFileSymtab::Initialize();
   UnwindAssemblyInstEmulation::Initialize();
   UnwindAssembly_x86::Initialize();
+
+  EmulateInstructionARM::Initialize();
   EmulateInstructionARM64::Initialize();
+  EmulateInstructionMIPS::Initialize();
+  EmulateInstructionMIPS64::Initialize();
   EmulateInstructionPPC64::Initialize();
+
   SymbolFileDWARFDebugMap::Initialize();
   ItaniumABILanguageRuntime::Initialize();
 #ifdef LLDB_ENABLE_ALL
@@ -392,17 +276,12 @@ void SystemInitializerFull::Initialize() {
   AppleObjCRuntimeV1::Initialize();
   SystemRuntimeMacOSX::Initialize();
   RenderScriptRuntime::Initialize();
-  GoLanguageRuntime::Initialize();
-  JavaLanguageRuntime::Initialize();
 #endif // LLDB_ENABLE_ALL
 
   CPlusPlusLanguage::Initialize();
 #ifdef LLDB_ENABLE_ALL
-  GoLanguage::Initialize();
-  JavaLanguage::Initialize();
   ObjCLanguage::Initialize();
   ObjCPlusPlusLanguage::Initialize();
-  OCamlLanguage::Initialize();
 #endif // LLDB_ENABLE_ALL
 
 #if defined(_WIN32)
@@ -418,6 +297,7 @@ void SystemInitializerFull::Initialize() {
   PlatformAppleWatchSimulator::Initialize();
   PlatformRemoteAppleTV::Initialize();
   PlatformRemoteAppleWatch::Initialize();
+  PlatformRemoteAppleBridge::Initialize();
   DynamicLoaderDarwinKernel::Initialize();
 #endif
 
@@ -427,9 +307,7 @@ void SystemInitializerFull::Initialize() {
   StructuredDataDarwinLog::Initialize();
 #endif // LLDB_ENABLE_ALL
 
-  //----------------------------------------------------------------------
   // Platform agnostic plugins
-  //----------------------------------------------------------------------
   platform_gdb_server::PlatformRemoteGDBServer::Initialize();
 
   process_gdb_remote::ProcessGDBRemote::Initialize();
@@ -451,28 +329,8 @@ void SystemInitializerFull::Initialize() {
   // AFTER PluginManager::Initialize is called.
 
   Debugger::SettingsInitialize();
-}
 
-void SystemInitializerFull::InitializeSWIG() {
-#if !defined(LLDB_DISABLE_PYTHON)
-  ScriptInterpreterPython::InitializeInterpreter(
-      LLDBSwigPyInit, LLDBSwigPythonBreakpointCallbackFunction,
-      LLDBSwigPythonWatchpointCallbackFunction, LLDBSwigPythonCallTypeScript,
-      LLDBSwigPythonCreateSyntheticProvider, LLDBSwigPythonCreateCommandObject,
-      LLDBSwigPython_CalculateNumChildren, LLDBSwigPython_GetChildAtIndex,
-      LLDBSwigPython_GetIndexOfChildWithName,
-      LLDBSWIGPython_CastPyObjectToSBValue,
-      LLDBSWIGPython_GetValueObjectSPFromSBValue,
-      LLDBSwigPython_UpdateSynthProviderInstance,
-      LLDBSwigPython_MightHaveChildrenSynthProviderInstance,
-      LLDBSwigPython_GetValueSynthProviderInstance, LLDBSwigPythonCallCommand,
-      LLDBSwigPythonCallCommandObject, LLDBSwigPythonCallModuleInit,
-      LLDBSWIGPythonCreateOSPlugin, LLDBSWIGPythonRunScriptKeywordProcess,
-      LLDBSWIGPythonRunScriptKeywordThread,
-      LLDBSWIGPythonRunScriptKeywordTarget, LLDBSWIGPythonRunScriptKeywordFrame,
-      LLDBSWIGPythonRunScriptKeywordValue, LLDBSWIGPython_GetDynamicSetting,
-      LLDBSwigPythonCreateScriptedThreadPlan, LLDBSWIGPythonCallThreadPlan);
-#endif
+  return llvm::Error::success();
 }
 
 void SystemInitializerFull::Terminate() {
@@ -485,10 +343,11 @@ void SystemInitializerFull::Terminate() {
   PluginManager::Terminate();
 
   ClangASTContext::Terminate();
-  GoASTContext::Terminate();
+
 #ifdef LLDB_ENABLE_ALL
-  JavaASTContext::Terminate();
-  OCamlASTContext::Terminate();
+  ArchitectureArm::Terminate();
+  ArchitectureMips::Terminate();
+  ArchitecturePPC64::Terminate();
 
   ABIMacOSX_i386::Terminate();
   ABIMacOSX_arm::Terminate();
@@ -507,6 +366,7 @@ void SystemInitializerFull::Terminate() {
   ABISysV_mips64::Terminate();
 #ifdef LLDB_ENABLE_ALL
   ABISysV_s390x::Terminate();
+  ABIWindows_x86_64::Terminate();
 #endif // LLDB_ENABLE_ALL
   DisassemblerLLVMC::Terminate();
 
@@ -524,6 +384,7 @@ void SystemInitializerFull::Terminate() {
   UndefinedBehaviorSanitizerRuntime::Terminate();
   MainThreadCheckerRuntime::Terminate();
   SymbolVendorELF::Terminate();
+  breakpad::SymbolFileBreakpad::Terminate();
   SymbolFileDWARF::Terminate();
 #ifdef LLDB_ENABLE_ALL
   SymbolFilePDB::Terminate();
@@ -531,8 +392,13 @@ void SystemInitializerFull::Terminate() {
   SymbolFileSymtab::Terminate();
   UnwindAssembly_x86::Terminate();
   UnwindAssemblyInstEmulation::Terminate();
+
+  EmulateInstructionARM::Terminate();
   EmulateInstructionARM64::Terminate();
+  EmulateInstructionMIPS::Terminate();
+  EmulateInstructionMIPS64::Terminate();
   EmulateInstructionPPC64::Terminate();
+
   SymbolFileDWARFDebugMap::Terminate();
   ItaniumABILanguageRuntime::Terminate();
 #ifdef LLDB_ENABLE_ALL
@@ -540,16 +406,12 @@ void SystemInitializerFull::Terminate() {
   AppleObjCRuntimeV1::Terminate();
   SystemRuntimeMacOSX::Terminate();
   RenderScriptRuntime::Terminate();
-  JavaLanguageRuntime::Terminate();
 #endif // LLDB_ENABLE_ALL
 
   CPlusPlusLanguage::Terminate();
 #ifdef LLDB_ENABLE_ALL
-  GoLanguage::Terminate();
-  JavaLanguage::Terminate();
   ObjCLanguage::Terminate();
   ObjCPlusPlusLanguage::Terminate();
-  OCamlLanguage::Terminate();
 #endif // LLDB_ENABLE_ALL
 
 #if defined(__APPLE__)
@@ -560,6 +422,7 @@ void SystemInitializerFull::Terminate() {
   PlatformAppleWatchSimulator::Terminate();
   PlatformRemoteAppleTV::Terminate();
   PlatformRemoteAppleWatch::Terminate();
+  PlatformRemoteAppleBridge::Terminate();
 #endif
 
 #if defined(__FreeBSD__)
@@ -584,9 +447,6 @@ void SystemInitializerFull::Terminate() {
 #ifndef LLDB_DISABLE_PYTHON
   OperatingSystemPython::Terminate();
 #endif
-#ifdef LLDB_ENABLE_ALL
-  OperatingSystemGo::Terminate();
-#endif // LLDB_ENABLE_ALL
 
   platform_freebsd::PlatformFreeBSD::Terminate();
 #ifdef LLDB_ENABLE_ALL
@@ -594,7 +454,6 @@ void SystemInitializerFull::Terminate() {
   platform_netbsd::PlatformNetBSD::Terminate();
   platform_openbsd::PlatformOpenBSD::Terminate();
   PlatformWindows::Terminate();
-  PlatformKalimba::Terminate();
   platform_android::PlatformAndroid::Terminate();
   PlatformMacOSX::Terminate();
   PlatformRemoteiOS::Terminate();
@@ -604,10 +463,16 @@ void SystemInitializerFull::Terminate() {
   PlatformDarwinKernel::Terminate();
 #endif
 
+  breakpad::ObjectFileBreakpad::Terminate();
   ObjectFileELF::Terminate();
 #ifdef LLDB_ENABLE_ALL
   ObjectFileMachO::Terminate();
   ObjectFilePECOFF::Terminate();
+#endif // LLDB_ENABLE_ALL
+
+  ObjectContainerBSDArchive::Terminate();
+#ifdef LLDB_ENABLE_ALL
+  ObjectContainerUniversalMachO::Terminate();
 #endif // LLDB_ENABLE_ALL
 
   // Now shutdown the common parts, in reverse order.

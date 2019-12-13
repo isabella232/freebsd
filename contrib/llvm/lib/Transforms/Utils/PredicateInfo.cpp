@@ -1,9 +1,8 @@
 //===-- PredicateInfo.cpp - PredicateInfo Builder--------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------===//
 //
@@ -35,7 +34,6 @@
 #include "llvm/Support/DebugCounter.h"
 #include "llvm/Support/FormattedStream.h"
 #include "llvm/Transforms/Utils.h"
-#include "llvm/Transforms/Utils/OrderedInstructions.h"
 #include <algorithm>
 #define DEBUG_TYPE "predicateinfo"
 using namespace llvm;
@@ -475,7 +473,8 @@ void PredicateInfo::buildPredicateInfo() {
   }
   for (auto &Assume : AC.assumptions()) {
     if (auto *II = dyn_cast_or_null<IntrinsicInst>(Assume))
-      processAssume(II, II->getParent(), OpsToRename);
+      if (DT.isReachableFromEntry(II->getParent()))
+        processAssume(II, II->getParent(), OpsToRename);
   }
   // Now rename all our operations.
   renameUses(OpsToRename);
@@ -490,8 +489,10 @@ void PredicateInfo::buildPredicateInfo() {
 // tricky (FIXME).
 static Function *getCopyDeclaration(Module *M, Type *Ty) {
   std::string Name = "llvm.ssa.copy." + utostr((uintptr_t) Ty);
-  return cast<Function>(M->getOrInsertFunction(
-      Name, getType(M->getContext(), Intrinsic::ssa_copy, Ty)));
+  return cast<Function>(
+      M->getOrInsertFunction(Name,
+                             getType(M->getContext(), Intrinsic::ssa_copy, Ty))
+          .getCallee());
 }
 
 // Given the renaming stack, make all the operands currently on the stack real
@@ -523,7 +524,7 @@ Value *PredicateInfo::materializeStack(unsigned int &Counter,
     if (isa<PredicateWithEdge>(ValInfo)) {
       IRBuilder<> B(getBranchTerminator(ValInfo));
       Function *IF = getCopyDeclaration(F.getParent(), Op->getType());
-      if (IF->user_begin() == IF->user_end())
+      if (empty(IF->users()))
         CreatedDeclarations.insert(IF);
       CallInst *PIC =
           B.CreateCall(IF, Op, Op->getName() + "." + Twine(Counter++));
@@ -535,7 +536,7 @@ Value *PredicateInfo::materializeStack(unsigned int &Counter,
              "Should not have gotten here without it being an assume");
       IRBuilder<> B(PAssume->AssumeInst);
       Function *IF = getCopyDeclaration(F.getParent(), Op->getType());
-      if (IF->user_begin() == IF->user_end())
+      if (empty(IF->users()))
         CreatedDeclarations.insert(IF);
       CallInst *PIC = B.CreateCall(IF, Op);
       PredicateMap.insert({PIC, ValInfo});
@@ -570,7 +571,7 @@ void PredicateInfo::renameUses(SmallPtrSetImpl<Value *> &OpSet) {
   auto Comparator = [&](const Value *A, const Value *B) {
     return valueComesBefore(OI, A, B);
   };
-  llvm::sort(OpsToRename.begin(), OpsToRename.end(), Comparator);
+  llvm::sort(OpsToRename, Comparator);
   ValueDFS_Compare Compare(OI);
   // Compute liveness, and rename in O(uses) per Op.
   for (auto *Op : OpsToRename) {
@@ -634,7 +635,7 @@ void PredicateInfo::renameUses(SmallPtrSetImpl<Value *> &OpSet) {
     // uses in the same instruction do not have a strict sort order
     // currently and will be considered equal. We could get rid of the
     // stable sort by creating one if we wanted.
-    std::stable_sort(OrderedUses.begin(), OrderedUses.end(), Compare);
+    llvm::stable_sort(OrderedUses, Compare);
     SmallVector<ValueDFS, 8> RenameStack;
     // For each use, sorted into dfs order, push values and replaces uses with
     // top of stack, which will represent the reaching def.

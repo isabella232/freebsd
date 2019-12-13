@@ -2,7 +2,6 @@
  * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
  *
  * Copyright (c) 2018 Emmanuel Vadot <manu@FreeBSD.org>
- * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -50,6 +49,9 @@ __FBSDID("$FreeBSD$");
 #include "regdev_if.h"
 
 MALLOC_DEFINE(M_RK805_REG, "RK805 regulator", "RK805 power regulator");
+
+/* #define	dprintf(sc, format, arg...)	device_printf(sc->base_dev, "%s: " format, __func__, arg) */
+#define	dprintf(sc, format, arg...)
 
 enum rk_pmic_type {
 	RK805 = 1,
@@ -138,6 +140,42 @@ static struct rk805_regdef rk805_regdefs[] = {
 		.voltage_step = 100000,
 		.voltage_nstep = 28,
 	},
+	{
+		.id = RK805_LDO1,
+		.name = "LDO_REG1",
+		.enable_reg = RK805_LDO_EN,
+		.enable_mask = 0x11,
+		.voltage_reg = RK805_LDO1_ON_VSEL,
+		.voltage_mask = 0x1F,
+		.voltage_min = 800000,
+		.voltage_max = 3400000,
+		.voltage_step = 100000,
+		.voltage_nstep = 27,
+	},
+	{
+		.id = RK805_LDO2,
+		.name = "LDO_REG2",
+		.enable_reg = RK805_LDO_EN,
+		.enable_mask = 0x22,
+		.voltage_reg = RK805_LDO2_ON_VSEL,
+		.voltage_mask = 0x1F,
+		.voltage_min = 800000,
+		.voltage_max = 3400000,
+		.voltage_step = 100000,
+		.voltage_nstep = 27,
+	},
+	{
+		.id = RK805_LDO3,
+		.name = "LDO_REG3",
+		.enable_reg = RK805_LDO_EN,
+		.enable_mask = 0x44,
+		.voltage_reg = RK805_LDO3_ON_VSEL,
+		.voltage_mask = 0x1F,
+		.voltage_min = 800000,
+		.voltage_max = 3400000,
+		.voltage_step = 100000,
+		.voltage_nstep = 27,
+	},
 };
 
 static struct rk805_regdef rk808_regdefs[] = {
@@ -188,24 +226,16 @@ static struct rk805_regdef rk808_regdefs[] = {
 static int
 rk805_read(device_t dev, uint8_t reg, uint8_t *data, uint8_t size)
 {
+	int err;
 
-	return (iicdev_readfrom(dev, reg, data, size, IIC_INTRWAIT));
+	err = iicdev_readfrom(dev, reg, data, size, IIC_INTRWAIT);
+	return (err);
 }
 
 static int
 rk805_write(device_t dev, uint8_t reg, uint8_t data)
 {
-	struct iic_msg msg;
-	uint8_t buf[2];
-
-	buf[0] = reg;
-	buf[1] = data;
-	msg.slave = iicbus_get_addr(dev);
-	msg.flags = IIC_M_WR;
-	msg.buf = buf;
-	msg.len = sizeof(buf);
-
-	return (iicbus_transfer_excl(dev, &msg, 1, IIC_INTRWAIT));
+	return (iicdev_writeto(dev, reg, &data, 1, IIC_INTRWAIT));
 }
 
 static int
@@ -222,6 +252,9 @@ rk805_regnode_enable(struct regnode *regnode, bool enable, int *udelay)
 
 	sc = regnode_get_softc(regnode);
 
+	dprintf(sc, "%sabling regulator %s\n",
+	    enable ? "En" : "Dis",
+	    sc->def->name);
 	rk805_read(sc->base_dev, sc->def->enable_reg, &val, 1);
 	if (enable)
 		val |= sc->def->enable_mask;
@@ -272,24 +305,31 @@ rk805_regnode_set_voltage(struct regnode *regnode, int min_uvolt,
 {
 	struct rk805_reg_sc *sc;
 	uint8_t val;
+	int uvolt;
 
 	sc = regnode_get_softc(regnode);
 
 	if (!sc->def->voltage_step)
 		return (ENXIO);
 
+	dprintf(sc, "Setting %s to %d<->%d uvolts\n",
+	    sc->def->name,
+	    min_uvolt,
+	    max_uvolt);
 	rk805_read(sc->base_dev, sc->def->voltage_reg, &val, 1);
-	printf("rk805_set_voltage: Current value for %x: %x\n", sc->def->voltage_reg, val);
 	if (rk805_regnode_voltage_to_reg(sc, min_uvolt, max_uvolt, &val) != 0)
 		return (ERANGE);
 
-	printf("rk805_set_voltage: Setting %x to %x\n", sc->def->voltage_reg, val);
 	rk805_write(sc->base_dev, sc->def->voltage_reg, val);
 
 	rk805_read(sc->base_dev, sc->def->voltage_reg, &val, 1);
-	printf("rk805_set_voltage: Set value for %x: %x\n", sc->def->voltage_reg, val);
 
 	*udelay = 0;
+
+	rk805_regnode_reg_to_voltage(sc, val, &uvolt);
+	dprintf(sc, "Regulator %s set to %d uvolt\n",
+	  sc->def->name,
+	  uvolt);
 
 	return (0);
 }
@@ -308,6 +348,10 @@ rk805_regnode_get_voltage(struct regnode *regnode, int *uvolt)
 	rk805_read(sc->base_dev, sc->def->voltage_reg, &val, 1);
 	rk805_regnode_reg_to_voltage(sc, val & sc->def->voltage_mask, uvolt);
 
+	dprintf(sc, "Regulator %s is at %d uvolt\n",
+	  sc->def->name,
+	  *uvolt);
+
 	return (0);
 }
 
@@ -317,6 +361,7 @@ static regnode_method_t rk805_regnode_methods[] = {
 	REGNODEMETHOD(regnode_enable,		rk805_regnode_enable),
 	REGNODEMETHOD(regnode_set_voltage,	rk805_regnode_set_voltage),
 	REGNODEMETHOD(regnode_get_voltage,	rk805_regnode_get_voltage),
+	REGNODEMETHOD(regnode_check_voltage,	regnode_method_check_voltage),
 	REGNODEMETHOD_END
 };
 DEFINE_CLASS_1(rk805_regnode, rk805_regnode_class, rk805_regnode_methods,
@@ -341,6 +386,7 @@ rk805_reg_attach(device_t dev, phandle_t node,
 		initdef.std_param.max_uvolt = def->voltage_max;
 	initdef.id = def->id;
 	initdef.ofw_node = node;
+
 	regnode = regnode_create(dev, &rk805_regnode_class, &initdef);
 	if (regnode == NULL) {
 		device_printf(dev, "cannot create regulator\n");
@@ -421,9 +467,6 @@ rk805_attach(device_t dev)
 	if (config_intrhook_establish(&sc->intr_hook) != 0)
 		return (ENOMEM);
 
-	sc->regs = malloc(sizeof(struct rk805_reg_sc *) * sc->nregs,
-	    M_RK805_REG, M_WAITOK | M_ZERO);
-
 	sc->type = ofw_bus_search_compatible(dev, compat_data)->ocd_data;
 	switch (sc->type) {
 	case RK805:
@@ -434,7 +477,13 @@ rk805_attach(device_t dev)
 		regdefs = rk808_regdefs;
 		sc->nregs = nitems(rk808_regdefs);
 		break;
+	default:
+		device_printf(dev, "Unknown type %d\n", sc->type);
+		return (ENXIO);
 	}
+
+	sc->regs = malloc(sizeof(struct rk805_reg_sc *) * sc->nregs,
+	    M_RK805_REG, M_WAITOK | M_ZERO);
 
 	rnode = ofw_bus_find_child(ofw_bus_get_node(dev), "regulators");
 	if (rnode > 0) {
@@ -468,11 +517,32 @@ rk805_detach(device_t dev)
 	return (EBUSY);
 }
 
+static int
+rk805_map(device_t dev, phandle_t xref, int ncells,
+    pcell_t *cells, intptr_t *id)
+{
+	struct rk805_softc *sc;
+	int i;
+
+	sc = device_get_softc(dev);
+
+	for (i = 0; i < sc->nregs; i++) {
+		if (sc->regs[i]->xref == xref) {
+			*id = sc->regs[i]->def->id;
+			return (0);
+		}
+	}
+
+	return (ERANGE);
+}
+
 static device_method_t rk805_methods[] = {
 	DEVMETHOD(device_probe,		rk805_probe),
 	DEVMETHOD(device_attach,	rk805_attach),
 	DEVMETHOD(device_detach,	rk805_detach),
 
+	/* regdev interface */
+	DEVMETHOD(regdev_map,		rk805_map),
 	DEVMETHOD_END
 };
 

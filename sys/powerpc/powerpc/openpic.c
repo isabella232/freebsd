@@ -32,9 +32,11 @@
 #include <sys/bus.h>
 #include <sys/conf.h>
 #include <sys/kernel.h>
+#include <sys/ktr.h>
 #include <sys/proc.h>
 #include <sys/rman.h>
 #include <sys/sched.h>
+#include <sys/smp.h>
 
 #include <machine/bus.h>
 #include <machine/intr_machdep.h>
@@ -49,6 +51,8 @@
 #include <machine/openpicvar.h>
 
 #include "pic_if.h"
+
+#define	OPENPIC_NIPIS		4
 
 devclass_t openpic_devclass;
 
@@ -180,6 +184,14 @@ openpic_common_attach(device_t dev, uint32_t node)
 		    "Version %s, supports %d CPUs and %d irqs\n",
 		    sc->sc_version, sc->sc_ncpu, sc->sc_nirq);
 
+	/*
+	 * Allow more IRQs than what the PIC says it handles.  Some Freescale PICs
+	 * have MSIs that show up above the PIC's self-described 196 IRQs
+	 * (P5020 starts MSI IRQs at 224).
+	 */
+	if (sc->sc_quirks & OPENPIC_QUIRK_HIDDEN_IRQS)
+		sc->sc_nirq = OPENPIC_IRQMAX - OPENPIC_NIPIS;
+
 	for (cpu = 0; cpu < sc->sc_ncpu; cpu++)
 		openpic_write(sc, OPENPIC_PCPU_TPR(cpu), 15);
 
@@ -194,7 +206,7 @@ openpic_common_attach(device_t dev, uint32_t node)
 	}
 
 	/* Reset and disable all IPIs. */
-	for (ipi = 0; ipi < 4; ipi++) {
+	for (ipi = 0; ipi < OPENPIC_NIPIS; ipi++) {
 		x = sc->sc_nirq + ipi;
 		x |= OPENPIC_IMASK;
 		x |= 15 << OPENPIC_PRIORITY_SHIFT;
@@ -219,7 +231,7 @@ openpic_common_attach(device_t dev, uint32_t node)
 	for (cpu = 0; cpu < sc->sc_ncpu; cpu++)
 		openpic_write(sc, OPENPIC_PCPU_TPR(cpu), 0);
 
-	powerpc_register_pic(dev, node, sc->sc_nirq, 4, FALSE);
+	powerpc_register_pic(dev, node, sc->sc_nirq, OPENPIC_NIPIS, FALSE);
 
 	/* If this is not a cascaded PIC, it must be the root PIC */
 	if (sc->sc_intr == NULL)
@@ -233,9 +245,10 @@ openpic_common_attach(device_t dev, uint32_t node)
  */
 
 void
-openpic_bind(device_t dev, u_int irq, cpuset_t cpumask)
+openpic_bind(device_t dev, u_int irq, cpuset_t cpumask, void **priv __unused)
 {
 	struct openpic_softc *sc;
+	uint32_t mask;
 
 	/* If we aren't directly connected to the CPU, this won't work */
 	if (dev != root_pic)
@@ -247,7 +260,23 @@ openpic_bind(device_t dev, u_int irq, cpuset_t cpumask)
 	 * XXX: openpic_write() is very special and just needs a 32 bits mask.
 	 * For the moment, just play dirty and get the first half word.
 	 */
-	openpic_write(sc, OPENPIC_IDEST(irq), cpumask.__bits[0] & 0xffffffff);
+	mask = cpumask.__bits[0] & 0xffffffff;
+	if (sc->sc_quirks & OPENPIC_QUIRK_SINGLE_BIND) {
+		int i = mftb() % CPU_COUNT(&cpumask);
+		int cpu, ncpu;
+
+		ncpu = 0;
+		CPU_FOREACH(cpu) {
+			if (!(mask & (1 << cpu)))
+				continue;
+			if (ncpu == i)
+				break;
+			ncpu++;
+		}
+		mask &= (1 << cpu);
+	}
+
+	openpic_write(sc, OPENPIC_IDEST(irq), mask);
 }
 
 void
@@ -302,7 +331,7 @@ openpic_dispatch(device_t dev, struct trapframe *tf)
 }
 
 void
-openpic_enable(device_t dev, u_int irq, u_int vector)
+openpic_enable(device_t dev, u_int irq, u_int vector, void **priv __unused)
 {
 	struct openpic_softc *sc;
 	uint32_t x;
@@ -322,7 +351,7 @@ openpic_enable(device_t dev, u_int irq, u_int vector)
 }
 
 void
-openpic_eoi(device_t dev, u_int irq __unused)
+openpic_eoi(device_t dev, u_int irq __unused, void *priv __unused)
 {
 	struct openpic_softc *sc;
 	u_int cpuid;
@@ -348,7 +377,7 @@ openpic_ipi(device_t dev, u_int cpu)
 }
 
 void
-openpic_mask(device_t dev, u_int irq)
+openpic_mask(device_t dev, u_int irq, void *priv __unused)
 {
 	struct openpic_softc *sc;
 	uint32_t x;
@@ -366,7 +395,7 @@ openpic_mask(device_t dev, u_int irq)
 }
 
 void
-openpic_unmask(device_t dev, u_int irq)
+openpic_unmask(device_t dev, u_int irq, void *priv __unused)
 {
 	struct openpic_softc *sc;
 	uint32_t x;
@@ -392,7 +421,7 @@ openpic_suspend(device_t dev)
 	sc = device_get_softc(dev);
 
 	sc->sc_saved_config = bus_read_4(sc->sc_memr, OPENPIC_CONFIG);
-	for (i = 0; i < 4; i++) {
+	for (i = 0; i < OPENPIC_NIPIS; i++) {
 		sc->sc_saved_ipis[i] = bus_read_4(sc->sc_memr, OPENPIC_IPI_VECTOR(i));
 	}
 
@@ -423,7 +452,7 @@ openpic_resume(device_t dev)
     	sc = device_get_softc(dev);
 
 	sc->sc_saved_config = bus_read_4(sc->sc_memr, OPENPIC_CONFIG);
-	for (i = 0; i < 4; i++) {
+	for (i = 0; i < OPENPIC_NIPIS; i++) {
 		bus_write_4(sc->sc_memr, OPENPIC_IPI_VECTOR(i), sc->sc_saved_ipis[i]);
 	}
 

@@ -1,18 +1,13 @@
 //===-- StopInfo.cpp --------------------------------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
-// C Includes
-// C++ Includes
 #include <string>
 
-// Other libraries and framework includes
-// Project includes
 #include "lldb/Breakpoint/Breakpoint.h"
 #include "lldb/Breakpoint/BreakpointLocation.h"
 #include "lldb/Breakpoint/StoppointCallbackContext.h"
@@ -83,9 +78,7 @@ bool StopInfo::HasTargetRunSinceMe() {
   return false;
 }
 
-//----------------------------------------------------------------------
 // StopInfoBreakpoint
-//----------------------------------------------------------------------
 
 namespace lldb_private {
 class StopInfoBreakpoint : public StopInfo {
@@ -333,6 +326,19 @@ protected:
             // commands when we see the same breakpoint hit a second time.
 
             m_should_stop_is_valid = true;
+
+            // It is possible that the user has a breakpoint at the same site
+            // as the completed plan had (e.g. user has a breakpoint
+            // on a module entry point, and `ThreadPlanCallFunction` ends
+            // also there). We can't find an internal breakpoint in the loop
+            // later because it was already removed on the plan completion.
+            // So check if the plan was completed, and stop if so.
+            if (thread_sp->CompletedPlanOverridesBreakpoint()) {
+              m_should_stop = true;
+              thread_sp->ResetStopInfo();
+              return;
+            }
+
             if (log)
               log->Printf("StopInfoBreakpoint::PerformAction - Hit a "
                           "breakpoint while running an expression,"
@@ -358,9 +364,8 @@ protected:
                           "continuing: %s.",
                           m_should_stop ? "true" : "false");
             process->GetTarget().GetDebugger().GetAsyncOutputStream()->Printf(
-                "Warning: hit breakpoint while "
-                "running function, skipping commands and conditions to prevent "
-                "recursion.");
+                "Warning: hit breakpoint while running function, skipping "
+                "commands and conditions to prevent recursion.\n");
             return;
           }
 
@@ -534,9 +539,9 @@ protected:
               __FUNCTION__, m_value);
       }
 
-      if ((m_should_stop == false || internal_breakpoint)
-          && thread_sp->CompletedPlanOverridesBreakpoint()) {
-        
+      if ((!m_should_stop || internal_breakpoint) &&
+          thread_sp->CompletedPlanOverridesBreakpoint()) {
+
         // Override should_stop decision when we have completed step plan
         // additionally to the breakpoint
         m_should_stop = true;
@@ -568,9 +573,7 @@ private:
   bool m_was_one_shot;
 };
 
-//----------------------------------------------------------------------
 // StopInfoWatchpoint
-//----------------------------------------------------------------------
 
 class StopInfoWatchpoint : public StopInfo {
 public:
@@ -720,14 +723,18 @@ protected:
                 StopInfoSP stored_stop_info_sp = thread_sp->GetStopInfo();
                 assert(stored_stop_info_sp.get() == this);
 
+                Status new_plan_status;
                 ThreadPlanSP new_plan_sp(
                     thread_sp->QueueThreadPlanForStepSingleInstruction(
-                        false,  // step-over
-                        false,  // abort_other_plans
-                        true)); // stop_other_threads
-                new_plan_sp->SetIsMasterPlan(true);
-                new_plan_sp->SetOkayToDiscard(false);
-                new_plan_sp->SetPrivate(true);
+                        false, // step-over
+                        false, // abort_other_plans
+                        true,  // stop_other_threads
+                        new_plan_status));
+                if (new_plan_sp && new_plan_status.Success()) {
+                  new_plan_sp->SetIsMasterPlan(true);
+                  new_plan_sp->SetOkayToDiscard(false);
+                  new_plan_sp->SetPrivate(true);
+                }
                 process_sp->GetThreadList().SetSelectedThreadByID(
                     thread_sp->GetID());
                 process_sp->ResumeSynchronous(nullptr);
@@ -901,9 +908,7 @@ private:
   lldb::addr_t m_watch_hit_addr;
 };
 
-//----------------------------------------------------------------------
 // StopInfoUnixSignal
-//----------------------------------------------------------------------
 
 class StopInfoUnixSignal : public StopInfo {
 public:
@@ -978,9 +983,7 @@ public:
   }
 };
 
-//----------------------------------------------------------------------
 // StopInfoTrace
-//----------------------------------------------------------------------
 
 class StopInfoTrace : public StopInfo {
 public:
@@ -998,9 +1001,7 @@ public:
   }
 };
 
-//----------------------------------------------------------------------
 // StopInfoException
-//----------------------------------------------------------------------
 
 class StopInfoException : public StopInfo {
 public:
@@ -1022,9 +1023,7 @@ public:
   }
 };
 
-//----------------------------------------------------------------------
 // StopInfoThreadPlan
-//----------------------------------------------------------------------
 
 class StopInfoThreadPlan : public StopInfo {
 public:
@@ -1067,9 +1066,7 @@ private:
   ExpressionVariableSP m_expression_variable_sp;
 };
 
-//----------------------------------------------------------------------
 // StopInfoExec
-//----------------------------------------------------------------------
 
 class StopInfoExec : public StopInfo {
 public:
@@ -1199,7 +1196,7 @@ StopInfo::GetCrashingDereference(StopInfoSP &stop_info_sp,
 
   address_loc += (sizeof(address_string) - 1);
 
-  uint64_t address = strtoull(address_loc, 0, 0);
+  uint64_t address = strtoull(address_loc, nullptr, 0);
   if (crashing_address) {
     *crashing_address = address;
   }

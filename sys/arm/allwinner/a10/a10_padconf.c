@@ -1,6 +1,5 @@
 /*-
  * Copyright (c) 2016 Emmanuel Vadot <manu@freebsd.org>
- * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -77,8 +76,8 @@ const static struct allwinner_pins a10_pins[] = {
 	{"PB17", 1, 17, {"gpio_in", "gpio_out", "spi2", "jtag", NULL, NULL, NULL, NULL}},
 	{"PB18", 1, 18, {"gpio_in", "gpio_out", "i2c1", NULL, NULL, NULL, NULL, NULL}},
 	{"PB19", 1, 19, {"gpio_in", "gpio_out", "i2c1", NULL, NULL, NULL, NULL, NULL}},
-	{"PB20", 1, 20, {"gpio_in", "gpio_out", "i2c1", NULL, NULL, NULL, NULL, NULL}},
-	{"PB21", 1, 21, {"gpio_in", "gpio_out", "i2c1", NULL, NULL, NULL, NULL, NULL}},
+	{"PB20", 1, 20, {"gpio_in", "gpio_out", "i2c2", NULL, NULL, NULL, NULL, NULL}},
+	{"PB21", 1, 21, {"gpio_in", "gpio_out", "i2c2", NULL, NULL, NULL, NULL, NULL}},
 	{"PB22", 1, 22, {"gpio_in", "gpio_out", "uart0", "ir1", NULL, NULL, NULL, NULL}},
 	{"PB23", 1, 23, {"gpio_in", "gpio_out", "uart0", "ir1", NULL, NULL, NULL, NULL}},
 

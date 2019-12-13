@@ -57,8 +57,8 @@ static void isp_loop_changed(ispsoftc_t *isp, int chan);
 static d_ioctl_t ispioctl;
 static void isp_cam_async(void *, uint32_t, struct cam_path *, void *);
 static void isp_poll(struct cam_sim *);
-static timeout_t isp_watchdog;
-static timeout_t isp_gdt;
+static callout_func_t isp_watchdog;
+static callout_func_t isp_gdt;
 static task_fn_t isp_gdt_task;
 static void isp_kthread(void *);
 static void isp_action(struct cam_sim *, union ccb *);
@@ -764,8 +764,8 @@ static cam_status create_lun_state(ispsoftc_t *, int, struct cam_path *, tstate_
 static void destroy_lun_state(ispsoftc_t *, int, tstate_t *);
 static void isp_enable_lun(ispsoftc_t *, union ccb *);
 static void isp_disable_lun(ispsoftc_t *, union ccb *);
-static timeout_t isp_refire_putback_atio;
-static timeout_t isp_refire_notify_ack;
+static callout_func_t isp_refire_putback_atio;
+static callout_func_t isp_refire_notify_ack;
 static void isp_complete_ctio(union ccb *);
 static void isp_target_putback_atio(union ccb *);
 enum Start_Ctio_How { FROM_CAM, FROM_TIMER, FROM_SRR, FROM_CTIO_DONE };
@@ -3742,6 +3742,10 @@ isp_async(ispsoftc_t *isp, ispasync_t cmd, ...)
 		break;
 	case ISPASYNC_DEV_CHANGED:
 	case ISPASYNC_DEV_STAYED:		
+	{
+		int crn_reset_done;
+
+		crn_reset_done = 0;
 		va_start(ap, cmd);
 		bus = va_arg(ap, int);
 		lp = va_arg(ap, fcportdb_t *);
@@ -3759,13 +3763,17 @@ isp_async(ispsoftc_t *isp, ispasync_t cmd, ...)
 		     (lp->new_prli_word3 & PRLI_WD3_TARGET_FUNCTION))) {
 			lp->is_target = !lp->is_target;
 			if (lp->is_target) {
-				if (cmd == ISPASYNC_DEV_CHANGED)
+				if (cmd == ISPASYNC_DEV_CHANGED) {
 					isp_fcp_reset_crn(isp, bus, tgt, /*tgt_set*/ 1);
+					crn_reset_done = 1;
+				}
 				isp_make_here(isp, lp, bus, tgt);
 			} else {
 				isp_make_gone(isp, lp, bus, tgt);
-				if (cmd == ISPASYNC_DEV_CHANGED)
+				if (cmd == ISPASYNC_DEV_CHANGED) {
 					isp_fcp_reset_crn(isp, bus, tgt, /*tgt_set*/ 1);
+					crn_reset_done = 1;
+				}
 			}
 		}
 		if (lp->is_initiator !=
@@ -3780,7 +3788,13 @@ isp_async(ispsoftc_t *isp, ispasync_t cmd, ...)
 			adc->arrived = lp->is_initiator;
 			xpt_async(AC_CONTRACT, fc->path, &ac);
 		}
+
+		if ((cmd == ISPASYNC_DEV_CHANGED) &&
+		    (crn_reset_done == 0))
+			isp_fcp_reset_crn(isp, bus, tgt, /*tgt_set*/ 1);
+
 		break;
+	}
 	case ISPASYNC_DEV_GONE:
 		va_start(ap, cmd);
 		bus = va_arg(ap, int);

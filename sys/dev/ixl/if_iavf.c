@@ -358,7 +358,7 @@ iavf_if_attach_pre(if_ctx_t ctx)
 		goto err_early;
 	}
 
-	iavf_dbg_init(sc, "Allocated PCI resources and MSIX vectors\n");
+	iavf_dbg_init(sc, "Allocated PCI resources and MSI-X vectors\n");
 
 	/*
 	 * XXX: This is called by init_shared_code in the PF driver,
@@ -407,7 +407,8 @@ iavf_if_attach_pre(if_ctx_t ctx)
 		goto err_aq;
 	}
 
-	device_printf(dev, "VSIs %d, QPs %d, MSIX %d, RSS sizes: key %d lut %d\n",
+	device_printf(dev,
+	    "VSIs %d, QPs %d, MSI-X %d, RSS sizes: key %d lut %d\n",
 	    sc->vf_res->num_vsis,
 	    sc->vf_res->num_queue_pairs,
 	    sc->vf_res->max_vectors,
@@ -613,7 +614,6 @@ iavf_send_vc_msg(struct iavf_sc *sc, u32 op)
 static void
 iavf_init_queues(struct ixl_vsi *vsi)
 {
-	if_softc_ctx_t scctx = vsi->shared;
 	struct ixl_tx_queue *tx_que = vsi->tx_queues;
 	struct ixl_rx_queue *rx_que = vsi->rx_queues;
 	struct rx_ring *rxr;
@@ -624,10 +624,7 @@ iavf_init_queues(struct ixl_vsi *vsi)
 	for (int i = 0; i < vsi->num_rx_queues; i++, rx_que++) {
 		rxr = &rx_que->rxr;
 
-		if (scctx->isc_max_frame_size <= MCLBYTES)
-			rxr->mbuf_sz = MCLBYTES;
-		else
-			rxr->mbuf_sz = MJUMPAGESIZE;
+		rxr->mbuf_sz = iflib_get_rx_mbuf_sz(vsi->ctx);
 
 		wr32(vsi->hw, rxr->tail, 0);
 	}
@@ -1228,18 +1225,13 @@ iavf_if_update_admin_status(if_ctx_t ctx)
 		iavf_enable_adminq_irq(hw);
 }
 
-static int
-iavf_mc_filter_apply(void *arg, struct ifmultiaddr *ifma, int count __unused)
+static u_int
+iavf_mc_filter_apply(void *arg, struct sockaddr_dl *sdl, u_int count __unused)
 {
 	struct iavf_sc *sc = arg;
-	int error = 0;
+	int error;
 
-	if (ifma->ifma_addr->sa_family != AF_LINK)
-		return (0);
-	error = iavf_add_mac_filter(sc,
-	    (u8*)LLADDR((struct sockaddr_dl *) ifma->ifma_addr),
-	    IXL_FILTER_MC);
-
+	error = iavf_add_mac_filter(sc, (u8*)LLADDR(sdl), IXL_FILTER_MC);
 	return (!error);
 }
 
@@ -1247,12 +1239,11 @@ static void
 iavf_if_multi_set(if_ctx_t ctx)
 {
 	struct iavf_sc *sc = iflib_get_softc(ctx);
-	int mcnt = 0;
 
 	IOCTL_DEBUGOUT("iavf_if_multi_set: begin");
 
-	mcnt = if_multiaddr_count(iflib_get_ifp(ctx), MAX_MULTICAST_ADDR);
-	if (__predict_false(mcnt == MAX_MULTICAST_ADDR)) {
+	if (__predict_false(if_llmaddr_count(iflib_get_ifp(ctx)) >=
+	    MAX_MULTICAST_ADDR)) {
 		/* Delete MC filters and enable mulitcast promisc instead */
 		iavf_init_multi(sc);
 		sc->promisc_flags |= FLAG_VF_MULTICAST_PROMISC;
@@ -1264,9 +1255,8 @@ iavf_if_multi_set(if_ctx_t ctx)
 	iavf_init_multi(sc);
 
 	/* And (re-)install filters for all mcast addresses */
-	mcnt = if_multi_apply(iflib_get_ifp(ctx), iavf_mc_filter_apply, sc);
-
-	if (mcnt > 0)
+	if (if_foreach_llmaddr(iflib_get_ifp(ctx), iavf_mc_filter_apply, sc) >
+	    0)
 		iavf_send_vc_msg(sc, IAVF_FLAG_AQ_ADD_MAC_FILTER);
 }
 
@@ -1361,8 +1351,8 @@ iavf_if_promisc_set(if_ctx_t ctx, int flags)
 
 	sc->promisc_flags = 0;
 
-	if (flags & IFF_ALLMULTI ||
-		if_multiaddr_count(ifp, MAX_MULTICAST_ADDR) == MAX_MULTICAST_ADDR)
+	if (flags & IFF_ALLMULTI || if_llmaddr_count(ifp) >=
+	    MAX_MULTICAST_ADDR)
 		sc->promisc_flags |= FLAG_VF_MULTICAST_PROMISC;
 	if (flags & IFF_PROMISC)
 		sc->promisc_flags |= FLAG_VF_UNICAST_PROMISC;
@@ -1485,7 +1475,7 @@ iavf_free_pci_resources(struct iavf_sc *sc)
 	struct ixl_rx_queue	*rx_que = vsi->rx_queues;
 	device_t                dev = sc->dev;
 
-	/* We may get here before stations are setup */
+	/* We may get here before stations are set up */
 	if (rx_que == NULL)
 		goto early;
 
@@ -1498,7 +1488,7 @@ iavf_free_pci_resources(struct iavf_sc *sc)
 early:
 	if (sc->pci_mem != NULL)
 		bus_release_resource(dev, SYS_RES_MEMORY,
-		    PCIR_BAR(0), sc->pci_mem);
+		    rman_get_rid(sc->pci_mem), sc->pci_mem);
 }
 
 

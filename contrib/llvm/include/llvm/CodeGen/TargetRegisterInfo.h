@@ -1,9 +1,8 @@
 //==- CodeGen/TargetRegisterInfo.h - Target Register Information -*- C++ -*-==//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -510,9 +509,21 @@ public:
   /// markSuperRegs() and checkAllSuperRegsMarked() in this case.
   virtual BitVector getReservedRegs(const MachineFunction &MF) const = 0;
 
+  /// Returns false if we can't guarantee that Physreg, specified as an IR asm
+  /// clobber constraint, will be preserved across the statement.
+  virtual bool isAsmClobberable(const MachineFunction &MF,
+                               unsigned PhysReg) const {
+    return true;
+  }
+
   /// Returns true if PhysReg is unallocatable and constant throughout the
   /// function.  Used by MachineRegisterInfo::isConstantPhysReg().
   virtual bool isConstantPhysReg(unsigned PhysReg) const { return false; }
+
+  /// Returns true if the register class is considered divergent.
+  virtual bool isDivergentRegClass(const TargetRegisterClass *RC) const {
+    return false;
+  }
 
   /// Physical registers that may be modified within a function but are
   /// guaranteed to be restored before any uses. This is useful for targets that
@@ -817,13 +828,6 @@ public:
     // Do nothing.
   }
 
-  /// The creation of multiple copy hints have been implemented in
-  /// weightCalcHelper(), but since this affects so many tests for many
-  /// targets, this is temporarily disabled per default. THIS SHOULD BE
-  /// "GENERAL GOODNESS" and hopefully all targets will update their tests
-  /// and enable this soon. This hook should then be removed.
-  virtual bool enableMultipleCopyHints() const { return false; }
-
   /// Allow the target to reverse allocation order of local live ranges. This
   /// will generally allocate shorter local live ranges first. For targets with
   /// many registers, this could reduce regalloc compile time by a large
@@ -986,7 +990,7 @@ public:
 
   /// getFrameRegister - This method should return the register used as a base
   /// for values allocated in the current stack frame.
-  virtual unsigned getFrameRegister(const MachineFunction &MF) const = 0;
+  virtual Register getFrameRegister(const MachineFunction &MF) const = 0;
 
   /// Mark a register and all its aliases as reserved in the given set.
   void markSuperRegs(BitVector &RegisterSet, unsigned Reg) const;

@@ -2,7 +2,6 @@
  * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
  *
  * Copyright (c) 2001, John Baldwin <jhb@FreeBSD.org>.
- * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -98,6 +97,14 @@ int smp_cpus = 1;	/* how many cpu's running */
 SYSCTL_INT(_kern_smp, OID_AUTO, cpus, CTLFLAG_RD|CTLFLAG_CAPRD, &smp_cpus, 0,
     "Number of CPUs online");
 
+int smp_threads_per_core = 1;	/* how many SMT threads are running per core */
+SYSCTL_INT(_kern_smp, OID_AUTO, threads_per_core, CTLFLAG_RD|CTLFLAG_CAPRD,
+    &smp_threads_per_core, 0, "Number of SMT threads online per core");
+
+int mp_ncores = -1;	/* how many physical cores running */
+SYSCTL_INT(_kern_smp, OID_AUTO, cores, CTLFLAG_RD|CTLFLAG_CAPRD, &mp_ncores, 0,
+    "Number of CPUs online");
+
 int smp_topology = 0;	/* Which topology we're using. */
 SYSCTL_INT(_kern_smp, OID_AUTO, topology, CTLFLAG_RDTUN, &smp_topology, 0,
     "Topology override setting; 0 is default provided by hardware.");
@@ -154,6 +161,7 @@ mp_start(void *dummy)
 
 	/* Probe for MP hardware. */
 	if (smp_disabled != 0 || cpu_mp_probe() == 0) {
+		mp_ncores = 1;
 		mp_ncpus = 1;
 		CPU_SETOF(PCPU_GET(cpuid), &all_cpus);
 		return;
@@ -162,6 +170,11 @@ mp_start(void *dummy)
 	cpu_mp_start();
 	printf("FreeBSD/SMP: Multiprocessor System Detected: %d CPUs\n",
 	    mp_ncpus);
+
+	/* Provide a default for most architectures that don't have SMT/HTT. */
+	if (mp_ncores < 0)
+		mp_ncores = mp_ncpus;
+
 	cpu_mp_announce();
 }
 SYSINIT(cpu_mp, SI_SUB_CPU, SI_ORDER_THIRD, mp_start, NULL);
@@ -338,42 +351,68 @@ generic_restart_cpus(cpuset_t map, u_int type)
 #endif
 	volatile cpuset_t *cpus;
 
-	KASSERT(type == IPI_STOP || type == IPI_STOP_HARD
 #if X86
-	    || type == IPI_SUSPEND
-#endif
-	    , ("%s: invalid stop type", __func__));
+	KASSERT(type == IPI_STOP || type == IPI_STOP_HARD
+	    || type == IPI_SUSPEND, ("%s: invalid stop type", __func__));
 
 	if (!smp_started)
 		return (0);
 
 	CTR1(KTR_SMP, "restart_cpus(%s)", cpusetobj_strprint(cpusetbuf, &map));
 
-#if X86
 	if (type == IPI_SUSPEND)
 		cpus = &resuming_cpus;
 	else
-#endif
 		cpus = &stopped_cpus;
 
 	/* signal other cpus to restart */
-#if X86
 	if (type == IPI_SUSPEND)
 		CPU_COPY_STORE_REL(&map, &toresume_cpus);
 	else
-#endif
 		CPU_COPY_STORE_REL(&map, &started_cpus);
 
-#if X86
+	/*
+	 * Wake up any CPUs stopped with MWAIT.  From MI code we can't tell if
+	 * MONITOR/MWAIT is enabled, but the potentially redundant writes are
+	 * relatively inexpensive.
+	 */
+	if (type == IPI_STOP) {
+		struct monitorbuf *mb;
+		u_int id;
+
+		CPU_FOREACH(id) {
+			if (!CPU_ISSET(id, &map))
+				continue;
+
+			mb = &pcpu_find(id)->pc_monitorbuf;
+			atomic_store_int(&mb->stop_state,
+			    MONITOR_STOPSTATE_RUNNING);
+		}
+	}
+
 	if (!nmi_is_broadcast || nmi_kdb_lock == 0) {
-#endif
+		/* wait for each to clear its bit */
+		while (CPU_OVERLAP(cpus, &map))
+			cpu_spinwait();
+	}
+#else /* !X86 */
+	KASSERT(type == IPI_STOP || type == IPI_STOP_HARD,
+	    ("%s: invalid stop type", __func__));
+
+	if (!smp_started)
+		return (0);
+
+	CTR1(KTR_SMP, "restart_cpus(%s)", cpusetobj_strprint(cpusetbuf, &map));
+
+	cpus = &stopped_cpus;
+
+	/* signal other cpus to restart */
+	CPU_COPY_STORE_REL(&map, &started_cpus);
+
 	/* wait for each to clear its bit */
 	while (CPU_OVERLAP(cpus, &map))
 		cpu_spinwait();
-#if X86
-	}
 #endif
-
 	return (1);
 }
 
@@ -823,6 +862,7 @@ static void
 mp_setvariables_for_up(void *dummy)
 {
 	mp_ncpus = 1;
+	mp_ncores = 1;
 	mp_maxid = PCPU_GET(cpuid);
 	CPU_SETOF(mp_maxid, &all_cpus);
 	KASSERT(PCPU_GET(cpuid) == 0, ("UP must have a CPU ID of zero"));
@@ -887,6 +927,66 @@ quiesce_all_cpus(const char *wmesg, int prio)
 {
 
 	return quiesce_cpus(all_cpus, wmesg, prio);
+}
+
+/*
+ * Observe all CPUs not executing in critical section.
+ * We are not in one so the check for us is safe. If the found
+ * thread changes to something else we know the section was
+ * exited as well.
+ */
+void
+quiesce_all_critical(void)
+{
+	struct thread *td, *newtd;
+	struct pcpu *pcpu;
+	int cpu;
+
+	MPASS(curthread->td_critnest == 0);
+
+	CPU_FOREACH(cpu) {
+		pcpu = cpuid_to_pcpu[cpu];
+		td = pcpu->pc_curthread;
+		for (;;) {
+			if (td->td_critnest == 0)
+				break;
+			cpu_spinwait();
+			newtd = (struct thread *)
+			    atomic_load_acq_ptr((void *)pcpu->pc_curthread);
+			if (td != newtd)
+				break;
+		}
+	}
+}
+
+static void
+cpus_fence_seq_cst_issue(void *arg __unused)
+{
+
+	atomic_thread_fence_seq_cst();
+}
+
+/*
+ * Send an IPI forcing a sequentially consistent fence.
+ *
+ * Allows replacement of an explicitly fence with a compiler barrier.
+ * Trades speed up during normal execution for a significant slowdown when
+ * the barrier is needed.
+ */
+void
+cpus_fence_seq_cst(void)
+{
+
+#ifdef SMP
+	smp_rendezvous(
+	    smp_no_rendezvous_barrier,
+	    cpus_fence_seq_cst_issue,
+	    smp_no_rendezvous_barrier,
+	    NULL
+	);
+#else
+	cpus_fence_seq_cst_issue(NULL);
+#endif
 }
 
 /* Extra care is taken with this sysctl because the data type is volatile */

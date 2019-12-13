@@ -1,6 +1,5 @@
 /*-
- * Copyright (c) 2015 M. Warner Losh <imp@freebsd.org>
- * All rights reserved.
+ * Copyright (c) 2015 M. Warner Losh <imp@FreeBSD.org>
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -132,9 +131,7 @@ owc_gpiobus_attach(device_t dev)
 		free(kids, M_TEMP);
 	if (nkid == 0)
 		device_add_child(dev, "ow", -1);
-	bus_generic_attach(dev);
-
-	return (0);
+	return (bus_delayed_attach_children(dev));
 }
 
 static int
@@ -191,7 +188,7 @@ owc_gpiobus_write_one(device_t dev, struct ow_timing *t)
 	sc = device_get_softc(dev);
 	error = GETBUS(sc);
 	if (error != 0)
-		return error;
+		return (error);
 
 	critical_enter();
 
@@ -205,10 +202,10 @@ owc_gpiobus_write_one(device_t dev, struct ow_timing *t)
 	DELAY(t->t_slot - t->t_low1 + t->t_rec);
 
 	critical_exit();
-	
+
 	RELBUS(sc);
-	
-	return 0;
+
+	return (0);
 }
 
 /*
@@ -232,7 +229,7 @@ owc_gpiobus_write_zero(device_t dev, struct ow_timing *t)
 	sc = device_get_softc(dev);
 	error = GETBUS(sc);
 	if (error != 0)
-		return error;
+		return (error);
 
 	critical_enter();
 
@@ -248,8 +245,8 @@ owc_gpiobus_write_zero(device_t dev, struct ow_timing *t)
 	critical_exit();
 
 	RELBUS(sc);
-	
-	return 0;
+
+	return (0);
 }
 
 /*
@@ -277,7 +274,9 @@ owc_gpiobus_read_data(device_t dev, struct ow_timing *t, int *bit)
 	sc = device_get_softc(dev);
 	error = GETBUS(sc);
 	if (error != 0)
-		return error;
+		return (error);
+
+	critical_enter();
 
 	/* Force low for t_lowr microseconds */
 	then = sbinuptime();
@@ -291,14 +290,13 @@ owc_gpiobus_read_data(device_t dev, struct ow_timing *t, int *bit)
 	 * master's pushing the line low.
 	 */
 	INPIN(sc);
-	critical_enter();
 	do {
 		now = sbinuptime();
 		GETPIN(sc, &sample);
-	} while (sbttous(now - then) < t->t_rdv + 2 && sample == 0);
+	} while (now - then < (t->t_rdv + 2) * SBT_1US && sample == 0);
 	critical_exit();
 
-	if (sbttons(now - then) < t->t_rdv * 1000)
+	if (now - then < t->t_rdv * SBT_1US)
 		*bit = 1;
 	else
 		*bit = 0;
@@ -306,11 +304,11 @@ owc_gpiobus_read_data(device_t dev, struct ow_timing *t, int *bit)
 	/* Wait out the rest of t_slot */
 	do {
 		now = sbinuptime();
-	} while ((now - then) / SBT_1US < t->t_slot);
+	} while (now - then < (t->t_slot + t->t_rec) * SBT_1US);
 
 	RELBUS(sc);
-	
-	return 0;
+
+	return (error);
 }
 
 /*
@@ -338,10 +336,9 @@ owc_gpiobus_reset_and_presence(device_t dev, struct ow_timing *t, int *bit)
 	sc = device_get_softc(dev);
 	error = GETBUS(sc);
 	if (error != 0)
-		return error;
-	
+		return (error);
 
-	/* 
+	/*
 	 * Read the current state of the bus. The steady state of an idle bus is
 	 * high. Badly wired buses that are missing the required pull up, or
 	 * that have a short circuit to ground cause all kinds of mischief when
@@ -353,7 +350,7 @@ owc_gpiobus_reset_and_presence(device_t dev, struct ow_timing *t, int *bit)
 	if (buf == 0) {
 		*bit = -1;
 		RELBUS(sc);
-		return EIO;
+		return (EIO);
 	}
 
 	critical_enter();
@@ -384,12 +381,12 @@ owc_gpiobus_reset_and_presence(device_t dev, struct ow_timing *t, int *bit)
 	if (buf == 0) {
 		*bit = -1;
 		RELBUS(sc);
-		return EIO;
+		return (EIO);
 	}
 
 	RELBUS(sc);
 
-	return 0;
+	return (0);
 }
 
 static devclass_t owc_gpiobus_devclass;
@@ -416,5 +413,7 @@ static driver_t owc_gpiobus_driver = {
 	sizeof(struct owc_gpiobus_softc),
 };
 
-DRIVER_MODULE(owc_gpiobus_fdt, gpiobus, owc_gpiobus_driver, owc_gpiobus_devclass, 0, 0);
-MODULE_DEPEND(owc_gpiobus_fdt, ow, 1, 1, 1);
+DRIVER_MODULE(owc_gpiobus, gpiobus, owc_gpiobus_driver, owc_gpiobus_devclass, 0, 0);
+MODULE_DEPEND(owc_gpiobus, ow, 1, 1, 1);
+MODULE_DEPEND(owc_gpiobus, gpiobus, 1, 1, 1);
+MODULE_VERSION(owc_gpiobus, 1);

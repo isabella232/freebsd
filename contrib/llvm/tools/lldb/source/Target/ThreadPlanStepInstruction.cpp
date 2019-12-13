@@ -1,16 +1,11 @@
 //===-- ThreadPlanStepInstruction.cpp ---------------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
-// C Includes
-// C++ Includes
-// Other libraries and framework includes
-// Project includes
 #include "lldb/Target/ThreadPlanStepInstruction.h"
 #include "lldb/Target/Process.h"
 #include "lldb/Target/RegisterContext.h"
@@ -23,9 +18,7 @@
 using namespace lldb;
 using namespace lldb_private;
 
-//----------------------------------------------------------------------
 // ThreadPlanStepInstruction: Step over the current instruction
-//----------------------------------------------------------------------
 
 ThreadPlanStepInstruction::ThreadPlanStepInstruction(Thread &thread,
                                                      bool step_over,
@@ -57,11 +50,19 @@ void ThreadPlanStepInstruction::SetUpState() {
 
 void ThreadPlanStepInstruction::GetDescription(Stream *s,
                                                lldb::DescriptionLevel level) {
+  auto PrintFailureIfAny = [&]() {
+    if (m_status.Success())
+      return;
+    s->Printf(" failed (%s)", m_status.AsCString());
+  };
+
   if (level == lldb::eDescriptionLevelBrief) {
     if (m_step_over)
       s->Printf("instruction step over");
     else
       s->Printf("instruction step into");
+
+    PrintFailureIfAny();
   } else {
     s->Printf("Stepping one instruction past ");
     s->Address(m_instruction_addr, sizeof(addr_t));
@@ -72,6 +73,8 @@ void ThreadPlanStepInstruction::GetDescription(Stream *s,
       s->Printf(" stepping over calls");
     else
       s->Printf(" stepping into calls");
+
+    PrintFailureIfAny();
   }
 }
 
@@ -192,7 +195,8 @@ bool ThreadPlanStepInstruction::ShouldStop(Event *event_ptr) {
           // for now it is safer to run others.
           const bool stop_others = false;
           m_thread.QueueThreadPlanForStepOutNoShouldStop(
-              false, nullptr, true, stop_others, eVoteNo, eVoteNoOpinion, 0);
+              false, nullptr, true, stop_others, eVoteNo, eVoteNoOpinion, 0,
+              m_status);
           return false;
         } else {
           if (log) {

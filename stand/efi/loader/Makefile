@@ -26,7 +26,7 @@ SRCS=	autoload.c \
 	vers.c
 
 CFLAGS+=	-I${.CURDIR}/../loader
-.if ${MK_ZFS} != "no"
+.if ${MK_LOADER_ZFS} != "no"
 CFLAGS+=	-I${ZFSSRC}
 CFLAGS+=	-DEFI_ZFS_BOOT
 HAVE_ZFS=	yes
@@ -55,7 +55,7 @@ CFLAGS+=	-I${EFISRC}/include
 CFLAGS+=	-I${EFISRC}/include/${MACHINE}
 CFLAGS+=	-I${SYSDIR}/contrib/dev/acpica/include
 CFLAGS+=	-I${BOOTSRC}/i386/libi386
-CFLAGS+=	-DNO_PCI -DEFI
+CFLAGS+=	-DEFI
 
 .if !defined(BOOT_HIDE_SERIAL_NUMBERS)
 # Export serial numbers, UUID, and asset tag from loader.
@@ -79,6 +79,10 @@ HAVE_BCACHE=    yes
 
 .if defined(EFI_STAGING_SIZE)
 CFLAGS+=	-DEFI_STAGING_SIZE=${EFI_STAGING_SIZE}
+.endif
+
+.if ${MK_LOADER_EFI_SECUREBOOT} != "no"
+CFLAGS+= -DEFI_SECUREBOOT
 .endif
 
 NEWVERSWHAT=	"EFI loader" ${MACHINE}

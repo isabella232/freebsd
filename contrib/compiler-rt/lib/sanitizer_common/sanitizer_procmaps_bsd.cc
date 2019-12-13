@@ -1,9 +1,8 @@
 //===-- sanitizer_procmaps_bsd.cc -----------------------------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -67,8 +66,8 @@ void ReadProcMaps(ProcSelfMapsBuff *proc_maps) {
 #endif
   };
 
-  size_t Size = 0;
-  int Err = sysctl(Mib, ARRAY_SIZE(Mib), NULL, &Size, NULL, 0);
+  uptr Size = 0;
+  int Err = internal_sysctl(Mib, ARRAY_SIZE(Mib), NULL, &Size, NULL, 0);
   CHECK_EQ(Err, 0);
   CHECK_GT(Size, 0);
 
@@ -76,7 +75,7 @@ void ReadProcMaps(ProcSelfMapsBuff *proc_maps) {
   size_t MmapedSize = Size * 4 / 3;
   void *VmMap = MmapOrDie(MmapedSize, "ReadProcMaps()");
   Size = MmapedSize;
-  Err = sysctl(Mib, ARRAY_SIZE(Mib), VmMap, &Size, NULL, 0);
+  Err = internal_sysctl(Mib, ARRAY_SIZE(Mib), VmMap, &Size, NULL, 0);
   CHECK_EQ(Err, 0);
   proc_maps->data = (char *)VmMap;
 #else
@@ -88,7 +87,7 @@ void ReadProcMaps(ProcSelfMapsBuff *proc_maps) {
   if (Size > 0x10000)
     Size = 0x10000;
   Size = (Size / sizeof(struct kinfo_vmentry)) * sizeof(struct kinfo_vmentry);
-  Err = sysctl(Mib, ARRAY_SIZE(Mib), Mem, &Size, NULL, 0);
+  Err = internal_sysctl(Mib, ARRAY_SIZE(Mib), Mem, &Size, NULL, 0);
   CHECK_EQ(Err, 0);
   MmapedSize = Size;
   proc_maps->data = Mem;
@@ -99,6 +98,7 @@ void ReadProcMaps(ProcSelfMapsBuff *proc_maps) {
 }
 
 bool MemoryMappingLayout::Next(MemoryMappedSegment *segment) {
+  CHECK(!Error()); // can not fail
   char *last = data_.proc_self_maps.data + data_.proc_self_maps.len;
   if (data_.current >= last)
     return false;

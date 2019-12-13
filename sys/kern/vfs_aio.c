@@ -292,7 +292,7 @@ struct kaioinfo {
  * Different ABIs provide their own operations.
  */
 struct aiocb_ops {
-	int	(*copyin)(struct aiocb *ujob, struct aiocb *kjob);
+	int	(*aio_copyin)(struct aiocb *ujob, struct aiocb *kjob);
 	long	(*fetch_status)(struct aiocb *ujob);
 	long	(*fetch_error)(struct aiocb *ujob);
 	int	(*store_status)(struct aiocb *ujob, long status);
@@ -1267,7 +1267,7 @@ aio_qbio(struct proc *p, struct kaiocb *job)
 			goto unref;
 		}
 
-		job->pbuf = pbuf = (struct buf *)getpbuf(NULL);
+		job->pbuf = pbuf = uma_zalloc(pbuf_zone, M_WAITOK);
 		BUF_KERNPROC(pbuf);
 		AIO_LOCK(ki);
 		ki->kaio_buffer_count++;
@@ -1318,7 +1318,7 @@ doerror:
 		AIO_LOCK(ki);
 		ki->kaio_buffer_count--;
 		AIO_UNLOCK(ki);
-		relpbuf(pbuf, NULL);
+		uma_zfree(pbuf_zone, pbuf);
 		job->pbuf = NULL;
 	}
 	g_destroy_bio(bp);
@@ -1420,7 +1420,7 @@ aiocb_store_aiocb(struct aiocb **ujobp, struct aiocb *ujob)
 }
 
 static struct aiocb_ops aiocb_ops = {
-	.copyin = aiocb_copyin,
+	.aio_copyin = aiocb_copyin,
 	.fetch_status = aiocb_fetch_status,
 	.fetch_error = aiocb_fetch_error,
 	.store_status = aiocb_store_status,
@@ -1431,7 +1431,7 @@ static struct aiocb_ops aiocb_ops = {
 
 #ifdef COMPAT_FREEBSD6
 static struct aiocb_ops aiocb_ops_osigevent = {
-	.copyin = aiocb_copyin_old_sigevent,
+	.aio_copyin = aiocb_copyin_old_sigevent,
 	.fetch_status = aiocb_fetch_status,
 	.fetch_error = aiocb_fetch_error,
 	.store_status = aiocb_store_status,
@@ -1478,7 +1478,7 @@ aio_aqueue(struct thread *td, struct aiocb *ujob, struct aioliojob *lj,
 	job = uma_zalloc(aiocb_zone, M_WAITOK | M_ZERO);
 	knlist_init_mtx(&job->klist, AIO_MTX(ki));
 
-	error = ops->copyin(ujob, &job->uaiocb);
+	error = ops->aio_copyin(ujob, &job->uaiocb);
 	if (error) {
 		ops->store_error(ujob, error);
 		uma_zfree(aiocb_zone, job);
@@ -2344,7 +2344,7 @@ aio_biowakeup(struct bio *bp)
 	ki = userp->p_aioinfo;
 	if (job->pbuf) {
 		pmap_qremove((vm_offset_t)job->pbuf->b_data, job->npages);
-		relpbuf(job->pbuf, NULL);
+		uma_zfree(pbuf_zone, job->pbuf);
 		job->pbuf = NULL;
 		atomic_subtract_int(&num_buf_aio, 1);
 		AIO_LOCK(ki);
@@ -2743,7 +2743,7 @@ aiocb32_store_aiocb(struct aiocb **ujobp, struct aiocb *ujob)
 }
 
 static struct aiocb_ops aiocb32_ops = {
-	.copyin = aiocb32_copyin,
+	.aio_copyin = aiocb32_copyin,
 	.fetch_status = aiocb32_fetch_status,
 	.fetch_error = aiocb32_fetch_error,
 	.store_status = aiocb32_store_status,
@@ -2754,7 +2754,7 @@ static struct aiocb_ops aiocb32_ops = {
 
 #ifdef COMPAT_FREEBSD6
 static struct aiocb_ops aiocb32_ops_osigevent = {
-	.copyin = aiocb32_copyin_old_sigevent,
+	.aio_copyin = aiocb32_copyin_old_sigevent,
 	.fetch_status = aiocb32_fetch_status,
 	.fetch_error = aiocb32_fetch_error,
 	.store_status = aiocb32_store_status,

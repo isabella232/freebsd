@@ -278,7 +278,8 @@ retry:
 	}
 
 	/* Print a subset of the capability information. */
-	device_printf(dev, "PF-ID[%d]: VFs %d, MSIX %d, VF MSIX %d, QPs %d, %s\n",
+	device_printf(dev,
+	    "PF-ID[%d]: VFs %d, MSI-X %d, VF MSI-X %d, QPs %d, %s\n",
 	    hw->pf_id, hw->func_caps.num_vfs, hw->func_caps.num_msix_vectors,
 	    hw->func_caps.num_msix_vectors_vf, hw->func_caps.num_tx_qp,
 	    (hw->func_caps.mdio_port_mode == 2) ? "I2C" :
@@ -505,7 +506,7 @@ ixl_intr(void *arg)
 
 /*********************************************************************
  *
- *  MSIX VSI Interrupt Service routine
+ *  MSI-X VSI Interrupt Service routine
  *
  **********************************************************************/
 int
@@ -524,7 +525,7 @@ ixl_msix_que(void *arg)
 
 /*********************************************************************
  *
- *  MSIX Admin Queue Interrupt Service routine
+ *  MSI-X Admin Queue Interrupt Service routine
  *
  **********************************************************************/
 int
@@ -636,6 +637,16 @@ ixl_msix_adminq(void *arg)
 		return (FILTER_HANDLED);
 }
 
+static u_int
+ixl_add_maddr(void *arg, struct sockaddr_dl *sdl, u_int cnt)
+{
+	struct ixl_vsi *vsi = arg;
+
+	ixl_add_mc_filter(vsi, (u8*)LLADDR(sdl));
+
+	return (1);
+}
+
 /*********************************************************************
  * 	Filter Routines
  *
@@ -645,25 +656,17 @@ ixl_msix_adminq(void *arg)
 void
 ixl_add_multi(struct ixl_vsi *vsi)
 {
-	struct	ifmultiaddr	*ifma;
 	struct ifnet		*ifp = vsi->ifp;
 	struct i40e_hw		*hw = vsi->hw;
 	int			mcnt = 0, flags;
 
 	IOCTL_DEBUGOUT("ixl_add_multi: begin");
 
-	if_maddr_rlock(ifp);
 	/*
 	** First just get a count, to decide if we
 	** we simply use multicast promiscuous.
 	*/
-	CK_STAILQ_FOREACH(ifma, &ifp->if_multiaddrs, ifma_link) {
-		if (ifma->ifma_addr->sa_family != AF_LINK)
-			continue;
-		mcnt++;
-	}
-	if_maddr_runlock(ifp);
-
+	mcnt = if_llmaddr_count(ifp);
 	if (__predict_false(mcnt >= MAX_MULTICAST_ADDR)) {
 		/* delete existing MC filters */
 		ixl_del_hw_filters(vsi, mcnt);
@@ -672,16 +675,7 @@ ixl_add_multi(struct ixl_vsi *vsi)
 		return;
 	}
 
-	mcnt = 0;
-	if_maddr_rlock(ifp);
-	CK_STAILQ_FOREACH(ifma, &ifp->if_multiaddrs, ifma_link) {
-		if (ifma->ifma_addr->sa_family != AF_LINK)
-			continue;
-		ixl_add_mc_filter(vsi,
-		    (u8*)LLADDR((struct sockaddr_dl *) ifma->ifma_addr));
-		mcnt++;
-	}
-	if_maddr_runlock(ifp);
+	mcnt = if_foreach_llmaddr(ifp, ixl_add_maddr, vsi);
 	if (mcnt > 0) {
 		flags = (IXL_FILTER_ADD | IXL_FILTER_USED | IXL_FILTER_MC);
 		ixl_add_hw_filters(vsi, flags, mcnt);
@@ -690,38 +684,33 @@ ixl_add_multi(struct ixl_vsi *vsi)
 	IOCTL_DEBUGOUT("ixl_add_multi: end");
 }
 
+static u_int
+ixl_match_maddr(void *arg, struct sockaddr_dl *sdl, u_int cnt)
+{
+	struct ixl_mac_filter *f = arg;
+
+	if (cmp_etheraddr(f->macaddr, (u8 *)LLADDR(sdl)))
+		return (1);
+	else
+		return (0);
+}
+
 int
 ixl_del_multi(struct ixl_vsi *vsi)
 {
 	struct ifnet		*ifp = vsi->ifp;
-	struct ifmultiaddr	*ifma;
 	struct ixl_mac_filter	*f;
 	int			mcnt = 0;
-	bool		match = FALSE;
 
 	IOCTL_DEBUGOUT("ixl_del_multi: begin");
 
-	/* Search for removed multicast addresses */
-	if_maddr_rlock(ifp);
-	SLIST_FOREACH(f, &vsi->ftl, next) {
-		if ((f->flags & IXL_FILTER_USED) && (f->flags & IXL_FILTER_MC)) {
-			match = FALSE;
-			CK_STAILQ_FOREACH(ifma, &ifp->if_multiaddrs, ifma_link) {
-				if (ifma->ifma_addr->sa_family != AF_LINK)
-					continue;
-				u8 *mc_addr = (u8 *)LLADDR((struct sockaddr_dl *)ifma->ifma_addr);
-				if (cmp_etheraddr(f->macaddr, mc_addr)) {
-					match = TRUE;
-					break;
-				}
-			}
-			if (match == FALSE) {
-				f->flags |= IXL_FILTER_DEL;
-				mcnt++;
-			}
+	SLIST_FOREACH(f, &vsi->ftl, next)
+		if ((f->flags & IXL_FILTER_USED) &&
+		    (f->flags & IXL_FILTER_MC) &&
+		    (if_foreach_llmaddr(ifp, ixl_match_maddr, f) == 0)) {
+			f->flags |= IXL_FILTER_DEL;
+			mcnt++;
 		}
-	}
-	if_maddr_runlock(ifp);
 
 	if (mcnt > 0)
 		ixl_del_hw_filters(vsi, mcnt);
@@ -791,7 +780,7 @@ ixl_configure_intr0_msix(struct ixl_pf *pf)
 	/*
 	 * 0x7FF is the end of the queue list.
 	 * This means we won't use MSI-X vector 0 for a queue interrupt
-	 * in MSIX mode.
+	 * in MSI-X mode.
 	 */
 	wr32(hw, I40E_PFINT_LNKLST0, 0x7FF);
 	/* Value is in 2 usec units, so 0x3E is 62*2 = 124 usecs. */
@@ -909,12 +898,12 @@ ixl_free_pci_resources(struct ixl_pf *pf)
 	device_t		dev = iflib_get_dev(vsi->ctx);
 	struct ixl_rx_queue	*rx_que = vsi->rx_queues;
 
-	/* We may get here before stations are setup */
+	/* We may get here before stations are set up */
 	if (rx_que == NULL)
 		goto early;
 
 	/*
-	**  Release all msix VSI resources:
+	**  Release all MSI-X VSI resources:
 	*/
 	iflib_irq_free(vsi->ctx, &vsi->irq);
 
@@ -923,7 +912,7 @@ ixl_free_pci_resources(struct ixl_pf *pf)
 early:
 	if (pf->pci_mem != NULL)
 		bus_release_resource(dev, SYS_RES_MEMORY,
-		    PCIR_BAR(0), pf->pci_mem);
+		    rman_get_rid(pf->pci_mem), pf->pci_mem);
 }
 
 void
@@ -1299,10 +1288,7 @@ ixl_initialize_vsi(struct ixl_vsi *vsi)
 		struct i40e_hmc_obj_rxq rctx;
 
 		/* Next setup the HMC RX Context  */
-		if (scctx->isc_max_frame_size <= MCLBYTES)
-			rxr->mbuf_sz = MCLBYTES;
-		else
-			rxr->mbuf_sz = MJUMPAGESIZE;
+		rxr->mbuf_sz = iflib_get_rx_mbuf_sz(vsi->ctx);
 
 		u16 max_rxmax = rxr->mbuf_sz * hw->func_caps.rx_buf_chain_len;
 
@@ -2606,6 +2592,7 @@ ixl_update_stats_counters(struct ixl_pf *pf)
 	struct i40e_hw	*hw = &pf->hw;
 	struct ixl_vsi	*vsi = &pf->vsi;
 	struct ixl_vf	*vf;
+	u64 prev_link_xoff_rx = pf->stats.link_xoff_rx;
 
 	struct i40e_hw_port_stats *nsd = &pf->stats;
 	struct i40e_hw_port_stats *osd = &pf->stats_offsets;
@@ -2690,6 +2677,13 @@ ixl_update_stats_counters(struct ixl_pf *pf)
 	ixl_stat_update32(hw, I40E_GLPRT_LXOFFTXC(hw->port),
 			   pf->stat_offsets_loaded,
 			   &osd->link_xoff_tx, &nsd->link_xoff_tx);
+
+	/*
+	 * For watchdog management we need to know if we have been paused
+	 * during the last interval, so capture that here.
+	 */
+	if (pf->stats.link_xoff_rx != prev_link_xoff_rx)
+		vsi->shared->isc_pause_frames = 1;
 
 	/* Packet size stats rx */
 	ixl_stat_update48(hw, I40E_GLPRT_PRC64H(hw->port),
@@ -3663,23 +3657,34 @@ ixl_handle_nvmupd_cmd(struct ixl_pf *pf, struct ifdrv *ifd)
 	struct i40e_nvm_access *nvma;
 	device_t dev = pf->dev;
 	enum i40e_status_code status = 0;
-	int perrno;
+	size_t nvma_size, ifd_len, exp_len;
+	int err, perrno;
 
 	DEBUGFUNC("ixl_handle_nvmupd_cmd");
 
 	/* Sanity checks */
-	if (ifd->ifd_len < sizeof(struct i40e_nvm_access) ||
+	nvma_size = sizeof(struct i40e_nvm_access);
+	ifd_len = ifd->ifd_len;
+
+	if (ifd_len < nvma_size ||
 	    ifd->ifd_data == NULL) {
 		device_printf(dev, "%s: incorrect ifdrv length or data pointer\n",
 		    __func__);
 		device_printf(dev, "%s: ifdrv length: %zu, sizeof(struct i40e_nvm_access): %zu\n",
-		    __func__, ifd->ifd_len, sizeof(struct i40e_nvm_access));
+		    __func__, ifd_len, nvma_size);
 		device_printf(dev, "%s: data pointer: %p\n", __func__,
 		    ifd->ifd_data);
 		return (EINVAL);
 	}
 
-	nvma = (struct i40e_nvm_access *)ifd->ifd_data;
+	nvma = malloc(ifd_len, M_DEVBUF, M_WAITOK);
+	err = copyin(ifd->ifd_data, nvma, ifd_len);
+	if (err) {
+		device_printf(dev, "%s: Cannot get request from user space\n",
+		    __func__);
+		free(nvma, M_DEVBUF);
+		return (err);
+	}
 
 	if (pf->dbg_mask & IXL_DBG_NVMUPD)
 		ixl_print_nvm_cmd(dev, nvma);
@@ -3693,13 +3698,49 @@ ixl_handle_nvmupd_cmd(struct ixl_pf *pf, struct ifdrv *ifd)
 		}
 	}
 
-	if (!(pf->state & IXL_PF_STATE_ADAPTER_RESETTING)) {
-		// TODO: Might need a different lock here
-		// IXL_PF_LOCK(pf);
-		status = i40e_nvmupd_command(hw, nvma, nvma->data, &perrno);
-		// IXL_PF_UNLOCK(pf);
-	} else {
-		perrno = -EBUSY;
+	if (pf->state & IXL_PF_STATE_ADAPTER_RESETTING) {
+		free(nvma, M_DEVBUF);
+		return (-EBUSY);
+	}
+
+	if (nvma->data_size < 1 || nvma->data_size > 4096) {
+		device_printf(dev, "%s: invalid request, data size not in supported range\n",
+		    __func__);
+		free(nvma, M_DEVBUF);
+		return (EINVAL);
+	}
+
+	/*
+	 * Older versions of the NVM update tool don't set ifd_len to the size
+	 * of the entire buffer passed to the ioctl. Check the data_size field
+	 * in the contained i40e_nvm_access struct and ensure everything is
+	 * copied in from userspace.
+	 */
+	exp_len = nvma_size + nvma->data_size - 1; /* One byte is kept in struct */
+
+	if (ifd_len < exp_len) {
+		ifd_len = exp_len;
+		nvma = realloc(nvma, ifd_len, M_DEVBUF, M_WAITOK);
+		err = copyin(ifd->ifd_data, nvma, ifd_len);
+		if (err) {
+			device_printf(dev, "%s: Cannot get request from user space\n",
+					__func__);
+			free(nvma, M_DEVBUF);
+			return (err);
+		}
+	}
+
+	// TODO: Might need a different lock here
+	// IXL_PF_LOCK(pf);
+	status = i40e_nvmupd_command(hw, nvma, nvma->data, &perrno);
+	// IXL_PF_UNLOCK(pf);
+
+	err = copyout(nvma, ifd->ifd_data, ifd_len);
+	free(nvma, M_DEVBUF);
+	if (err) {
+		device_printf(dev, "%s: Cannot return data to user space\n",
+				__func__);
+		return (err);
 	}
 
 	/* Let the nvmupdate report errors, show them only when debug is enabled */

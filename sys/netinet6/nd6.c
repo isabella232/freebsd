@@ -39,6 +39,7 @@ __FBSDID("$FreeBSD$");
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/eventhandler.h>
 #include <sys/callout.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
@@ -113,9 +114,8 @@ VNET_DEFINE(int, nd6_debug) = 1;
 VNET_DEFINE(int, nd6_debug) = 0;
 #endif
 
-static eventhandler_tag lle_event_eh, iflladdr_event_eh;
+static eventhandler_tag lle_event_eh, iflladdr_event_eh, ifnet_link_event_eh;
 
-VNET_DEFINE(struct nd_drhead, nd_defrouter);
 VNET_DEFINE(struct nd_prhead, nd_prefix);
 VNET_DEFINE(struct rwlock, nd6_lock);
 VNET_DEFINE(uint64_t, nd6_list_genid);
@@ -145,8 +145,10 @@ static int nd6_need_cache(struct ifnet *);
 VNET_DEFINE_STATIC(struct callout, nd6_slowtimo_ch);
 #define	V_nd6_slowtimo_ch		VNET(nd6_slowtimo_ch)
 
-VNET_DEFINE(struct callout, nd6_timer_ch);
+VNET_DEFINE_STATIC(struct callout, nd6_timer_ch);
 #define	V_nd6_timer_ch			VNET(nd6_timer_ch)
+
+SYSCTL_DECL(_net_inet6_icmp6);
 
 static void
 nd6_lle_event(void *arg __unused, struct llentry *lle, int evt)
@@ -217,7 +219,7 @@ nd6_init(void)
 	rw_init(&V_nd6_lock, "nd6 list");
 
 	LIST_INIT(&V_nd_prefix);
-	TAILQ_INIT(&V_nd_defrouter);
+	nd6_defrouter_init();
 
 	/* Start timers. */
 	callout_init(&V_nd6_slowtimo_ch, 0);
@@ -233,6 +235,8 @@ nd6_init(void)
 		    NULL, EVENTHANDLER_PRI_ANY);
 		iflladdr_event_eh = EVENTHANDLER_REGISTER(iflladdr_event,
 		    nd6_iflladdr, NULL, EVENTHANDLER_PRI_ANY);
+		ifnet_link_event_eh = EVENTHANDLER_REGISTER(ifnet_link_event,
+		    nd6_ifnet_link_event, NULL, EVENTHANDLER_PRI_ANY);
 	}
 }
 
@@ -244,6 +248,7 @@ nd6_destroy()
 	callout_drain(&V_nd6_slowtimo_ch);
 	callout_drain(&V_nd6_timer_ch);
 	if (IS_DEFAULT_VNET(curvnet)) {
+		EVENTHANDLER_DEREGISTER(ifnet_link_event, ifnet_link_event_eh);
 		EVENTHANDLER_DEREGISTER(lle_event, lle_event_eh);
 		EVENTHANDLER_DEREGISTER(iflladdr_event, iflladdr_event_eh);
 	}
@@ -298,9 +303,10 @@ nd6_ifattach(struct ifnet *ifp)
 void
 nd6_ifdetach(struct ifnet *ifp, struct nd_ifinfo *nd)
 {
+	struct epoch_tracker et;
 	struct ifaddr *ifa, *next;
 
-	IF_ADDR_RLOCK(ifp);
+	NET_EPOCH_ENTER(et);
 	CK_STAILQ_FOREACH_SAFE(ifa, &ifp->if_addrhead, ifa_link, next) {
 		if (ifa->ifa_addr->sa_family != AF_INET6)
 			continue;
@@ -308,7 +314,7 @@ nd6_ifdetach(struct ifnet *ifp, struct nd_ifinfo *nd)
 		/* stop DAD processing */
 		nd6_dad_stop(ifa);
 	}
-	IF_ADDR_RUNLOCK(ifp);
+	NET_EPOCH_EXIT(et);
 
 	free(nd, M_IP6NDP);
 }
@@ -727,6 +733,7 @@ nd6_llinfo_setstate(struct llentry *lle, int newstate)
 static __noinline void
 nd6_llinfo_timer(void *arg)
 {
+	struct epoch_tracker et;
 	struct llentry *ln;
 	struct in6_addr *dst, *pdst, *psrc, src;
 	struct ifnet *ifp;
@@ -763,6 +770,7 @@ nd6_llinfo_timer(void *arg)
 		CURVNET_RESTORE();
 		return;
 	}
+	NET_EPOCH_ENTER(et);
 	ndi = ND_IFINFO(ifp);
 	send_ns = 0;
 	dst = &ln->r_l3addr.addr6;
@@ -881,6 +889,7 @@ done:
 
 	if (ln != NULL)
 		LLE_FREE_LOCKED(ln);
+	NET_EPOCH_EXIT(et);
 	CURVNET_RESTORE();
 }
 
@@ -892,26 +901,17 @@ void
 nd6_timer(void *arg)
 {
 	CURVNET_SET((struct vnet *) arg);
-	struct nd_drhead drq;
+	struct epoch_tracker et;
 	struct nd_prhead prl;
-	struct nd_defrouter *dr, *ndr;
 	struct nd_prefix *pr, *npr;
+	struct ifnet *ifp;
 	struct in6_ifaddr *ia6, *nia6;
 	uint64_t genid;
 
-	TAILQ_INIT(&drq);
 	LIST_INIT(&prl);
 
-	ND6_WLOCK();
-	TAILQ_FOREACH_SAFE(dr, &V_nd_defrouter, dr_entry, ndr)
-		if (dr->expire && dr->expire < time_uptime)
-			defrouter_unlink(dr, &drq);
-	ND6_WUNLOCK();
-
-	while ((dr = TAILQ_FIRST(&drq)) != NULL) {
-		TAILQ_REMOVE(&drq, dr, dr_entry);
-		defrouter_del(dr);
-	}
+	NET_EPOCH_ENTER(et);
+	nd6_defrouter_timer();
 
 	/*
 	 * expire interface addresses.
@@ -992,14 +992,15 @@ nd6_timer(void *arg)
 			 * Check status of the interface.  If it is down,
 			 * mark the address as tentative for future DAD.
 			 */
-			if ((ia6->ia_ifp->if_flags & IFF_UP) == 0 ||
-			    (ia6->ia_ifp->if_drv_flags & IFF_DRV_RUNNING)
-				== 0 ||
-			    (ND_IFINFO(ia6->ia_ifp)->flags &
-				ND6_IFF_IFDISABLED) != 0) {
+			ifp = ia6->ia_ifp;
+			if ((ND_IFINFO(ifp)->flags & ND6_IFF_NO_DAD) == 0 &&
+			    ((ifp->if_flags & IFF_UP) == 0 ||
+			    (ifp->if_drv_flags & IFF_DRV_RUNNING) == 0 ||
+			    (ND_IFINFO(ifp)->flags & ND6_IFF_IFDISABLED) != 0)){
 				ia6->ia6_flags &= ~IN6_IFF_DUPLICATED;
 				ia6->ia6_flags |= IN6_IFF_TENTATIVE;
 			}
+
 			/*
 			 * A new RA might have made a deprecated address
 			 * preferred.
@@ -1007,6 +1008,7 @@ nd6_timer(void *arg)
 			ia6->ia6_flags &= ~IN6_IFF_DEPRECATED;
 		}
 	}
+	NET_EPOCH_EXIT(et);
 
 	ND6_WLOCK();
 restart:
@@ -1066,8 +1068,9 @@ regen_tmpaddr(struct in6_ifaddr *ia6)
 	struct ifnet *ifp;
 	struct in6_ifaddr *public_ifa6 = NULL;
 
+	NET_EPOCH_ASSERT();
+
 	ifp = ia6->ia_ifa.ifa_ifp;
-	IF_ADDR_RLOCK(ifp);
 	CK_STAILQ_FOREACH(ifa, &ifp->if_addrhead, ifa_link) {
 		struct in6_ifaddr *it6;
 
@@ -1108,7 +1111,6 @@ regen_tmpaddr(struct in6_ifaddr *ia6)
 	}
 	if (public_ifa6 != NULL)
 		ifa_ref(&public_ifa6->ia_ifa);
-	IF_ADDR_RUNLOCK(ifp);
 
 	if (public_ifa6 != NULL) {
 		int e;
@@ -1133,34 +1135,15 @@ regen_tmpaddr(struct in6_ifaddr *ia6)
 void
 nd6_purge(struct ifnet *ifp)
 {
-	struct nd_drhead drq;
 	struct nd_prhead prl;
-	struct nd_defrouter *dr, *ndr;
 	struct nd_prefix *pr, *npr;
 
-	TAILQ_INIT(&drq);
 	LIST_INIT(&prl);
 
-	/*
-	 * Nuke default router list entries toward ifp.
-	 * We defer removal of default router list entries that is installed
-	 * in the routing table, in order to keep additional side effects as
-	 * small as possible.
-	 */
-	ND6_WLOCK();
-	TAILQ_FOREACH_SAFE(dr, &V_nd_defrouter, dr_entry, ndr) {
-		if (dr->installed)
-			continue;
-		if (dr->ifp == ifp)
-			defrouter_unlink(dr, &drq);
-	}
-	TAILQ_FOREACH_SAFE(dr, &V_nd_defrouter, dr_entry, ndr) {
-		if (!dr->installed)
-			continue;
-		if (dr->ifp == ifp)
-			defrouter_unlink(dr, &drq);
-	}
+	/* Purge default router list entries toward ifp. */
+	nd6_defrouter_purge(ifp);
 
+	ND6_WLOCK();
 	/*
 	 * Remove prefixes on ifp. We should have already removed addresses on
 	 * this interface, so no addresses should be referencing these prefixes.
@@ -1171,11 +1154,7 @@ nd6_purge(struct ifnet *ifp)
 	}
 	ND6_WUNLOCK();
 
-	/* Delete the unlinked router and prefix objects. */
-	while ((dr = TAILQ_FIRST(&drq)) != NULL) {
-		TAILQ_REMOVE(&drq, dr, dr_entry);
-		defrouter_del(dr);
-	}
+	/* Delete the unlinked prefix objects. */
 	while ((pr = LIST_FIRST(&prl)) != NULL) {
 		LIST_REMOVE(pr, ndpr_entry);
 		nd6_prefix_del(pr);
@@ -1213,7 +1192,7 @@ nd6_lookup(const struct in6_addr *addr6, int flags, struct ifnet *ifp)
 	return (ln);
 }
 
-struct llentry *
+static struct llentry *
 nd6_alloc(const struct in6_addr *addr6, int flags, struct ifnet *ifp)
 {
 	struct sockaddr_in6 sin6;
@@ -1343,17 +1322,19 @@ restart:
 	 * a p2p interface, the address should be a neighbor.
 	 */
 	if (ifp->if_flags & IFF_POINTOPOINT) {
-		IF_ADDR_RLOCK(ifp);
+		struct epoch_tracker et;
+
+		NET_EPOCH_ENTER(et);
 		CK_STAILQ_FOREACH(ifa, &ifp->if_addrhead, ifa_link) {
 			if (ifa->ifa_addr->sa_family != addr->sin6_family)
 				continue;
 			if (ifa->ifa_dstaddr != NULL &&
 			    sa_equal(addr, ifa->ifa_dstaddr)) {
-				IF_ADDR_RUNLOCK(ifp);
+				NET_EPOCH_EXIT(et);
 				return 1;
 			}
 		}
-		IF_ADDR_RUNLOCK(ifp);
+		NET_EPOCH_EXIT(et);
 	}
 
 	/*
@@ -1361,7 +1342,7 @@ restart:
 	 * as on-link, and thus, as a neighbor.
 	 */
 	if (ND_IFINFO(ifp)->flags & ND6_IFF_ACCEPT_RTADV &&
-	    TAILQ_EMPTY(&V_nd_defrouter) &&
+	    nd6_defrouter_list_empty() &&
 	    V_nd6_defifindex == ifp->if_index) {
 		return (1);
 	}
@@ -1380,6 +1361,7 @@ nd6_is_addr_neighbor(const struct sockaddr_in6 *addr, struct ifnet *ifp)
 	struct llentry *lle;
 	int rc = 0;
 
+	NET_EPOCH_ASSERT();
 	IF_AFDATA_UNLOCK_ASSERT(ifp);
 	if (nd6_is_new_addr_neighbor(addr, ifp))
 		return (1);
@@ -1388,12 +1370,10 @@ nd6_is_addr_neighbor(const struct sockaddr_in6 *addr, struct ifnet *ifp)
 	 * Even if the address matches none of our addresses, it might be
 	 * in the neighbor cache.
 	 */
-	IF_AFDATA_RLOCK(ifp);
 	if ((lle = nd6_lookup(&addr->sin6_addr, 0, ifp)) != NULL) {
 		LLE_RUNLOCK(lle);
 		rc = 1;
 	}
-	IF_AFDATA_RUNLOCK(ifp);
 	return (rc);
 }
 
@@ -1622,6 +1602,7 @@ nd6_ioctl(u_long cmd, caddr_t data, struct ifnet *ifp)
 	struct in6_ndireq *ndi = (struct in6_ndireq *)data;
 	struct in6_nbrinfo *nbi = (struct in6_nbrinfo *)data;
 	struct in6_ndifreq *ndif = (struct in6_ndifreq *)data;
+	struct epoch_tracker et;
 	int error = 0;
 
 	if (ifp->if_afdata[AF_INET6] == NULL)
@@ -1686,7 +1667,7 @@ nd6_ioctl(u_long cmd, caddr_t data, struct ifnet *ifp)
 			 * do not clear ND6_IFF_IFDISABLED.
 			 * See RFC 4862, Section 5.4.5.
 			 */
-			IF_ADDR_RLOCK(ifp);
+			NET_EPOCH_ENTER(et);
 			CK_STAILQ_FOREACH(ifa, &ifp->if_addrhead, ifa_link) {
 				if (ifa->ifa_addr->sa_family != AF_INET6)
 					continue;
@@ -1695,7 +1676,7 @@ nd6_ioctl(u_long cmd, caddr_t data, struct ifnet *ifp)
 				    IN6_IS_ADDR_LINKLOCAL(IA6_IN6(ia)))
 					break;
 			}
-			IF_ADDR_RUNLOCK(ifp);
+			NET_EPOCH_EXIT(et);
 
 			if (ifa != NULL) {
 				/* LLA is duplicated. */
@@ -1716,7 +1697,7 @@ nd6_ioctl(u_long cmd, caddr_t data, struct ifnet *ifp)
 			ND_IFINFO(ifp)->flags |= ND6_IFF_IFDISABLED;
 			if (V_ip6_dad_count > 0 &&
 			    (ND_IFINFO(ifp)->flags & ND6_IFF_NO_DAD) == 0) {
-				IF_ADDR_RLOCK(ifp);
+				NET_EPOCH_ENTER(et);
 				CK_STAILQ_FOREACH(ifa, &ifp->if_addrhead,
 				    ifa_link) {
 					if (ifa->ifa_addr->sa_family !=
@@ -1725,7 +1706,7 @@ nd6_ioctl(u_long cmd, caddr_t data, struct ifnet *ifp)
 					ia = (struct in6_ifaddr *)ifa;
 					ia->ia6_flags |= IN6_IFF_TENTATIVE;
 				}
-				IF_ADDR_RUNLOCK(ifp);
+				NET_EPOCH_EXIT(et);
 			}
 		}
 
@@ -1744,7 +1725,7 @@ nd6_ioctl(u_long cmd, caddr_t data, struct ifnet *ifp)
 				 * address is assigned, and IFF_UP, try to
 				 * assign one.
 				 */
-				IF_ADDR_RLOCK(ifp);
+				NET_EPOCH_ENTER(et);
 				CK_STAILQ_FOREACH(ifa, &ifp->if_addrhead,
 				    ifa_link) {
 					if (ifa->ifa_addr->sa_family !=
@@ -1754,20 +1735,20 @@ nd6_ioctl(u_long cmd, caddr_t data, struct ifnet *ifp)
 					if (IN6_IS_ADDR_LINKLOCAL(IA6_IN6(ia)))
 						break;
 				}
-				IF_ADDR_RUNLOCK(ifp);
+				NET_EPOCH_EXIT(et);
 				if (ifa != NULL)
 					/* No LLA is configured. */
 					in6_ifattach(ifp, NULL);
 			}
 		}
-	}
 		ND_IFINFO(ifp)->flags = ND.flags;
 		break;
+	}
 #undef ND
 	case SIOCSNDFLUSH_IN6:	/* XXX: the ioctl name is confusing... */
 		/* sync kernel routing table with the default router list */
 		defrouter_reset();
-		defrouter_select();
+		defrouter_select_fib(RT_ALL_FIBS);
 		break;
 	case SIOCSPFXFLUSH_IN6:
 	{
@@ -1804,23 +1785,10 @@ nd6_ioctl(u_long cmd, caddr_t data, struct ifnet *ifp)
 	case SIOCSRTRFLUSH_IN6:
 	{
 		/* flush all the default routers */
-		struct nd_drhead drq;
-		struct nd_defrouter *dr;
-
-		TAILQ_INIT(&drq);
 
 		defrouter_reset();
-
-		ND6_WLOCK();
-		while ((dr = TAILQ_FIRST(&V_nd_defrouter)) != NULL)
-			defrouter_unlink(dr, &drq);
-		ND6_WUNLOCK();
-		while ((dr = TAILQ_FIRST(&drq)) != NULL) {
-			TAILQ_REMOVE(&drq, dr, dr_entry);
-			defrouter_del(dr);
-		}
-
-		defrouter_select();
+		nd6_defrouter_flush_all();
+		defrouter_select_fib(RT_ALL_FIBS);
 		break;
 	}
 	case SIOCGNBRINFO_IN6:
@@ -1831,9 +1799,9 @@ nd6_ioctl(u_long cmd, caddr_t data, struct ifnet *ifp)
 		if ((error = in6_setscope(&nb_addr, ifp, NULL)) != 0)
 			return (error);
 
-		IF_AFDATA_RLOCK(ifp);
+		NET_EPOCH_ENTER(et);
 		ln = nd6_lookup(&nb_addr, 0, ifp);
-		IF_AFDATA_RUNLOCK(ifp);
+		NET_EPOCH_EXIT(et);
 
 		if (ln == NULL) {
 			error = EINVAL;
@@ -1963,6 +1931,7 @@ nd6_cache_lladdr(struct ifnet *ifp, struct in6_addr *from, char *lladdr,
 	size_t linkhdrsize;
 	int lladdr_off;
 
+	NET_EPOCH_ASSERT();
 	IF_AFDATA_UNLOCK_ASSERT(ifp);
 
 	KASSERT(ifp != NULL, ("%s: ifp == NULL", __func__));
@@ -1982,9 +1951,7 @@ nd6_cache_lladdr(struct ifnet *ifp, struct in6_addr *from, char *lladdr,
 	 * description on it in NS section (RFC 2461 7.2.3).
 	 */
 	flags = lladdr ? LLE_EXCLUSIVE : 0;
-	IF_AFDATA_RLOCK(ifp);
 	ln = nd6_lookup(from, flags, ifp);
-	IF_AFDATA_RUNLOCK(ifp);
 	is_newentry = 0;
 	if (ln == NULL) {
 		flags |= LLE_EXCLUSIVE;
@@ -2126,13 +2093,14 @@ nd6_cache_lladdr(struct ifnet *ifp, struct in6_addr *from, char *lladdr,
 static void
 nd6_slowtimo(void *arg)
 {
+	struct epoch_tracker et;
 	CURVNET_SET((struct vnet *) arg);
 	struct nd_ifinfo *nd6if;
 	struct ifnet *ifp;
 
 	callout_reset(&V_nd6_slowtimo_ch, ND6_SLOWTIMER_INTERVAL * hz,
 	    nd6_slowtimo, curvnet);
-	IFNET_RLOCK_NOSLEEP();
+	NET_EPOCH_ENTER(et);
 	CK_STAILQ_FOREACH(ifp, &V_ifnet, if_link) {
 		if (ifp->if_afdata[AF_INET6] == NULL)
 			continue;
@@ -2149,7 +2117,7 @@ nd6_slowtimo(void *arg)
 			nd6if->reachable = ND_COMPUTE_RTIME(nd6if->basereachable);
 		}
 	}
-	IFNET_RUNLOCK_NOSLEEP();
+	NET_EPOCH_EXIT(et);
 	CURVNET_RESTORE();
 }
 
@@ -2245,6 +2213,8 @@ nd6_resolve(struct ifnet *ifp, int is_gw, struct mbuf *m,
 	struct llentry *ln = NULL;
 	const struct sockaddr_in6 *dst6;
 
+	NET_EPOCH_ASSERT();
+
 	if (pflags != NULL)
 		*pflags = 0;
 
@@ -2270,7 +2240,6 @@ nd6_resolve(struct ifnet *ifp, int is_gw, struct mbuf *m,
 		}
 	}
 
-	IF_AFDATA_RLOCK(ifp);
 	ln = nd6_lookup(&dst6->sin6_addr, plle ? LLE_EXCLUSIVE : LLE_UNLOCKED,
 	    ifp);
 	if (ln != NULL && (ln->r_flags & RLLE_VALID) != 0) {
@@ -2290,11 +2259,9 @@ nd6_resolve(struct ifnet *ifp, int is_gw, struct mbuf *m,
 			*plle = ln;
 			LLE_WUNLOCK(ln);
 		}
-		IF_AFDATA_RUNLOCK(ifp);
 		return (0);
 	} else if (plle && ln)
 		LLE_WUNLOCK(ln);
-	IF_AFDATA_RUNLOCK(ifp);
 
 	return (nd6_resolve_slow(ifp, 0, m, dst6, desten, pflags, plle));
 }
@@ -2321,6 +2288,8 @@ nd6_resolve_slow(struct ifnet *ifp, int flags, struct mbuf *m,
 	int send_ns, ll_len;
 	char *lladdr;
 
+	NET_EPOCH_ASSERT();
+
 	/*
 	 * Address resolution or Neighbor Unreachability Detection
 	 * for the next hop.
@@ -2328,9 +2297,7 @@ nd6_resolve_slow(struct ifnet *ifp, int flags, struct mbuf *m,
 	 * or an anycast address(i.e. not a multicast).
 	 */
 	if (lle == NULL) {
-		IF_AFDATA_RLOCK(ifp);
 		lle = nd6_lookup(&dst->sin6_addr, LLE_EXCLUSIVE, ifp);
-		IF_AFDATA_RUNLOCK(ifp);
 		if ((lle == NULL) && nd6_is_addr_neighbor(dst, ifp))  {
 			/*
 			 * Since nd6_is_addr_neighbor() internally calls nd6_lookup(),
@@ -2363,13 +2330,7 @@ nd6_resolve_slow(struct ifnet *ifp, int flags, struct mbuf *m,
 		}
 	} 
 	if (lle == NULL) {
-		if (!(ND_IFINFO(ifp)->flags & ND6_IFF_PERFORMNUD)) {
-			m_freem(m);
-			return (ENOBUFS);
-		}
-
-		if (m != NULL)
-			m_freem(m);
+		m_freem(m);
 		return (ENOBUFS);
 	}
 
@@ -2612,59 +2573,6 @@ clear_llinfo_pqueue(struct llentry *ln)
 	ln->la_hold = NULL;
 }
 
-static int nd6_sysctl_drlist(SYSCTL_HANDLER_ARGS);
-static int nd6_sysctl_prlist(SYSCTL_HANDLER_ARGS);
-
-SYSCTL_DECL(_net_inet6_icmp6);
-SYSCTL_PROC(_net_inet6_icmp6, ICMPV6CTL_ND6_DRLIST, nd6_drlist,
-	CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_MPSAFE,
-	NULL, 0, nd6_sysctl_drlist, "S,in6_defrouter",
-	"NDP default router list");
-SYSCTL_PROC(_net_inet6_icmp6, ICMPV6CTL_ND6_PRLIST, nd6_prlist,
-	CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_MPSAFE,
-	NULL, 0, nd6_sysctl_prlist, "S,in6_prefix",
-	"NDP prefix list");
-SYSCTL_INT(_net_inet6_icmp6, ICMPV6CTL_ND6_MAXQLEN, nd6_maxqueuelen,
-	CTLFLAG_VNET | CTLFLAG_RW, &VNET_NAME(nd6_maxqueuelen), 1, "");
-SYSCTL_INT(_net_inet6_icmp6, OID_AUTO, nd6_gctimer,
-	CTLFLAG_VNET | CTLFLAG_RW, &VNET_NAME(nd6_gctimer), (60 * 60 * 24), "");
-
-static int
-nd6_sysctl_drlist(SYSCTL_HANDLER_ARGS)
-{
-	struct in6_defrouter d;
-	struct nd_defrouter *dr;
-	int error;
-
-	if (req->newptr != NULL)
-		return (EPERM);
-
-	error = sysctl_wire_old_buffer(req, 0);
-	if (error != 0)
-		return (error);
-
-	bzero(&d, sizeof(d));
-	d.rtaddr.sin6_family = AF_INET6;
-	d.rtaddr.sin6_len = sizeof(d.rtaddr);
-
-	ND6_RLOCK();
-	TAILQ_FOREACH(dr, &V_nd_defrouter, dr_entry) {
-		d.rtaddr.sin6_addr = dr->rtaddr;
-		error = sa6_recoverscope(&d.rtaddr);
-		if (error != 0)
-			break;
-		d.flags = dr->raflags;
-		d.rtlifetime = dr->rtlifetime;
-		d.expire = dr->expire + (time_second - time_uptime);
-		d.if_index = dr->ifp->if_index;
-		error = SYSCTL_OUT(req, &d, sizeof(d));
-		if (error != 0)
-			break;
-	}
-	ND6_RUNLOCK();
-	return (error);
-}
-
 static int
 nd6_sysctl_prlist(SYSCTL_HANDLER_ARGS)
 {
@@ -2738,3 +2646,11 @@ out:
 	ND6_RUNLOCK();
 	return (error);
 }
+SYSCTL_PROC(_net_inet6_icmp6, ICMPV6CTL_ND6_PRLIST, nd6_prlist,
+	CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_MPSAFE,
+	NULL, 0, nd6_sysctl_prlist, "S,in6_prefix",
+	"NDP prefix list");
+SYSCTL_INT(_net_inet6_icmp6, ICMPV6CTL_ND6_MAXQLEN, nd6_maxqueuelen,
+	CTLFLAG_VNET | CTLFLAG_RW, &VNET_NAME(nd6_maxqueuelen), 1, "");
+SYSCTL_INT(_net_inet6_icmp6, OID_AUTO, nd6_gctimer,
+	CTLFLAG_VNET | CTLFLAG_RW, &VNET_NAME(nd6_gctimer), (60 * 60 * 24), "");

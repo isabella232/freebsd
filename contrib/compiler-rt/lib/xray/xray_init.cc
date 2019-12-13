@@ -1,9 +1,8 @@
 //===-- xray_init.cc --------------------------------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -27,6 +26,15 @@ extern const XRaySledEntry __start_xray_instr_map[] __attribute__((weak));
 extern const XRaySledEntry __stop_xray_instr_map[] __attribute__((weak));
 extern const XRayFunctionSledIndex __start_xray_fn_idx[] __attribute__((weak));
 extern const XRayFunctionSledIndex __stop_xray_fn_idx[] __attribute__((weak));
+
+#if SANITIZER_MAC
+// HACK: This is a temporary workaround to make XRay build on 
+// Darwin, but it will probably not work at runtime.
+const XRaySledEntry __start_xray_instr_map[] = {};
+extern const XRaySledEntry __stop_xray_instr_map[] = {};
+extern const XRayFunctionSledIndex __start_xray_fn_idx[] = {};
+extern const XRayFunctionSledIndex __stop_xray_fn_idx[] = {};
+#endif
 }
 
 using namespace __xray;
@@ -57,6 +65,9 @@ void __xray_init() XRAY_NEVER_INSTRUMENT {
   // Short-circuit if we've already initialized XRay before.
   if (atomic_load(&XRayInitialized, memory_order_acquire))
     return;
+
+  // XRAY is not compatible with PaX MPROTECT
+  CheckMPROTECT();
 
   if (!atomic_load(&XRayFlagsInitialized, memory_order_acquire)) {
     initializeFlags();
@@ -97,8 +108,8 @@ __attribute__((section(".preinit_array"),
 #else
 // If we cannot use the .preinit_array section, we should instead use dynamic
 // initialisation.
-static bool UNUSED __local_xray_dyninit = [] {
+__attribute__ ((constructor (0)))
+static void __local_xray_dyninit() {
   __xray_init();
-  return true;
-}();
+}
 #endif

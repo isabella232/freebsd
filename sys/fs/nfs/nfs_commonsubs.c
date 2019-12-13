@@ -42,9 +42,12 @@ __FBSDID("$FreeBSD$");
  * copy data between mbuf chains and uio lists.
  */
 #ifndef APPLEKEXT
+#include "opt_inet.h"
 #include "opt_inet6.h"
 
 #include <fs/nfs/nfsport.h>
+
+#include <sys/extattr.h>
 
 #include <security/mac/mac_framework.h>
 
@@ -63,7 +66,8 @@ struct timeval nfsboottime;	/* Copy boottime once, so it never changes */
 int nfscl_ticks;
 int nfsrv_useacl = 1;
 struct nfssockreq nfsrv_nfsuserdsock;
-int nfsrv_nfsuserd = 0;
+nfsuserd_state nfsrv_nfsuserd = NOTRUNNING;
+static int nfsrv_userdupcalls = 0;
 struct nfsreqhead nfsd_reqq;
 uid_t nfsrv_defaultuid = UID_NOBODY;
 gid_t nfsrv_defaultgid = GID_NOGROUP;
@@ -89,6 +93,10 @@ int nfsrv_maxpnfsmirror = 1;
 SYSCTL_INT(_vfs_nfs, OID_AUTO, pnfsmirror, CTLFLAG_RD,
     &nfsrv_maxpnfsmirror, 0, "Mirror level for pNFS service");
 
+int nfs_maxcopyrange = 10 * 1024 * 1024;
+SYSCTL_INT(_vfs_nfs, OID_AUTO, maxcopyrange, CTLFLAG_RW,
+    &nfs_maxcopyrange, 0, "Max size of a Copy so RPC times reasonable");
+
 /*
  * This array of structures indicates, for V4:
  * retfh - which of 3 types of calling args are used
@@ -106,7 +114,7 @@ SYSCTL_INT(_vfs_nfs, OID_AUTO, pnfsmirror, CTLFLAG_RD,
  * non-idempotent Ops.
  * Define it here, since it is used by both the client and server.
  */
-struct nfsv4_opflag nfsv4_opflag[NFSV41_NOPS] = {
+struct nfsv4_opflag nfsv4_opflag[NFSV42_NOPS] = {
 	{ 0, 0, 0, 0, LK_EXCLUSIVE, 1, 1 },		/* undef */
 	{ 0, 0, 0, 0, LK_EXCLUSIVE, 1, 1 },		/* undef */
 	{ 0, 0, 0, 0, LK_EXCLUSIVE, 1, 1 },		/* undef */
@@ -166,6 +174,23 @@ struct nfsv4_opflag nfsv4_opflag[NFSV41_NOPS] = {
 	{ 0, 0, 0, 0, LK_EXCLUSIVE, 1, 1 },		/* Want Delegation */
 	{ 0, 0, 0, 0, LK_EXCLUSIVE, 0, 0 },		/* Destroy ClientID */
 	{ 0, 0, 0, 0, LK_EXCLUSIVE, 1, 0 },		/* Reclaim Complete */
+	{ 0, 1, 1, 1, LK_EXCLUSIVE, 1, 0 },		/* Allocate */
+	{ 2, 1, 1, 0, LK_SHARED, 1, 0 },		/* Copy */
+	{ 0, 0, 0, 0, LK_EXCLUSIVE, 1, 1 },		/* Copy Notify */
+	{ 0, 0, 0, 0, LK_EXCLUSIVE, 1, 1 },		/* Deallocate */
+	{ 0, 1, 0, 0, LK_SHARED, 1, 0 },		/* IO Advise */
+	{ 0, 1, 0, 0, LK_EXCLUSIVE, 1, 0 },		/* Layout Error */
+	{ 0, 1, 0, 0, LK_EXCLUSIVE, 1, 0 },		/* Layout Stats */
+	{ 0, 0, 0, 0, LK_EXCLUSIVE, 1, 1 },		/* Offload Cancel */
+	{ 0, 0, 0, 0, LK_EXCLUSIVE, 1, 1 },		/* Offload Status */
+	{ 0, 0, 0, 0, LK_EXCLUSIVE, 1, 1 },		/* Read Plus */
+	{ 0, 1, 0, 0, LK_SHARED, 1, 0 },		/* Seek */
+	{ 0, 0, 0, 0, LK_EXCLUSIVE, 1, 1 },		/* Write Same */
+	{ 0, 0, 0, 0, LK_EXCLUSIVE, 1, 1 },		/* Clone */
+	{ 0, 1, 0, 0, LK_SHARED, 1, 1 },		/* Getxattr */
+	{ 0, 1, 1, 1, LK_EXCLUSIVE, 1, 1 },		/* Setxattr */
+	{ 0, 1, 0, 0, LK_SHARED, 1, 1 },		/* Listxattrs */
+	{ 0, 1, 1, 1, LK_EXCLUSIVE, 1, 1 },		/* Removexattr */
 };
 #endif	/* !APPLEKEXT */
 
@@ -190,16 +215,16 @@ static struct nfsrv_lughash	*nfsgroupnamehash;
  * marked 0 in this array, the code will still work, just not quite as
  * efficiently.)
  */
-static int nfs_bigreply[NFSV41_NPROCS] = { 0, 0, 0, 1, 0, 1, 1, 0, 0, 0, 0,
+static int nfs_bigreply[NFSV42_NPROCS] = { 0, 0, 0, 1, 0, 1, 1, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0 };
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+    1, 0, 0, 1 };
 
 /* local functions */
 static int nfsrv_skipace(struct nfsrv_descript *nd, int *acesizep);
 static void nfsv4_wanted(struct nfsv4lock *lp);
 static int nfsrv_cmpmixedcase(u_char *cp, u_char *cp2, int len);
-static int nfsrv_getuser(int procnum, uid_t uid, gid_t gid, char *name,
-    NFSPROC_T *p);
+static int nfsrv_getuser(int procnum, uid_t uid, gid_t gid, char *name);
 static void nfsrv_removeuser(struct nfsusrgrp *usrp, int isuser);
 static int nfsrv_getrefstr(struct nfsrv_descript *, u_char **, u_char **,
     int *, int *);
@@ -210,7 +235,7 @@ static struct {
 	int	opcnt;
 	const u_char *tag;
 	int	taglen;
-} nfsv4_opmap[NFSV41_NPROCS] = {
+} nfsv4_opmap[NFSV42_NPROCS] = {
 	{ 0, 1, "Null", 4 },
 	{ NFSV4OP_GETATTR, 1, "Getattr", 7, },
 	{ NFSV4OP_SETATTR, 2, "Setattr", 7, },
@@ -267,15 +292,24 @@ static struct {
 	{ NFSV4OP_COMMIT, 1, "CommitDS", 8, },
 	{ NFSV4OP_OPEN, 3, "OpenLayoutGet", 13, },
 	{ NFSV4OP_OPEN, 8, "CreateLayGet", 12, },
+	{ NFSV4OP_IOADVISE, 1, "Advise", 6, },
+	{ NFSV4OP_ALLOCATE, 2, "Allocate", 8, },
+	{ NFSV4OP_SAVEFH, 5, "Copy", 4, },
+	{ NFSV4OP_SEEK, 2, "Seek", 4, },
+	{ NFSV4OP_SEEK, 1, "SeekDS", 6, },
+	{ NFSV4OP_GETXATTR, 2, "Getxattr", 8, },
+	{ NFSV4OP_SETXATTR, 2, "Setxattr", 8, },
+	{ NFSV4OP_REMOVEXATTR, 2, "Rmxattr", 7, },
+	{ NFSV4OP_LISTXATTRS, 2, "Listxattr", 9, },
 };
 
 /*
  * NFS RPCS that have large request message size.
  */
-static int nfs_bigrequest[NFSV41_NPROCS] = {
+static int nfs_bigrequest[NFSV42_NPROCS] = {
 	0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0
+	0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0
 };
 
 /*
@@ -300,13 +334,17 @@ nfscl_reqstart(struct nfsrv_descript *nd, int procnum, struct nfsmount *nmp,
 		nd->nd_flag = ND_NFSV4 | ND_NFSCL;
 		if (minorvers == NFSV41_MINORVERSION)
 			nd->nd_flag |= ND_NFSV41;
+		else if (minorvers == NFSV42_MINORVERSION)
+			nd->nd_flag |= (ND_NFSV41 | ND_NFSV42);
 	} else if (vers == NFS_VER3)
 		nd->nd_flag = ND_NFSV3 | ND_NFSCL;
 	else {
 		if (NFSHASNFSV4(nmp)) {
 			nd->nd_flag = ND_NFSV4 | ND_NFSCL;
-			if (NFSHASNFSV4N(nmp))
+			if (nmp->nm_minorvers == 1)
 				nd->nd_flag |= ND_NFSV41;
+			else if (nmp->nm_minorvers == 2)
+				nd->nd_flag |= (ND_NFSV41 | ND_NFSV42);
 		} else if (NFSHASNFSV3(nmp))
 			nd->nd_flag = ND_NFSV3 | ND_NFSCL;
 		else
@@ -355,7 +393,9 @@ nfscl_reqstart(struct nfsrv_descript *nd, int procnum, struct nfsmount *nmp,
 		(void) nfsm_strtom(nd, nfsv4_opmap[procnum].tag,
 			nfsv4_opmap[procnum].taglen);
 		NFSM_BUILD(tl, u_int32_t *, 2 * NFSX_UNSIGNED);
-		if ((nd->nd_flag & ND_NFSV41) != 0)
+		if ((nd->nd_flag & ND_NFSV42) != 0)
+			*tl++ = txdr_unsigned(NFSV42_MINORVERSION);
+		else if ((nd->nd_flag & ND_NFSV41) != 0)
 			*tl++ = txdr_unsigned(NFSV41_MINORVERSION);
 		else
 			*tl++ = txdr_unsigned(NFSV4_MINORVERSION);
@@ -408,7 +448,7 @@ nfscl_reqstart(struct nfsrv_descript *nd, int procnum, struct nfsmount *nmp,
 	} else {
 		(void) nfsm_fhtom(nd, nfhp, fhlen, 0);
 	}
-	if (procnum < NFSV41_NPROCS)
+	if (procnum < NFSV42_NPROCS)
 		NFSINCRGLOBAL(nfsstatsv1.rpccnt[procnum]);
 }
 
@@ -898,15 +938,19 @@ nfsm_fhtom(struct nfsrv_descript *nd, u_int8_t *fhp, int size, int set_true)
 APPLESTATIC int
 nfsaddr_match(int family, union nethostaddr *haddr, NFSSOCKADDR_T nam)
 {
+#ifdef INET
 	struct sockaddr_in *inetaddr;
+#endif
 
 	switch (family) {
+#ifdef INET
 	case AF_INET:
 		inetaddr = NFSSOCKADDR(nam, struct sockaddr_in *);
 		if (inetaddr->sin_family == AF_INET &&
 		    inetaddr->sin_addr.s_addr == haddr->had_inet.s_addr)
 			return (1);
 		break;
+#endif
 #ifdef INET6
 	case AF_INET6:
 		{
@@ -1293,7 +1337,7 @@ nfsv4_loadattr(struct nfsrv_descript *nd, vnode_t vp,
 			if (error)
 			    goto nfsmout;
 			if (compare && !(*retcmpp)) {
-			   NFSSETSUPP_ATTRBIT(&checkattrbits);
+			   NFSSETSUPP_ATTRBIT(&checkattrbits, nd);
 
 			   /* Some filesystem do not support NFSv4ACL   */
 			   if (nfsrv_useacl == 0 || nfs_supportsnfsv4acls(vp) == 0) {
@@ -1820,12 +1864,12 @@ nfsv4_loadattr(struct nfsrv_descript *nd, vnode_t vp,
 			}
 			if (compare) {
 			    if (!(*retcmpp)) {
-				if (nfsv4_strtouid(nd, cp, j, &uid, p) ||
+				if (nfsv4_strtouid(nd, cp, j, &uid) ||
 				    nap->na_uid != uid)
 				    *retcmpp = NFSERR_NOTSAME;
 			    }
 			} else if (nap != NULL) {
-				if (nfsv4_strtouid(nd, cp, j, &uid, p))
+				if (nfsv4_strtouid(nd, cp, j, &uid))
 					nap->na_uid = nfsrv_defaultuid;
 				else
 					nap->na_uid = uid;
@@ -1853,12 +1897,12 @@ nfsv4_loadattr(struct nfsrv_descript *nd, vnode_t vp,
 			}
 			if (compare) {
 			    if (!(*retcmpp)) {
-				if (nfsv4_strtogid(nd, cp, j, &gid, p) ||
+				if (nfsv4_strtogid(nd, cp, j, &gid) ||
 				    nap->na_gid != gid)
 				    *retcmpp = NFSERR_NOTSAME;
 			    }
 			} else if (nap != NULL) {
-				if (nfsv4_strtogid(nd, cp, j, &gid, p))
+				if (nfsv4_strtogid(nd, cp, j, &gid))
 					nap->na_gid = nfsrv_defaultgid;
 				else
 					nap->na_gid = gid;
@@ -2129,8 +2173,8 @@ nfsv4_loadattr(struct nfsrv_descript *nd, vnode_t vp,
 			if (error)
 			    goto nfsmout;
 			if (compare && !(*retcmpp)) {
-			   NFSSETSUPP_ATTRBIT(&checkattrbits);
-			   NFSCLRNOTSETABLE_ATTRBIT(&checkattrbits);
+			   NFSSETSUPP_ATTRBIT(&checkattrbits, nd);
+			   NFSCLRNOTSETABLE_ATTRBIT(&checkattrbits, nd);
 			   NFSCLRBIT_ATTRBIT(&checkattrbits,
 				NFSATTRBIT_TIMEACCESSSET);
 			   if (!NFSEQUAL_ATTRBIT(&retattrbits, &checkattrbits)
@@ -2444,6 +2488,8 @@ nfsv4_fillattr(struct nfsrv_descript *nd, struct mount *mp, vnode_t vp,
 	struct nfsfsinfo fsinf;
 	struct timespec temptime;
 	NFSACL_T *aclp, *naclp = NULL;
+	size_t atsiz;
+	bool xattrsupp;
 #ifdef QUOTA
 	struct dqblk dqb;
 	uid_t savuid;
@@ -2460,10 +2506,10 @@ nfsv4_fillattr(struct nfsrv_descript *nd, struct mount *mp, vnode_t vp,
 	 * reply call.
 	 */
 	if (p == NULL && cred == NULL) {
-		NFSCLRNOTSETABLE_ATTRBIT(retbitp);
+		NFSCLRNOTSETABLE_ATTRBIT(retbitp, nd);
 		aclp = saclp;
 	} else {
-		NFSCLRNOTFILLABLE_ATTRBIT(retbitp);
+		NFSCLRNOTFILLABLE_ATTRBIT(retbitp, nd);
 		naclp = acl_alloc(M_WAITOK);
 		aclp = naclp;
 	}
@@ -2518,6 +2564,18 @@ nfsv4_fillattr(struct nfsrv_descript *nd, struct mount *mp, vnode_t vp,
 		}
 	}
 
+	/* Check to see if Extended Attributes are supported. */
+	xattrsupp = false;
+	if (NFSISSET_ATTRBIT(retbitp, NFSATTRBIT_XATTRSUPPORT)) {
+		if (NFSVOPLOCK(vp, LK_SHARED) == 0) {
+			error = VOP_GETEXTATTR(vp, EXTATTR_NAMESPACE_USER,
+			    "xxx", NULL, &atsiz, cred, p);
+			NFSVOPUNLOCK(vp, 0);
+			if (error != EOPNOTSUPP)
+				xattrsupp = true;
+		}
+	}
+	
 	/*
 	 * Put out the attribute bitmap for the ones being filled in
 	 * and get the field for the number of attributes returned.
@@ -2533,7 +2591,7 @@ nfsv4_fillattr(struct nfsrv_descript *nd, struct mount *mp, vnode_t vp,
 	    if (NFSISSET_ATTRBIT(retbitp, bitpos)) {
 		switch (bitpos) {
 		case NFSATTRBIT_SUPPORTEDATTRS:
-			NFSSETSUPP_ATTRBIT(&attrbits);
+			NFSSETSUPP_ATTRBIT(&attrbits, nd);
 			if (nfsrv_useacl == 0 || ((cred != NULL || p != NULL)
 			    && supports_nfsv4acls == 0)) {
 			    NFSCLRBIT_ATTRBIT(&attrbits,NFSATTRBIT_ACLSUPPORT);
@@ -2743,14 +2801,14 @@ nfsv4_fillattr(struct nfsrv_descript *nd, struct mount *mp, vnode_t vp,
 			break;
 		case NFSATTRBIT_OWNER:
 			cp = namestr;
-			nfsv4_uidtostr(vap->va_uid, &cp, &siz, p);
+			nfsv4_uidtostr(vap->va_uid, &cp, &siz);
 			retnum += nfsm_strtom(nd, cp, siz);
 			if (cp != namestr)
 				free(cp, M_NFSSTRING);
 			break;
 		case NFSATTRBIT_OWNERGROUP:
 			cp = namestr;
-			nfsv4_gidtostr(vap->va_gid, &cp, &siz, p);
+			nfsv4_gidtostr(vap->va_gid, &cp, &siz);
 			retnum += nfsm_strtom(nd, cp, siz);
 			if (cp != namestr)
 				free(cp, M_NFSSTRING);
@@ -2935,8 +2993,8 @@ nfsv4_fillattr(struct nfsrv_descript *nd, struct mount *mp, vnode_t vp,
 			retnum += NFSX_HYPER;
 			break;
 		case NFSATTRBIT_SUPPATTREXCLCREAT:
-			NFSSETSUPP_ATTRBIT(&attrbits);
-			NFSCLRNOTSETABLE_ATTRBIT(&attrbits);
+			NFSSETSUPP_ATTRBIT(&attrbits, nd);
+			NFSCLRNOTSETABLE_ATTRBIT(&attrbits, nd);
 			NFSCLRBIT_ATTRBIT(&attrbits, NFSATTRBIT_TIMEACCESSSET);
 			retnum += nfsrv_putattrbit(nd, &attrbits);
 			break;
@@ -2965,6 +3023,14 @@ nfsv4_fillattr(struct nfsrv_descript *nd, struct mount *mp, vnode_t vp,
 		case NFSATTRBIT_LAYOUTBLKSIZE:
 			NFSM_BUILD(tl, u_int32_t *, NFSX_UNSIGNED);
 			*tl = txdr_unsigned(NFS_SRVMAXIO);
+			retnum += NFSX_UNSIGNED;
+			break;
+		case NFSATTRBIT_XATTRSUPPORT:
+			NFSM_BUILD(tl, u_int32_t *, NFSX_UNSIGNED);
+			if (xattrsupp)
+				*tl = newnfs_true;
+			else
+				*tl = newnfs_false;
 			retnum += NFSX_UNSIGNED;
 			break;
 		default:
@@ -3009,7 +3075,7 @@ nfsrv_putattrbit(struct nfsrv_descript *nd, nfsattrbit_t *attrbitp)
  * retlenp - pointer to length to be returned
  */
 APPLESTATIC void
-nfsv4_uidtostr(uid_t uid, u_char **cpp, int *retlenp, NFSPROC_T *p)
+nfsv4_uidtostr(uid_t uid, u_char **cpp, int *retlenp)
 {
 	int i;
 	struct nfsusrgrp *usrp;
@@ -3087,8 +3153,7 @@ tryagain:
 		}
 		mtx_unlock(&hp->mtx);
 		cnt++;
-		ret = nfsrv_getuser(RPCNFSUSERD_GETUID, uid, (gid_t)0,
-		    NULL, p);
+		ret = nfsrv_getuser(RPCNFSUSERD_GETUID, uid, (gid_t)0, NULL);
 		if (ret == 0 && cnt < 2)
 			goto tryagain;
 	}
@@ -3151,8 +3216,7 @@ tryagain:
 		}
 		mtx_unlock(&hp->mtx);
 		cnt++;
-		ret = nfsrv_getuser(RPCNFSUSERD_GETUID, uid, (gid_t)0,
-		    NULL, curthread);
+		ret = nfsrv_getuser(RPCNFSUSERD_GETUID, uid, (gid_t)0, NULL);
 		if (ret == 0 && cnt < 2)
 			goto tryagain;
 	}
@@ -3168,8 +3232,7 @@ tryagain:
  * a number.
  */
 APPLESTATIC int
-nfsv4_strtouid(struct nfsrv_descript *nd, u_char *str, int len, uid_t *uidp,
-    NFSPROC_T *p)
+nfsv4_strtouid(struct nfsrv_descript *nd, u_char *str, int len, uid_t *uidp)
 {
 	int i;
 	char *cp, *endstr, *str0;
@@ -3252,7 +3315,7 @@ tryagain:
 		mtx_unlock(&hp->mtx);
 		cnt++;
 		ret = nfsrv_getuser(RPCNFSUSERD_GETUSER, (uid_t)0, (gid_t)0,
-		    str, p);
+		    str);
 		if (ret == 0 && cnt < 2)
 			goto tryagain;
 	}
@@ -3271,7 +3334,7 @@ out:
  * retlenp - pointer to length to be returned
  */
 APPLESTATIC void
-nfsv4_gidtostr(gid_t gid, u_char **cpp, int *retlenp, NFSPROC_T *p)
+nfsv4_gidtostr(gid_t gid, u_char **cpp, int *retlenp)
 {
 	int i;
 	struct nfsusrgrp *usrp;
@@ -3349,8 +3412,7 @@ tryagain:
 		}
 		mtx_unlock(&hp->mtx);
 		cnt++;
-		ret = nfsrv_getuser(RPCNFSUSERD_GETGID, (uid_t)0, gid,
-		    NULL, p);
+		ret = nfsrv_getuser(RPCNFSUSERD_GETGID, (uid_t)0, gid, NULL);
 		if (ret == 0 && cnt < 2)
 			goto tryagain;
 	}
@@ -3384,8 +3446,7 @@ tryagain:
  * a number.
  */
 APPLESTATIC int
-nfsv4_strtogid(struct nfsrv_descript *nd, u_char *str, int len, gid_t *gidp,
-    NFSPROC_T *p)
+nfsv4_strtogid(struct nfsrv_descript *nd, u_char *str, int len, gid_t *gidp)
 {
 	int i;
 	char *cp, *endstr, *str0;
@@ -3466,7 +3527,7 @@ tryagain:
 		mtx_unlock(&hp->mtx);
 		cnt++;
 		ret = nfsrv_getuser(RPCNFSUSERD_GETGROUP, (uid_t)0, (gid_t)0,
-		    str, p);
+		    str);
 		if (ret == 0 && cnt < 2)
 			goto tryagain;
 	}
@@ -3510,51 +3571,79 @@ nfsrv_cmpmixedcase(u_char *cp, u_char *cp2, int len)
  * Set the port for the nfsuserd.
  */
 APPLESTATIC int
-nfsrv_nfsuserdport(struct sockaddr *sad, u_short port, NFSPROC_T *p)
+nfsrv_nfsuserdport(struct nfsuserd_args *nargs, NFSPROC_T *p)
 {
 	struct nfssockreq *rp;
+#ifdef INET
 	struct sockaddr_in *ad;
+#endif
+#ifdef INET6
+	struct sockaddr_in6 *ad6;
+	const struct in6_addr in6loopback = IN6ADDR_LOOPBACK_INIT;
+#endif
 	int error;
 
 	NFSLOCKNAMEID();
-	if (nfsrv_nfsuserd) {
+	if (nfsrv_nfsuserd != NOTRUNNING) {
 		NFSUNLOCKNAMEID();
 		error = EPERM;
-		free(sad, M_SONAME);
 		goto out;
 	}
-	nfsrv_nfsuserd = 1;
-	NFSUNLOCKNAMEID();
+	nfsrv_nfsuserd = STARTSTOP;
 	/*
 	 * Set up the socket record and connect.
+	 * Set nr_client NULL before unlocking, just to ensure that no other
+	 * process/thread/core will use a bogus old value.  This could only
+	 * occur if the use of the nameid lock to protect nfsrv_nfsuserd is
+	 * broken.
 	 */
 	rp = &nfsrv_nfsuserdsock;
 	rp->nr_client = NULL;
-	rp->nr_cred = NULL;
+	NFSUNLOCKNAMEID();
+	rp->nr_sotype = SOCK_DGRAM;
+	rp->nr_soproto = IPPROTO_UDP;
 	rp->nr_lock = (NFSR_RESERVEDPORT | NFSR_LOCALHOST);
-	if (sad != NULL) {
-		/* Use the AF_LOCAL socket address passed in. */
-		rp->nr_sotype = SOCK_STREAM;
-		rp->nr_soproto = 0;
-		rp->nr_nam = sad;
-	} else {
-		/* Use the port# for a UDP socket (old nfsuserd). */
-		rp->nr_sotype = SOCK_DGRAM;
-		rp->nr_soproto = IPPROTO_UDP;
-		rp->nr_nam = malloc(sizeof(*rp->nr_nam), M_SONAME, M_WAITOK |
-		    M_ZERO);
-		NFSSOCKADDRSIZE(rp->nr_nam, sizeof (struct sockaddr_in));
-		ad = NFSSOCKADDR(rp->nr_nam, struct sockaddr_in *);
-		ad->sin_family = AF_INET;
-		ad->sin_addr.s_addr = htonl((u_int32_t)0x7f000001);
-		ad->sin_port = port;
-	}
+	rp->nr_cred = NULL;
 	rp->nr_prog = RPCPROG_NFSUSERD;
+	error = 0;
+	switch (nargs->nuserd_family) {
+#ifdef INET
+	case AF_INET:
+		rp->nr_nam = malloc(sizeof(struct sockaddr_in), M_SONAME,
+		    M_WAITOK | M_ZERO);
+ 		ad = (struct sockaddr_in *)rp->nr_nam;
+		ad->sin_len = sizeof(struct sockaddr_in);
+ 		ad->sin_family = AF_INET;
+		ad->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		ad->sin_port = nargs->nuserd_port;
+		break;
+#endif
+#ifdef INET6
+	case AF_INET6:
+		rp->nr_nam = malloc(sizeof(struct sockaddr_in6), M_SONAME,
+		    M_WAITOK | M_ZERO);
+		ad6 = (struct sockaddr_in6 *)rp->nr_nam;
+		ad6->sin6_len = sizeof(struct sockaddr_in6);
+		ad6->sin6_family = AF_INET6;
+		ad6->sin6_addr = in6loopback;
+		ad6->sin6_port = nargs->nuserd_port;
+		break;
+#endif
+	default:
+		error = ENXIO;
+ 	}
 	rp->nr_vers = RPCNFSUSERD_VERS;
-	error = newnfs_connect(NULL, rp, NFSPROCCRED(p), p, 0);
-	if (error) {
+	if (error == 0)
+		error = newnfs_connect(NULL, rp, NFSPROCCRED(p), p, 0);
+	if (error == 0) {
+		NFSLOCKNAMEID();
+		nfsrv_nfsuserd = RUNNING;
+		NFSUNLOCKNAMEID();
+	} else {
 		free(rp->nr_nam, M_SONAME);
-		nfsrv_nfsuserd = 0;
+		NFSLOCKNAMEID();
+		nfsrv_nfsuserd = NOTRUNNING;
+		NFSUNLOCKNAMEID();
 	}
 out:
 	NFSEXITCODE(error);
@@ -3569,14 +3658,21 @@ nfsrv_nfsuserddelport(void)
 {
 
 	NFSLOCKNAMEID();
-	if (nfsrv_nfsuserd == 0) {
+	if (nfsrv_nfsuserd != RUNNING) {
 		NFSUNLOCKNAMEID();
 		return;
 	}
-	nfsrv_nfsuserd = 0;
+	nfsrv_nfsuserd = STARTSTOP;
+	/* Wait for all upcalls to complete. */
+	while (nfsrv_userdupcalls > 0)
+		msleep(&nfsrv_userdupcalls, NFSNAMEIDMUTEXPTR, PVFS,
+		    "nfsupcalls", 0);
 	NFSUNLOCKNAMEID();
 	newnfs_disconnect(&nfsrv_nfsuserdsock);
 	free(nfsrv_nfsuserdsock.nr_nam, M_SONAME);
+	NFSLOCKNAMEID();
+	nfsrv_nfsuserd = NOTRUNNING;
+	NFSUNLOCKNAMEID();
 }
 
 /*
@@ -3585,7 +3681,7 @@ nfsrv_nfsuserddelport(void)
  * Returns 0 upon success, non-zero otherwise.
  */
 static int
-nfsrv_getuser(int procnum, uid_t uid, gid_t gid, char *name, NFSPROC_T *p)
+nfsrv_getuser(int procnum, uid_t uid, gid_t gid, char *name)
 {
 	u_int32_t *tl;
 	struct nfsrv_descript *nd;
@@ -3595,12 +3691,19 @@ nfsrv_getuser(int procnum, uid_t uid, gid_t gid, char *name, NFSPROC_T *p)
 	int error;
 
 	NFSLOCKNAMEID();
-	if (nfsrv_nfsuserd == 0) {
+	if (nfsrv_nfsuserd != RUNNING) {
 		NFSUNLOCKNAMEID();
 		error = EPERM;
 		goto out;
 	}
+	/*
+	 * Maintain a count of upcalls in progress, so that nfsrv_X()
+	 * can wait until no upcalls are in progress.
+	 */
+	nfsrv_userdupcalls++;
 	NFSUNLOCKNAMEID();
+	KASSERT(nfsrv_userdupcalls > 0,
+	    ("nfsrv_getuser: non-positive upcalls"));
 	nd = &nfsd;
 	cred = newnfs_getcred();
 	nd->nd_flag = ND_GSSINITREPLY;
@@ -3619,6 +3722,10 @@ nfsrv_getuser(int procnum, uid_t uid, gid_t gid, char *name, NFSPROC_T *p)
 	}
 	error = newnfs_request(nd, NULL, NULL, &nfsrv_nfsuserdsock, NULL, NULL,
 		cred, RPCPROG_NFSUSERD, RPCNFSUSERD_VERS, NULL, 0, NULL, NULL);
+	NFSLOCKNAMEID();
+	if (--nfsrv_userdupcalls == 0 && nfsrv_nfsuserd == STARTSTOP)
+		wakeup(&nfsrv_userdupcalls);
+	NFSUNLOCKNAMEID();
 	NFSFREECRED(cred);
 	if (!error) {
 		mbuf_freem(nd->nd_mrep);
@@ -4583,6 +4690,8 @@ nfsv4_setsequence(struct nfsmount *nmp, struct nfsrv_descript *nd,
 
 	error = nfsv4_sequencelookup(nmp, sep, &slotpos, &maxslot, &slotseq,
 	    sessionid);
+	nd->nd_maxreq = sep->nfsess_maxreq;
+	nd->nd_maxresp = sep->nfsess_maxresp;
 
 	/* Build the Sequence arguments. */
 	NFSM_BUILD(tl, uint32_t *, NFSX_V4SESSIONID + 4 * NFSX_UNSIGNED);

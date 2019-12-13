@@ -1,20 +1,14 @@
 //===-- ThreadPlanPython.cpp ------------------------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
 #include "lldb/Target/ThreadPlan.h"
 
-// C Includes
-// C++ Includes
-// Other libraries and framework includes
-// Project includes
 #include "lldb/Core/Debugger.h"
-#include "lldb/Core/State.h"
 #include "lldb/Interpreter/CommandInterpreter.h"
 #include "lldb/Interpreter/ScriptInterpreter.h"
 #include "lldb/Target/Process.h"
@@ -24,18 +18,17 @@
 #include "lldb/Target/ThreadPlan.h"
 #include "lldb/Target/ThreadPlanPython.h"
 #include "lldb/Utility/Log.h"
+#include "lldb/Utility/State.h"
 
 using namespace lldb;
 using namespace lldb_private;
 
-//----------------------------------------------------------------------
 // ThreadPlanPython
-//----------------------------------------------------------------------
 
 ThreadPlanPython::ThreadPlanPython(Thread &thread, const char *class_name)
     : ThreadPlan(ThreadPlan::eKindPython, "Python based Thread Plan", thread,
                  eVoteNoOpinion, eVoteNoOpinion),
-      m_class_name(class_name) {
+      m_class_name(class_name), m_did_push(false) {
   SetIsMasterPlan(true);
   SetOkayToDiscard(true);
   SetPrivate(false);
@@ -47,25 +40,26 @@ ThreadPlanPython::~ThreadPlanPython() {
 }
 
 bool ThreadPlanPython::ValidatePlan(Stream *error) {
-  // I have to postpone setting up the implementation till after the constructor
-  // because I need to call
-  // shared_from_this, which you can't do in the constructor.  So I'll do it
-  // here.
-  if (m_implementation_sp)
+  if (!m_did_push)
     return true;
-  else
+
+  if (!m_implementation_sp) {
+    if (error)
+      error->Printf("Python thread plan does not have an implementation");
     return false;
+  }
+
+  return true;
 }
 
 void ThreadPlanPython::DidPush() {
   // We set up the script side in DidPush, so that it can push other plans in
   // the constructor, and doesn't have to care about the details of DidPush.
-
+  m_did_push = true;
   if (!m_class_name.empty()) {
     ScriptInterpreter *script_interp = m_thread.GetProcess()
                                            ->GetTarget()
                                            .GetDebugger()
-                                           .GetCommandInterpreter()
                                            .GetScriptInterpreter();
     if (script_interp) {
       m_implementation_sp = script_interp->CreateScriptedThreadPlan(
@@ -85,7 +79,6 @@ bool ThreadPlanPython::ShouldStop(Event *event_ptr) {
     ScriptInterpreter *script_interp = m_thread.GetProcess()
                                            ->GetTarget()
                                            .GetDebugger()
-                                           .GetCommandInterpreter()
                                            .GetScriptInterpreter();
     if (script_interp) {
       bool script_error;
@@ -109,7 +102,6 @@ bool ThreadPlanPython::IsPlanStale() {
     ScriptInterpreter *script_interp = m_thread.GetProcess()
                                            ->GetTarget()
                                            .GetDebugger()
-                                           .GetCommandInterpreter()
                                            .GetScriptInterpreter();
     if (script_interp) {
       bool script_error;
@@ -133,7 +125,6 @@ bool ThreadPlanPython::DoPlanExplainsStop(Event *event_ptr) {
     ScriptInterpreter *script_interp = m_thread.GetProcess()
                                            ->GetTarget()
                                            .GetDebugger()
-                                           .GetCommandInterpreter()
                                            .GetScriptInterpreter();
     if (script_interp) {
       bool script_error;
@@ -172,7 +163,6 @@ lldb::StateType ThreadPlanPython::GetPlanRunState() {
     ScriptInterpreter *script_interp = m_thread.GetProcess()
                                            ->GetTarget()
                                            .GetDebugger()
-                                           .GetCommandInterpreter()
                                            .GetScriptInterpreter();
     if (script_interp) {
       bool script_error;

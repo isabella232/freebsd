@@ -110,6 +110,7 @@
 
 #define MD_SHUTDOWN	0x10000		/* Tell worker thread to terminate. */
 #define	MD_EXITING	0x20000		/* Worker thread is exiting. */
+#define MD_PROVIDERGONE	0x40000		/* Safe to free the softc */
 
 #ifndef MD_NSECT
 #define MD_NSECT (10000 * 2)
@@ -150,7 +151,6 @@ CTASSERT((sizeof(struct md_ioctl32)) == 436);
 #define	MDIOCATTACH_32	_IOC_NEWTYPE(MDIOCATTACH, struct md_ioctl32)
 #define	MDIOCDETACH_32	_IOC_NEWTYPE(MDIOCDETACH, struct md_ioctl32)
 #define	MDIOCQUERY_32	_IOC_NEWTYPE(MDIOCQUERY, struct md_ioctl32)
-#define	MDIOCLIST_32	_IOC_NEWTYPE(MDIOCLIST, struct md_ioctl32)
 #define	MDIOCRESIZE_32	_IOC_NEWTYPE(MDIOCRESIZE, struct md_ioctl32)
 #endif /* COMPAT_FREEBSD32 */
 
@@ -199,6 +199,7 @@ static g_start_t g_md_start;
 static g_access_t g_md_access;
 static void g_md_dumpconf(struct sbuf *sb, const char *indent,
     struct g_geom *gp, struct g_consumer *cp __unused, struct g_provider *pp);
+static g_provgone_t g_md_providergone;
 
 static struct cdev *status_dev = NULL;
 static struct sx md_sx;
@@ -220,6 +221,7 @@ struct g_class g_md_class = {
 	.start = g_md_start,
 	.access = g_md_access,
 	.dumpconf = g_md_dumpconf,
+	.providergone = g_md_providergone,
 };
 
 DECLARE_GEOM_CLASS(g_md_class, g_md);
@@ -231,7 +233,7 @@ static LIST_HEAD(, md_s) md_softc_list = LIST_HEAD_INITIALIZER(md_softc_list);
 #define NMASK	(NINDIR-1)
 static int nshift;
 
-static int md_vnode_pbuf_freecnt;
+static uma_zone_t md_pbuf_zone;
 
 struct indir {
 	uintptr_t	*array;
@@ -481,8 +483,8 @@ g_md_start(struct bio *bp)
 	}
 	mtx_lock(&sc->queue_mtx);
 	bioq_disksort(&sc->bio_queue, bp);
-	mtx_unlock(&sc->queue_mtx);
 	wakeup(sc);
+	mtx_unlock(&sc->queue_mtx);
 }
 
 #define	MD_MALLOC_MOVE_ZERO	1
@@ -962,7 +964,7 @@ mdstart_vnode(struct md_s *sc, struct bio *bp)
 		auio.uio_iovcnt = piov - auio.uio_iov;
 		piov = auio.uio_iov;
 	} else if ((bp->bio_flags & BIO_UNMAPPED) != 0) {
-		pb = getpbuf(&md_vnode_pbuf_freecnt);
+		pb = uma_zalloc(md_pbuf_zone, M_WAITOK);
 		bp->bio_resid = len;
 unmapped_step:
 		npages = atop(min(MAXPHYS, round_page(len + (ma_offs &
@@ -1013,23 +1015,13 @@ unmapped_step:
 			if (len > 0)
 				goto unmapped_step;
 		}
-		relpbuf(pb, &md_vnode_pbuf_freecnt);
+		uma_zfree(md_pbuf_zone, pb);
 	}
 
 	free(piov, M_MD);
 	if (pb == NULL)
 		bp->bio_resid = auio.uio_resid;
 	return (error);
-}
-
-static void
-md_swap_page_free(vm_page_t m)
-{
-
-	vm_page_xunbusy(m);
-	vm_page_lock(m);
-	vm_page_free(m);
-	vm_page_unlock(m);
 }
 
 static int
@@ -1074,13 +1066,13 @@ mdstart_swap(struct md_s *sc, struct bio *bp)
 		len = ((i == lastp) ? lastend : PAGE_SIZE) - offs;
 		m = vm_page_grab(sc->object, i, VM_ALLOC_SYSTEM);
 		if (bp->bio_cmd == BIO_READ) {
-			if (m->valid == VM_PAGE_BITS_ALL)
+			if (vm_page_all_valid(m))
 				rv = VM_PAGER_OK;
 			else
 				rv = vm_pager_get_pages(sc->object, &m, 1,
 				    NULL, NULL);
 			if (rv == VM_PAGER_ERROR) {
-				md_swap_page_free(m);
+				vm_page_free(m);
 				break;
 			} else if (rv == VM_PAGER_FAIL) {
 				/*
@@ -1090,7 +1082,7 @@ mdstart_swap(struct md_s *sc, struct bio *bp)
 				 * can be recreated if thrown out.
 				 */
 				pmap_zero_page(m);
-				m->valid = VM_PAGE_BITS_ALL;
+				vm_page_valid(m);
 			}
 			if ((bp->bio_flags & BIO_UNMAPPED) != 0) {
 				pmap_copy_pages(&m, offs, bp->bio_ma,
@@ -1104,13 +1096,13 @@ mdstart_swap(struct md_s *sc, struct bio *bp)
 				cpu_flush_dcache(p, len);
 			}
 		} else if (bp->bio_cmd == BIO_WRITE) {
-			if (len == PAGE_SIZE || m->valid == VM_PAGE_BITS_ALL)
+			if (len == PAGE_SIZE || vm_page_all_valid(m))
 				rv = VM_PAGER_OK;
 			else
 				rv = vm_pager_get_pages(sc->object, &m, 1,
 				    NULL, NULL);
 			if (rv == VM_PAGER_ERROR) {
-				md_swap_page_free(m);
+				vm_page_free(m);
 				break;
 			} else if (rv == VM_PAGER_FAIL)
 				pmap_zero_page(m);
@@ -1125,22 +1117,22 @@ mdstart_swap(struct md_s *sc, struct bio *bp)
 				physcopyin(p, VM_PAGE_TO_PHYS(m) + offs, len);
 			}
 
-			m->valid = VM_PAGE_BITS_ALL;
+			vm_page_valid(m);
 			if (m->dirty != VM_PAGE_BITS_ALL) {
 				vm_page_dirty(m);
 				vm_pager_page_unswapped(m);
 			}
 		} else if (bp->bio_cmd == BIO_DELETE) {
-			if (len == PAGE_SIZE || m->valid == VM_PAGE_BITS_ALL)
+			if (len == PAGE_SIZE || vm_page_all_valid(m))
 				rv = VM_PAGER_OK;
 			else
 				rv = vm_pager_get_pages(sc->object, &m, 1,
 				    NULL, NULL);
 			if (rv == VM_PAGER_ERROR) {
-				md_swap_page_free(m);
+				vm_page_free(m);
 				break;
 			} else if (rv == VM_PAGER_FAIL) {
-				md_swap_page_free(m);
+				vm_page_free(m);
 				m = NULL;
 			} else {
 				/* Page is valid. */
@@ -1152,7 +1144,7 @@ mdstart_swap(struct md_s *sc, struct bio *bp)
 					}
 				} else {
 					vm_pager_page_unswapped(m);
-					md_swap_page_free(m);
+					vm_page_free(m);
 					m = NULL;
 				}
 			}
@@ -1461,7 +1453,7 @@ mdcreate_vnode(struct md_s *sc, struct md_req *mdr, struct thread *td)
 		goto bad;
 	if (VOP_ISLOCKED(nd.ni_vp) != LK_EXCLUSIVE) {
 		vn_lock(nd.ni_vp, LK_UPGRADE | LK_RETRY);
-		if (nd.ni_vp->v_iflag & VI_DOOMED) {
+		if (VN_IS_DOOMED(nd.ni_vp)) {
 			/* Forced unmount. */
 			error = EBADF;
 			goto bad;
@@ -1496,17 +1488,30 @@ bad:
 	return (error);
 }
 
+static void
+g_md_providergone(struct g_provider *pp)
+{
+	struct md_s *sc = pp->geom->softc;
+
+	mtx_lock(&sc->queue_mtx);
+	sc->flags |= MD_PROVIDERGONE;
+	wakeup(&sc->flags);
+	mtx_unlock(&sc->queue_mtx);
+}
+
 static int
 mddestroy(struct md_s *sc, struct thread *td)
 {
 
 	if (sc->gp) {
-		sc->gp->softc = NULL;
 		g_topology_lock();
 		g_wither_geom(sc->gp, ENXIO);
 		g_topology_unlock();
-		sc->gp = NULL;
-		sc->pp = NULL;
+
+		mtx_lock(&sc->queue_mtx);
+		while (!(sc->flags & MD_PROVIDERGONE))
+			msleep(&sc->flags, &sc->queue_mtx, PRIBIO, "mddestroy", 0);
+		mtx_unlock(&sc->queue_mtx);
 	}
 	if (sc->devstat) {
 		devstat_remove_entry(sc->devstat);
@@ -1860,48 +1865,6 @@ kern_mdquery(struct md_req *mdr)
 	return (error);
 }
 
-static int
-kern_mdlist_locked(struct md_req *mdr)
-{
-	struct md_s *sc;
-	int i;
-
-	sx_assert(&md_sx, SA_XLOCKED);
-
-	/*
-	 * Write the number of md devices to mdr->md_units[0].
-	 * Write the unit number of the first (mdr->md_units_nitems - 2)
-	 * units to mdr->md_units[1::(mdr->md_units - 2)] and terminate the
-	 * list with -1.
-	 *
-	 * XXX: There is currently no mechanism to retrieve unit
-	 * numbers for more than (MDNPAD - 2) units.
-	 *
-	 * XXX: Due to the use of LIST_INSERT_HEAD in mdnew(), the
-	 * list of visible unit numbers not stable.
-	 */
-	i = 1;
-	LIST_FOREACH(sc, &md_softc_list, list) {
-		if (i < mdr->md_units_nitems - 1)
-			mdr->md_units[i] = sc->unit;
-		i++;
-	}
-	mdr->md_units[MIN(i, mdr->md_units_nitems - 1)] = -1;
-	mdr->md_units[0] = i - 1;
-	return (0);
-}
-
-static int
-kern_mdlist(struct md_req *mdr)
-{
-	int error;
-
-	sx_xlock(&md_sx);
-	error = kern_mdlist_locked(mdr);
-	sx_xunlock(&md_sx);
-	return (error);
-}
-
 /* Copy members that are not userspace pointers. */
 #define	MD_IOCTL2REQ(mdio, mdr) do {					\
 	(mdr)->md_unit = (mdio)->md_unit;				\
@@ -1942,8 +1905,7 @@ mdctlioctl(struct cdev *dev, u_long cmd, caddr_t addr, int flags,
 	case MDIOCATTACH:
 	case MDIOCDETACH:
 	case MDIOCRESIZE:
-	case MDIOCQUERY:
-	case MDIOCLIST: {
+	case MDIOCQUERY: {
 		struct md_ioctl *mdio = (struct md_ioctl *)addr;
 		if (mdio->md_version != MDIOVERSION)
 			return (EINVAL);
@@ -1960,8 +1922,7 @@ mdctlioctl(struct cdev *dev, u_long cmd, caddr_t addr, int flags,
 	case MDIOCATTACH_32:
 	case MDIOCDETACH_32:
 	case MDIOCRESIZE_32:
-	case MDIOCQUERY_32:
-	case MDIOCLIST_32: {
+	case MDIOCQUERY_32: {
 		struct md_ioctl32 *mdio = (struct md_ioctl32 *)addr;
 		if (mdio->md_version != MDIOVERSION)
 			return (EINVAL);
@@ -2002,12 +1963,6 @@ mdctlioctl(struct cdev *dev, u_long cmd, caddr_t addr, int flags,
 	case MDIOCQUERY_32:
 #endif
 		error = kern_mdquery(&mdr);
-		break;
-	case MDIOCLIST:
-#ifdef COMPAT_FREEBSD32
-	case MDIOCLIST_32:
-#endif
-		error = kern_mdlist(&mdr);
 		break;
 	default:
 		error = ENOIOCTL;
@@ -2118,7 +2073,7 @@ g_md_init(struct g_class *mp __unused)
 			sx_xunlock(&md_sx);
 		}
 	}
-	md_vnode_pbuf_freecnt = nswbuf / 10;
+	md_pbuf_zone = pbuf_zsecond_create("mdpbuf", nswbuf / 10);
 	status_dev = make_dev(&mdctl_cdevsw, INT_MAX, UID_ROOT, GID_WHEEL,
 	    0600, MDCTL_NAME);
 	g_topology_lock();
@@ -2214,5 +2169,6 @@ g_md_fini(struct g_class *mp __unused)
 	sx_destroy(&md_sx);
 	if (status_dev != NULL)
 		destroy_dev(status_dev);
+	uma_zdestroy(md_pbuf_zone);
 	delete_unrhdr(md_uh);
 }

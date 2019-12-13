@@ -35,6 +35,7 @@
 
 #include <sys/kernel.h>
 #include <sys/bus.h>
+#include <sys/counter.h>
 #include <sys/rman.h>
 #include <sys/types.h>
 #include <sys/lock.h>
@@ -155,9 +156,10 @@ enum {
 	CHK_MBOX_ACCESS	= (1 << 2),
 	MASTER_PF	= (1 << 3),
 	ADAP_SYSCTL_CTX	= (1 << 4),
-	/* TOM_INIT_DONE= (1 << 5),	No longer used */
+	ADAP_ERR	= (1 << 5),
 	BUF_PACKING_OK	= (1 << 6),
 	IS_VF		= (1 << 7),
+	KERN_TLS_OK	= (1 << 8),
 
 	CXGBE_BUSY	= (1 << 9),
 
@@ -175,6 +177,7 @@ enum {
 	DF_LOAD_FW_ANYTIME	= (1 << 1),	/* Allow LOAD_FW after init */
 	DF_DISABLE_TCB_CACHE	= (1 << 2),	/* Disable TCB cache (T6+) */
 	DF_DISABLE_CFG_RETRY	= (1 << 3),	/* Disable fallback config */
+	DF_VERBOSE_SLOWINTR	= (1 << 4),	/* Chatty slow intr handler */
 };
 
 #define IS_DOOMED(vi)	((vi)->flags & DOOMED)
@@ -193,8 +196,10 @@ struct vi_info {
 	int if_flags;
 
 	uint16_t *rss, *nm_rss;
-	int smt_idx;		/* for convenience */
-	uint16_t viid;
+	uint16_t viid;		/* opaque VI identifier */
+	uint16_t smt_idx;
+	uint16_t vin;
+	uint8_t vfvld;
 	int16_t  xact_addr_filt;/* index of exact MAC address filter */
 	uint16_t rss_size;	/* size of VI's RSS table slice */
 	uint16_t rss_base;	/* start of VI's RSS table slice */
@@ -377,7 +382,7 @@ enum {
 	CPL_COOKIE_TOM,
 	CPL_COOKIE_HASHFILTER,
 	CPL_COOKIE_ETHOFLD,
-	CPL_COOKIE_AVAILABLE3,
+	CPL_COOKIE_KERN_TLS,
 
 	NUM_CPL_COOKIES = 8	/* Limited by M_COOKIE.  Do not increase. */
 };
@@ -579,8 +584,25 @@ struct sge_txq {
 	uint64_t txpkts0_pkts;	/* # of frames in type0 coalesced tx WRs */
 	uint64_t txpkts1_pkts;	/* # of frames in type1 coalesced tx WRs */
 	uint64_t raw_wrs;	/* # of raw work requests (alloc_wr_mbuf) */
+	uint64_t tls_wrs;	/* # of TLS work requests */
+
+	uint64_t kern_tls_records;
+	uint64_t kern_tls_short;
+	uint64_t kern_tls_partial;
+	uint64_t kern_tls_full;
+	uint64_t kern_tls_octets;
+	uint64_t kern_tls_waste;
+	uint64_t kern_tls_options;
+	uint64_t kern_tls_header;
+	uint64_t kern_tls_fin;
+	uint64_t kern_tls_fin_short;
+	uint64_t kern_tls_cbc;
+	uint64_t kern_tls_gcm;
 
 	/* stats for not-that-common events */
+
+	/* Optional scratch space for constructing work requests. */
+	uint8_t ss[SGE_MAX_WR_LEN] __aligned(16);
 } __aligned(CACHE_LINE_SIZE);
 
 /* rxq: SGE ingress queue + SGE free list + miscellaneous items */
@@ -721,6 +743,7 @@ struct sge_nm_txq {
 	u_int udb_qid;
 	u_int cntxt_id;
 	__be32 cpl_ctrl0;	/* for convenience */
+	__be32 op_pkd;		/* ditto */
 	u_int nid;		/* netmap ring # for this queue */
 
 	/* infrequently used items after this */
@@ -837,6 +860,7 @@ struct adapter {
 	struct smt_data *smt;	/* Source MAC Table */
 	struct tid_info tids;
 	vmem_t *key_map;
+	struct tls_tunables tlst;
 
 	uint8_t doorbells;
 	int offload_map;	/* ports with IFCAP_TOE enabled */
@@ -892,6 +916,11 @@ struct adapter {
 	const char *last_op;
 	const void *last_op_thr;
 	int last_op_flags;
+
+	int swintr;
+	int sensor_resets;
+
+	struct callout ktls_tick;
 };
 
 #define ADAPTER_LOCK(sc)		mtx_lock(&(sc)->sc_lock)
@@ -931,24 +960,6 @@ struct adapter {
 #define TXQ_UNLOCK(txq)			EQ_UNLOCK(&(txq)->eq)
 #define TXQ_LOCK_ASSERT_OWNED(txq)	EQ_LOCK_ASSERT_OWNED(&(txq)->eq)
 #define TXQ_LOCK_ASSERT_NOTOWNED(txq)	EQ_LOCK_ASSERT_NOTOWNED(&(txq)->eq)
-
-#define CH_DUMP_MBOX(sc, mbox, data_reg) \
-	do { \
-		if (sc->debug_flags & DF_DUMP_MBOX) { \
-			log(LOG_NOTICE, \
-			    "%s mbox %u: %016llx %016llx %016llx %016llx " \
-			    "%016llx %016llx %016llx %016llx\n", \
-			    device_get_nameunit(sc->dev), mbox, \
-			    (unsigned long long)t4_read_reg64(sc, data_reg), \
-			    (unsigned long long)t4_read_reg64(sc, data_reg + 8), \
-			    (unsigned long long)t4_read_reg64(sc, data_reg + 16), \
-			    (unsigned long long)t4_read_reg64(sc, data_reg + 24), \
-			    (unsigned long long)t4_read_reg64(sc, data_reg + 32), \
-			    (unsigned long long)t4_read_reg64(sc, data_reg + 40), \
-			    (unsigned long long)t4_read_reg64(sc, data_reg + 48), \
-			    (unsigned long long)t4_read_reg64(sc, data_reg + 56)); \
-		} \
-	} while (0)
 
 #define for_each_txq(vi, iter, q) \
 	for (q = &vi->pi->adapter->sge.txq[vi->first_txq], iter = 0; \
@@ -1105,6 +1116,38 @@ t4_use_ldst(struct adapter *sc)
 #endif
 }
 
+static inline void
+CH_DUMP_MBOX(struct adapter *sc, int mbox, const int reg,
+    const char *msg, const __be64 *const p, const bool err)
+{
+
+	if (!(sc->debug_flags & DF_DUMP_MBOX) && !err)
+		return;
+	if (p != NULL) {
+		log(err ? LOG_ERR : LOG_DEBUG,
+		    "%s: mbox %u %s %016llx %016llx %016llx %016llx "
+		    "%016llx %016llx %016llx %016llx\n",
+		    device_get_nameunit(sc->dev), mbox, msg,
+		    (long long)be64_to_cpu(p[0]), (long long)be64_to_cpu(p[1]),
+		    (long long)be64_to_cpu(p[2]), (long long)be64_to_cpu(p[3]),
+		    (long long)be64_to_cpu(p[4]), (long long)be64_to_cpu(p[5]),
+		    (long long)be64_to_cpu(p[6]), (long long)be64_to_cpu(p[7]));
+	} else {
+		log(err ? LOG_ERR : LOG_DEBUG,
+		    "%s: mbox %u %s %016llx %016llx %016llx %016llx "
+		    "%016llx %016llx %016llx %016llx\n",
+		    device_get_nameunit(sc->dev), mbox, msg,
+		    (long long)t4_read_reg64(sc, reg),
+		    (long long)t4_read_reg64(sc, reg + 8),
+		    (long long)t4_read_reg64(sc, reg + 16),
+		    (long long)t4_read_reg64(sc, reg + 24),
+		    (long long)t4_read_reg64(sc, reg + 32),
+		    (long long)t4_read_reg64(sc, reg + 40),
+		    (long long)t4_read_reg64(sc, reg + 48),
+		    (long long)t4_read_reg64(sc, reg + 56));
+	}
+}
+
 /* t4_main.c */
 extern int t4_ntxq;
 extern int t4_nrxq;
@@ -1123,7 +1166,6 @@ void t4_os_link_changed(struct port_info *);
 void t4_iterate(void (*)(struct adapter *, void *), void *);
 void t4_init_devnames(struct adapter *);
 void t4_add_adapter(struct adapter *);
-void t4_aes_getdeckey(void *, const void *, unsigned int);
 int t4_detach_common(device_t);
 int t4_map_bars_0_and_4(struct adapter *);
 int t4_map_bar_2(struct adapter *);
@@ -1136,19 +1178,41 @@ int update_mac_settings(struct ifnet *, int);
 int adapter_full_init(struct adapter *);
 int adapter_full_uninit(struct adapter *);
 uint64_t cxgbe_get_counter(struct ifnet *, ift_counter);
+void cxgbe_snd_tag_init(struct cxgbe_snd_tag *, struct ifnet *, int);
 int vi_full_init(struct vi_info *);
 int vi_full_uninit(struct vi_info *);
 void vi_sysctls(struct vi_info *);
 void vi_tick(void *);
 int rw_via_memwin(struct adapter *, int, uint32_t, uint32_t *, int, int);
-int alloc_atid_tab(struct tid_info *, int);
-void free_atid_tab(struct tid_info *);
 int alloc_atid(struct adapter *, void *);
 void *lookup_atid(struct adapter *, int);
 void free_atid(struct adapter *, int);
 void release_tid(struct adapter *, int, struct sge_wrq *);
 int cxgbe_media_change(struct ifnet *);
 void cxgbe_media_status(struct ifnet *, struct ifmediareq *);
+bool t4_os_dump_cimla(struct adapter *, int, bool);
+void t4_os_dump_devlog(struct adapter *);
+
+#ifdef KERN_TLS
+/* t4_kern_tls.c */
+int cxgbe_tls_tag_alloc(struct ifnet *, union if_snd_tag_alloc_params *,
+    struct m_snd_tag **);
+void cxgbe_tls_tag_free(struct m_snd_tag *);
+void t6_ktls_modload(void);
+void t6_ktls_modunload(void);
+int t6_ktls_try(struct ifnet *, struct socket *, struct ktls_session *);
+int t6_ktls_parse_pkt(struct mbuf *, int *, int *);
+int t6_ktls_write_wr(struct sge_txq *, void *, struct mbuf *, u_int, u_int);
+#endif
+
+/* t4_keyctx.c */
+struct auth_hash;
+union authctx;
+
+void t4_aes_getdeckey(void *, const void *, unsigned int);
+void t4_copy_partial_hash(int, union authctx *, void *);
+void t4_init_gmac_hash(const char *, int, char *);
+void t4_init_hmac_digest(struct auth_hash *, u_int, char *, int, char *);
 
 #ifdef DEV_NETMAP
 /* t4_netmap.c */
@@ -1193,7 +1257,7 @@ void t4_register_cpl_handler(int, cpl_handler_t);
 void t4_register_shared_cpl_handler(int, cpl_handler_t, int);
 #ifdef RATELIMIT
 int ethofld_transmit(struct ifnet *, struct mbuf *);
-void send_etid_flush_wr(struct cxgbe_snd_tag *);
+void send_etid_flush_wr(struct cxgbe_rate_tag *);
 #endif
 
 /* t4_tracer.c */
@@ -1219,13 +1283,14 @@ int sysctl_tc_params(SYSCTL_HANDLER_ARGS);
 #ifdef RATELIMIT
 void t4_init_etid_table(struct adapter *);
 void t4_free_etid_table(struct adapter *);
-struct cxgbe_snd_tag *lookup_etid(struct adapter *, int);
-int cxgbe_snd_tag_alloc(struct ifnet *, union if_snd_tag_alloc_params *,
+struct cxgbe_rate_tag *lookup_etid(struct adapter *, int);
+int cxgbe_rate_tag_alloc(struct ifnet *, union if_snd_tag_alloc_params *,
     struct m_snd_tag **);
-int cxgbe_snd_tag_modify(struct m_snd_tag *, union if_snd_tag_modify_params *);
-int cxgbe_snd_tag_query(struct m_snd_tag *, union if_snd_tag_query_params *);
-void cxgbe_snd_tag_free(struct m_snd_tag *);
-void cxgbe_snd_tag_free_locked(struct cxgbe_snd_tag *);
+int cxgbe_rate_tag_modify(struct m_snd_tag *, union if_snd_tag_modify_params *);
+int cxgbe_rate_tag_query(struct m_snd_tag *, union if_snd_tag_query_params *);
+void cxgbe_rate_tag_free(struct m_snd_tag *);
+void cxgbe_rate_tag_free_locked(struct cxgbe_rate_tag *);
+void cxgbe_ratelimit_query(struct ifnet *, struct if_ratelimit_query_results *);
 #endif
 
 /* t4_filter.c */

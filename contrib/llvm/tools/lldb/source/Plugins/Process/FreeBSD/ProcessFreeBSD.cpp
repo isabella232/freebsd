@@ -1,14 +1,12 @@
 //===-- ProcessFreeBSD.cpp ----------------------------------------*- C++
 //-*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
-// C Includes
 #include <errno.h>
 #include <pthread.h>
 #include <pthread_np.h>
@@ -18,18 +16,17 @@
 #include <sys/user.h>
 #include <machine/elf.h>
 
-// C++ Includes
 #include <mutex>
 #include <unordered_map>
 
-// Other libraries and framework includes
 #include "lldb/Core/PluginManager.h"
-#include "lldb/Core/RegisterValue.h"
-#include "lldb/Core/State.h"
+#include "lldb/Host/FileSystem.h"
 #include "lldb/Host/Host.h"
 #include "lldb/Symbol/ObjectFile.h"
 #include "lldb/Target/DynamicLoader.h"
 #include "lldb/Target/Target.h"
+#include "lldb/Utility/RegisterValue.h"
+#include "lldb/Utility/State.h"
 
 #include "FreeBSDThread.h"
 #include "Plugins/Process/POSIX/ProcessPOSIXLog.h"
@@ -38,13 +35,11 @@
 #include "ProcessFreeBSD.h"
 #include "ProcessMonitor.h"
 
-// Other libraries and framework includes
 #include "lldb/Breakpoint/BreakpointLocation.h"
 #include "lldb/Breakpoint/Watchpoint.h"
 #include "lldb/Core/Module.h"
 #include "lldb/Core/ModuleSpec.h"
 #include "lldb/Core/PluginManager.h"
-#include "lldb/Core/State.h"
 #include "lldb/Host/Host.h"
 #include "lldb/Symbol/ObjectFile.h"
 #include "lldb/Target/DynamicLoader.h"
@@ -52,6 +47,7 @@
 #include "lldb/Target/Target.h"
 #include "lldb/Utility/DataBufferHeap.h"
 #include "lldb/Utility/FileSpec.h"
+#include "lldb/Utility/State.h"
 
 #include "lldb/Host/posix/Fcntl.h"
 
@@ -68,7 +64,6 @@ UnixSignalsSP &GetFreeBSDSignals() {
 }
 }
 
-//------------------------------------------------------------------------------
 // Static functions.
 
 lldb::ProcessSP
@@ -100,7 +95,6 @@ const char *ProcessFreeBSD::GetPluginDescriptionStatic() {
   return "Process plugin for FreeBSD";
 }
 
-//------------------------------------------------------------------------------
 // ProcessInterface protocol.
 
 lldb_private::ConstString ProcessFreeBSD::GetPluginName() {
@@ -254,7 +248,6 @@ void ProcessFreeBSD::SendMessage(const ProcessMessage &message) {
   m_message_queue.push(message);
 }
 
-//------------------------------------------------------------------------------
 // Constructors and destructors.
 
 ProcessFreeBSD::ProcessFreeBSD(lldb::TargetSP target_sp,
@@ -273,7 +266,6 @@ ProcessFreeBSD::ProcessFreeBSD(lldb::TargetSP target_sp,
 
 ProcessFreeBSD::~ProcessFreeBSD() { delete m_monitor; }
 
-//------------------------------------------------------------------------------
 // Process protocol.
 void ProcessFreeBSD::Finalize() {
   Process::Finalize();
@@ -287,7 +279,7 @@ bool ProcessFreeBSD::CanDebug(lldb::TargetSP target_sp,
   // For now we are just making sure the file exists for a given module
   ModuleSP exe_module_sp(target_sp->GetExecutableModule());
   if (exe_module_sp.get())
-    return exe_module_sp->GetFileSpec().Exists();
+    return FileSystem::Instance().Exists(exe_module_sp->GetFileSpec());
   // If there is no executable module, we return true since we might be
   // preparing to attach.
   return true;
@@ -335,7 +327,7 @@ ProcessFreeBSD::DoAttachToProcessWithID(lldb::pid_t pid,
     GetTarget().SetArchitecture(module_arch);
 
   // Initialize the target module list
-  GetTarget().SetExecutableModule(exe_module_sp, true);
+  GetTarget().SetExecutableModule(exe_module_sp, eLoadDependentsYes);
 
   SetSTDIOFileDescriptor(m_monitor->GetTerminalFD());
 
@@ -373,12 +365,13 @@ Status ProcessFreeBSD::DoLaunch(Module *module,
   assert(m_monitor == NULL);
 
   FileSpec working_dir = launch_info.GetWorkingDirectory();
-  namespace fs = llvm::sys::fs;
-  if (working_dir && (!working_dir.ResolvePath() ||
-                      !fs::is_directory(working_dir.GetPath()))) {
-    error.SetErrorStringWithFormat("No such file or directory: %s",
+  if (working_dir) {
+    FileSystem::Instance().Resolve(working_dir);
+    if (!FileSystem::Instance().IsDirectory(working_dir.GetPath())) {
+      error.SetErrorStringWithFormat("No such file or directory: %s",
                                    working_dir.GetCString());
-    return error;
+      return error;
+    }
   }
 
   SetPrivateState(eStateLaunching);
@@ -390,8 +383,7 @@ Status ProcessFreeBSD::DoLaunch(Module *module,
   FileSpec stdout_file_spec{};
   FileSpec stderr_file_spec{};
 
-  const FileSpec dbg_pts_file_spec{launch_info.GetPTY().GetSlaveName(NULL, 0),
-                                   false};
+  const FileSpec dbg_pts_file_spec{launch_info.GetPTY().GetSlaveName(NULL, 0)};
 
   file_action = launch_info.GetFileActionForFD(STDIN_FILENO);
   stdin_file_spec =
@@ -519,7 +511,7 @@ void ProcessFreeBSD::DoDidExec() {
           executable_search_paths.GetSize() ? &executable_search_paths : NULL);
       if (!error.Success())
         return;
-      target->SetExecutableModule(exe_module_sp, true);
+      target->SetExecutableModule(exe_module_sp, eLoadDependentsYes);
     }
   }
 }
@@ -839,7 +831,6 @@ size_t ProcessFreeBSD::PutSTDIN(const char *buf, size_t len, Status &error) {
   return status;
 }
 
-//------------------------------------------------------------------------------
 // Utility functions.
 
 bool ProcessFreeBSD::HasExited() {
@@ -885,7 +876,7 @@ bool ProcessFreeBSD::IsAThreadRunning() {
   return is_running;
 }
 
-const DataBufferSP ProcessFreeBSD::GetAuxvData() {
+lldb_private::DataExtractor ProcessFreeBSD::GetAuxvData() {
   // If we're the local platform, we can ask the host for auxv data.
   PlatformSP platform_sp = GetTarget().GetPlatform();
   assert(platform_sp && platform_sp->IsHost());
@@ -899,7 +890,7 @@ const DataBufferSP ProcessFreeBSD::GetAuxvData() {
     buf_sp.reset();
   }
 
-  return buf_sp;
+  return DataExtractor(buf_sp, GetByteOrder(), GetAddressByteSize());
 }
 
 struct EmulatorBaton {
@@ -1029,21 +1020,17 @@ bool ProcessFreeBSD::IsSoftwareStepBreakpoint(lldb::tid_t tid) {
 
 bool ProcessFreeBSD::SupportHardwareSingleStepping() const {
   lldb_private::ArchSpec arch = GetTarget().GetArchitecture();
-  if (arch.GetMachine() == llvm::Triple::arm ||
-      arch.GetMachine() == llvm::Triple::mips64 ||
-      arch.GetMachine() == llvm::Triple::mips64el ||
-      arch.GetMachine() == llvm::Triple::mips ||
-      arch.GetMachine() == llvm::Triple::mipsel)
+  if (arch.GetMachine() == llvm::Triple::arm || arch.IsMIPS())
     return false;
   return true;
 }
 
 Status ProcessFreeBSD::SetupSoftwareSingleStepping(lldb::tid_t tid) {
-  std::unique_ptr<EmulateInstruction> emulator_ap(
+  std::unique_ptr<EmulateInstruction> emulator_up(
       EmulateInstruction::FindPlugin(GetTarget().GetArchitecture(),
                                      eInstructionTypePCModifying, nullptr));
 
-  if (emulator_ap == nullptr)
+  if (emulator_up == nullptr)
     return Status("Instruction emulator not found!");
 
   FreeBSDThread *thread = static_cast<FreeBSDThread *>(
@@ -1054,17 +1041,17 @@ Status ProcessFreeBSD::SetupSoftwareSingleStepping(lldb::tid_t tid) {
   lldb::RegisterContextSP register_context_sp = thread->GetRegisterContext();
 
   EmulatorBaton baton(this, register_context_sp.get());
-  emulator_ap->SetBaton(&baton);
-  emulator_ap->SetReadMemCallback(&ReadMemoryCallback);
-  emulator_ap->SetReadRegCallback(&ReadRegisterCallback);
-  emulator_ap->SetWriteMemCallback(&WriteMemoryCallback);
-  emulator_ap->SetWriteRegCallback(&WriteRegisterCallback);
+  emulator_up->SetBaton(&baton);
+  emulator_up->SetReadMemCallback(&ReadMemoryCallback);
+  emulator_up->SetReadRegCallback(&ReadRegisterCallback);
+  emulator_up->SetWriteMemCallback(&WriteMemoryCallback);
+  emulator_up->SetWriteRegCallback(&WriteRegisterCallback);
 
-  if (!emulator_ap->ReadInstruction())
+  if (!emulator_up->ReadInstruction())
     return Status("Read instruction failed!");
 
   bool emulation_result =
-      emulator_ap->EvaluateInstruction(eEmulateInstructionOptionAutoAdvancePC);
+      emulator_up->EvaluateInstruction(eEmulateInstructionOptionAutoAdvancePC);
   const RegisterInfo *reg_info_pc = register_context_sp->GetRegisterInfo(
       eRegisterKindGeneric, LLDB_REGNUM_GENERIC_PC);
   auto pc_it =
@@ -1081,7 +1068,7 @@ Status ProcessFreeBSD::SetupSoftwareSingleStepping(lldb::tid_t tid) {
     // PC modifying instruction should be successful. The failure most
     // likely caused by a not supported instruction which don't modify PC.
     next_pc =
-        register_context_sp->GetPC() + emulator_ap->GetOpcode().GetByteSize();
+        register_context_sp->GetPC() + emulator_up->GetOpcode().GetByteSize();
   } else {
     // The instruction emulation failed after it modified the PC. It is an
     // unknown error where we can't continue because the next instruction is

@@ -1,9 +1,8 @@
 //===--- PPCallbacks.h - Callbacks for Preprocessor actions -----*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 ///
@@ -133,6 +132,28 @@ public:
                                   SrcMgr::CharacteristicKind FileType) {
   }
 
+  /// Callback invoked whenever a submodule was entered.
+  ///
+  /// \param M The submodule we have entered.
+  ///
+  /// \param ImportLoc The location of import directive token.
+  ///
+  /// \param ForPragma If entering from pragma directive.
+  ///
+  virtual void EnteredSubmodule(Module *M, SourceLocation ImportLoc,
+                                bool ForPragma) { }
+
+  /// Callback invoked whenever a submodule was left.
+  ///
+  /// \param M The submodule we have left.
+  ///
+  /// \param ImportLoc The location of import directive token.
+  ///
+  /// \param ForPragma If entering from pragma directive.
+  ///
+  virtual void LeftSubmodule(Module *M, SourceLocation ImportLoc,
+                             bool ForPragma) { }
+
   /// Callback invoked whenever there was an explicit module-import
   /// syntax.
   ///
@@ -240,6 +261,14 @@ public:
   virtual void PragmaWarningPop(SourceLocation Loc) {
   }
 
+  /// Callback invoked when a \#pragma execution_character_set(push) directive
+  /// is read.
+  virtual void PragmaExecCharsetPush(SourceLocation Loc, StringRef Str) {}
+
+  /// Callback invoked when a \#pragma execution_character_set(pop) directive
+  /// is read.
+  virtual void PragmaExecCharsetPop(SourceLocation Loc) {}
+
   /// Callback invoked when a \#pragma clang assume_nonnull begin directive
   /// is read.
   virtual void PragmaAssumeNonNullBegin(SourceLocation Loc) {}
@@ -275,6 +304,12 @@ public:
   virtual void Defined(const Token &MacroNameTok, const MacroDefinition &MD,
                        SourceRange Range) {
   }
+
+  /// Hook called when a '__has_include' or '__has_include_next' directive is
+  /// read.
+  virtual void HasInclude(SourceLocation Loc, StringRef FileName, bool IsAngled,
+                          const FileEntry *File,
+                          SrcMgr::CharacteristicKind FileType) {}
 
   /// Hook called when a source range is skipped.
   /// \param Range The SourceRange that was skipped. The range begins at the
@@ -382,6 +417,18 @@ public:
                                Imported, FileType);
   }
 
+  void EnteredSubmodule(Module *M, SourceLocation ImportLoc,
+                        bool ForPragma) override {
+    First->EnteredSubmodule(M, ImportLoc, ForPragma);
+    Second->EnteredSubmodule(M, ImportLoc, ForPragma);
+  }
+
+  void LeftSubmodule(Module *M, SourceLocation ImportLoc,
+                     bool ForPragma) override {
+    First->LeftSubmodule(M, ImportLoc, ForPragma);
+    Second->LeftSubmodule(M, ImportLoc, ForPragma);
+  }
+
   void moduleImport(SourceLocation ImportLoc, ModuleIdPath Path,
                     const Module *Imported) override {
     First->moduleImport(ImportLoc, Path, Imported);
@@ -443,6 +490,13 @@ public:
     Second->PragmaDiagnostic(Loc, Namespace, mapping, Str);
   }
 
+  void HasInclude(SourceLocation Loc, StringRef FileName, bool IsAngled,
+                  const FileEntry *File,
+                  SrcMgr::CharacteristicKind FileType) override {
+    First->HasInclude(Loc, FileName, IsAngled, File, FileType);
+    Second->HasInclude(Loc, FileName, IsAngled, File, FileType);
+  }
+
   void PragmaOpenCLExtension(SourceLocation NameLoc, const IdentifierInfo *Name,
                              SourceLocation StateLoc, unsigned State) override {
     First->PragmaOpenCLExtension(NameLoc, Name, StateLoc, State);
@@ -463,6 +517,16 @@ public:
   void PragmaWarningPop(SourceLocation Loc) override {
     First->PragmaWarningPop(Loc);
     Second->PragmaWarningPop(Loc);
+  }
+
+  void PragmaExecCharsetPush(SourceLocation Loc, StringRef Str) override {
+    First->PragmaExecCharsetPush(Loc, Str);
+    Second->PragmaExecCharsetPush(Loc, Str);
+  }
+
+  void PragmaExecCharsetPop(SourceLocation Loc) override {
+    First->PragmaExecCharsetPop(Loc);
+    Second->PragmaExecCharsetPop(Loc);
   }
 
   void PragmaAssumeNonNullBegin(SourceLocation Loc) override {
