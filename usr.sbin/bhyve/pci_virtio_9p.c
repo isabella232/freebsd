@@ -27,7 +27,7 @@
  */
 
 /*
- * virtio filesystem passtrough using 9p protocol.
+ * VirtIO filesystem passthrough using 9p protocol.
  */
 
 #include <sys/cdefs.h>
@@ -36,6 +36,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/param.h>
 #include <sys/linker_set.h>
 #include <sys/uio.h>
+#include <sys/capsicum.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -45,7 +46,6 @@ __FBSDID("$FreeBSD$");
 #include <unistd.h>
 #include <assert.h>
 #include <pthread.h>
-#include <sys/capsicum.h>
 
 #include <lib9p.h>
 #include <backend/fs.h>
@@ -273,6 +273,9 @@ pci_vt9p_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
 	    CAP_SEEK, CAP_SYMLINKAT, CAP_UNLINKAT, CAP_EXTATTR_DELETE,
 	    CAP_EXTATTR_GET, CAP_EXTATTR_LIST, CAP_EXTATTR_SET,
 	    CAP_FUTIMES, CAP_FSTATFS, CAP_FSYNC, CAP_FPATHCONF);
+
+	if (cap_rights_limit(rootfd, &rootcap) != 0)
+		return (1);
 
 	sc->vsc_config->tag_len = (uint16_t)strlen(sharename);
 	strncpy(sc->vsc_config->tag, sharename, strlen(sharename));
