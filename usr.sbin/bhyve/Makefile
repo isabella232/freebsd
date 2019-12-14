@@ -4,7 +4,6 @@
 
 .include <src.opts.mk>
 CFLAGS+=-I${.CURDIR}/../../contrib/lib9p
-.PATH:  ${.CURDIR}/../../contrib/lib9p
 CFLAGS+=-I${SRCTOP}/sys
 .PATH:  ${SRCTOP}/sys/cam/ctl
 
