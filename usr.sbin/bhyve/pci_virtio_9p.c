@@ -236,6 +236,7 @@ pci_vt9p_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
 	char *sharename = NULL;
 	char *rootpath = NULL;
 	int rootfd;
+	bool ro = false;
 	cap_rights_t rootcap;
 
 	if (opts == NULL) {
@@ -256,8 +257,10 @@ pci_vt9p_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
 			continue;
 		}
 
-		if (strcmp(opt, "ro") == 0)
+		if (strcmp(opt, "ro") == 0) {
 			DPRINTF(("read-only mount requested\r\n"));
+			ro = true;
+		}
 	}
 
 	rootfd = open(rootpath, O_DIRECTORY);
@@ -280,7 +283,7 @@ pci_vt9p_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
 	sc->vsc_config->tag_len = (uint16_t)strlen(sharename);
 	strncpy(sc->vsc_config->tag, sharename, strlen(sharename));
 	
-	if (l9p_backend_fs_init(&sc->vsc_fs_backend, rootfd) != 0) {
+	if (l9p_backend_fs_init(&sc->vsc_fs_backend, rootfd, ro) != 0) {
 		errno = ENXIO;
 		return (1);
 	}
