@@ -244,16 +244,15 @@ pci_vt9p_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
 		return (1);
 	}
 
-	sc = calloc(1, sizeof(struct pci_vt9p_softc));
-	sc->vsc_config = calloc(1, sizeof(struct pci_vt9p_config) +
-	    VT9P_MAXTAGSZ);
-
-	pthread_mutex_init(&sc->vsc_mtx, NULL);
-
 	while ((opt = strsep(&opts, ",")) != NULL) {
-		if (sharename == NULL) {
+		if (strchr(opt, '=') != NULL) {
+			if (sharename != NULL) {
+				printf("virtio-9p: more than one share name given\n");
+				return (1);
+			}
+
 			sharename = strsep(&opt, "=");
-			rootpath = strdup(opt);
+			rootpath = opt;
 			continue;
 		}
 
@@ -263,9 +262,20 @@ pci_vt9p_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
 		}
 	}
 
+	if (strlen(sharename) > VT9P_MAXTAGSZ) {
+		printf("virtio-9p: share name too long\n");
+		return (1);
+	}
+
 	rootfd = open(rootpath, O_DIRECTORY);
 	if (rootfd < 0)
 		return (-1);
+
+	sc = calloc(1, sizeof(struct pci_vt9p_softc));
+	sc->vsc_config = calloc(1, sizeof(struct pci_vt9p_config) +
+	    VT9P_MAXTAGSZ);
+
+	pthread_mutex_init(&sc->vsc_mtx, NULL);
 
 	cap_rights_init(&rootcap,
 	    CAP_LOOKUP, CAP_ACL_CHECK, CAP_ACL_DELETE, CAP_ACL_GET,
@@ -281,7 +291,7 @@ pci_vt9p_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
 		return (1);
 
 	sc->vsc_config->tag_len = (uint16_t)strlen(sharename);
-	strncpy(sc->vsc_config->tag, sharename, strlen(sharename));
+	memcpy(sc->vsc_config->tag, sharename, sc->vsc_config->tag_len);
 	
 	if (l9p_backend_fs_init(&sc->vsc_fs_backend, rootfd, ro) != 0) {
 		errno = ENXIO;
