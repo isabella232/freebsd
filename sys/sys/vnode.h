@@ -174,7 +174,6 @@ struct vnode {
 	int	v_writecount;			/* I ref count of writers or
 						   (negative) text users */
 	u_int	v_hash;
-	const char *v_tag;			/* u type of underlying data */
 };
 
 #endif /* defined(_KERNEL) || defined(_KVM_VNODE) */
@@ -663,7 +662,7 @@ void	vgone(struct vnode *vp);
 void	vhold(struct vnode *);
 void	vholdl(struct vnode *);
 void	vholdnz(struct vnode *);
-void	vinactive(struct vnode *, struct thread *);
+void	vinactive(struct vnode *vp);
 int	vinvalbuf(struct vnode *vp, int save, int slpflag, int slptimeo);
 int	vtruncbuf(struct vnode *vp, off_t length, int blksize);
 void	v_inval_buf_range(struct vnode *vp, daddr_t startlbn, daddr_t endlbn,
@@ -893,7 +892,7 @@ do {									\
 #define	VOP_UNSET_TEXT_CHECKED(vp)		VOP_UNSET_TEXT((vp))
 #endif
 
-#define	VN_IS_DOOMED(vp)	((vp)->v_irflag & VIRF_DOOMED)
+#define	VN_IS_DOOMED(vp)	__predict_false((vp)->v_irflag & VIRF_DOOMED)
 
 void	vput(struct vnode *vp);
 void	vrele(struct vnode *vp);
@@ -954,6 +953,19 @@ int vn_chown(struct file *fp, uid_t uid, gid_t gid, struct ucred *active_cred,
     struct thread *td);
 
 void vn_fsid(struct vnode *vp, struct vattr *va);
+
+#define VOP_UNLOCK_FLAGS(vp, flags)	({				\
+	struct vnode *_vp = (vp);					\
+	int _flags = (flags);						\
+	int _error;							\
+									\
+        if ((_flags & ~(LK_INTERLOCK | LK_RELEASE)) != 0)		\
+                panic("%s: unsupported flags %x\n", __func__, flags);	\
+        _error = VOP_UNLOCK(_vp);					\
+        if (_flags & LK_INTERLOCK)					\
+                VI_UNLOCK(_vp);						\
+        _error;								\
+})
 
 #include <sys/kernel.h>
 
