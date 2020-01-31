@@ -259,7 +259,11 @@ pci_vt9p_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
 		if (strcmp(opt, "ro") == 0) {
 			DPRINTF(("read-only mount requested\r\n"));
 			ro = true;
+			continue;
 		}
+
+		printf("virtio-9p: invalid option '%s'\n", opt);
+		return (1);
 	}
 
 	if (strlen(sharename) > VT9P_MAXTAGSZ) {
