@@ -96,7 +96,7 @@ __FBSDID("$FreeBSD$");
 #include <netinet/tcp_timer.h>
 #include <netinet/tcp_var.h>
 
-extern int	in6_inithead(void **head, int off);
+extern int	in6_inithead(void **head, int off, u_int fibnum);
 #ifdef VIMAGE
 extern int	in6_detachhead(void **head, int off);
 #endif
@@ -157,11 +157,12 @@ in6_addroute(void *v_arg, void *n_arg, struct radix_head *head,
  */
 
 int
-in6_inithead(void **head, int off)
+in6_inithead(void **head, int off, u_int fibnum)
 {
 	struct rib_head *rh;
 
-	rh = rt_table_init(offsetof(struct sockaddr_in6, sin6_addr) << 3);
+	rh = rt_table_init(offsetof(struct sockaddr_in6, sin6_addr) << 3,
+	    AF_INET6, fibnum);
 	if (rh == NULL)
 		return (0);
 
@@ -185,14 +186,6 @@ in6_detachhead(void **head, int off)
 /*
  * Extended API for IPv6 FIB support.
  */
-void
-in6_rtredirect(struct sockaddr *dst, struct sockaddr *gw, struct sockaddr *nm,
-    int flags, struct sockaddr *src, u_int fibnum)
-{
-
-	rtredirect_fib(dst, gw, nm, flags, src, fibnum);
-}
-
 int
 in6_rtrequest(int req, struct sockaddr *dst, struct sockaddr *gw,
     struct sockaddr *mask, int flags, struct rtentry **ret_nrt, u_int fibnum)

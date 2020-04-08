@@ -216,9 +216,6 @@ __FBSDID("$FreeBSD$");
     atomic_clear_int((u_int *)(pte), PG_W))
 #define pmap_pte_set_prot(pte, v) ((*(int *)pte &= ~PG_PROT), (*(int *)pte |= (v)))
 
-_Static_assert(sizeof(struct pmap) <= sizeof(struct pmap_KBI),
-    "pmap_KBI");
-
 static int pgeflag = 0;		/* PG_G or-in */
 static int pseflag = 0;		/* PG_PS or-in */
 
@@ -342,12 +339,10 @@ static void pmap_remove_pde(pmap_t pmap, pd_entry_t *pdq, vm_offset_t sva,
 static int pmap_remove_pte(pmap_t pmap, pt_entry_t *ptq, vm_offset_t sva,
     struct spglist *free);
 static vm_page_t pmap_remove_pt_page(pmap_t pmap, vm_offset_t va);
-static void pmap_remove_page(struct pmap *pmap, vm_offset_t va,
-    struct spglist *free);
+static void pmap_remove_page(pmap_t pmap, vm_offset_t va, struct spglist *free);
 static bool	pmap_remove_ptes(pmap_t pmap, vm_offset_t sva, vm_offset_t eva,
 		    struct spglist *free);
-static void pmap_remove_entry(struct pmap *pmap, vm_page_t m,
-					vm_offset_t va);
+static void pmap_remove_entry(pmap_t pmap, vm_page_t m, vm_offset_t va);
 static void pmap_insert_entry(pmap_t pmap, vm_offset_t va, vm_page_t m);
 static boolean_t pmap_try_insert_pv_entry(pmap_t pmap, vm_offset_t va,
     vm_page_t m);
@@ -1069,7 +1064,7 @@ __CONCAT(PMTYPE, init)(void)
 #ifdef PMAP_PAE_COMP
 	pdptzone = uma_zcreate("PDPT", NPGPTD * sizeof(pdpt_entry_t), NULL,
 	    NULL, NULL, NULL, (NPGPTD * sizeof(pdpt_entry_t)) - 1,
-	    UMA_ZONE_VM | UMA_ZONE_NOFREE);
+	    UMA_ZONE_CONTIG | UMA_ZONE_VM | UMA_ZONE_NOFREE);
 	uma_zone_set_allocf(pdptzone, pmap_pdpt_allocf);
 #endif
 

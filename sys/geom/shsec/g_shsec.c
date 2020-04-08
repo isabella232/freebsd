@@ -71,7 +71,7 @@ struct g_class g_shsec_class = {
 };
 
 SYSCTL_DECL(_kern_geom);
-static SYSCTL_NODE(_kern_geom, OID_AUTO, shsec, CTLFLAG_RW, 0,
+static SYSCTL_NODE(_kern_geom, OID_AUTO, shsec, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
     "GEOM_SHSEC stuff");
 static u_int g_shsec_debug = 0;
 SYSCTL_UINT(_kern_geom_shsec, OID_AUTO, debug, CTLFLAG_RWTUN, &g_shsec_debug, 0,
@@ -316,6 +316,7 @@ g_shsec_start(struct bio *bp)
 	case BIO_READ:
 	case BIO_WRITE:
 	case BIO_FLUSH:
+	case BIO_SPEEDUP:
 		/*
 		 * Only those requests are supported.
 		 */

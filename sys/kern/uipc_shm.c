@@ -138,6 +138,7 @@ static fo_fill_kinfo_t	shm_fill_kinfo;
 static fo_mmap_t	shm_mmap;
 static fo_get_seals_t	shm_get_seals;
 static fo_add_seals_t	shm_add_seals;
+static fo_fallocate_t	shm_fallocate;
 
 /* File descriptor operations. */
 struct fileops shm_ops = {
@@ -157,6 +158,7 @@ struct fileops shm_ops = {
 	.fo_mmap = shm_mmap,
 	.fo_get_seals = shm_get_seals,
 	.fo_add_seals = shm_add_seals,
+	.fo_fallocate = shm_fallocate,
 	.fo_flags = DFLAG_PASSABLE | DFLAG_SEEKABLE
 };
 
@@ -174,23 +176,25 @@ uiomove_object_page(vm_object_t obj, size_t len, struct uio *uio)
 	offset = uio->uio_offset & PAGE_MASK;
 	tlen = MIN(PAGE_SIZE - offset, len);
 
-	VM_OBJECT_WLOCK(obj);
+	rv = vm_page_grab_valid_unlocked(&m, obj, idx,
+	    VM_ALLOC_SBUSY | VM_ALLOC_IGN_SBUSY | VM_ALLOC_NOCREAT);
+	if (rv == VM_PAGER_OK)
+		goto found;
 
 	/*
 	 * Read I/O without either a corresponding resident page or swap
 	 * page: use zero_region.  This is intended to avoid instantiating
 	 * pages on read from a sparse region.
 	 */
-	if (uio->uio_rw == UIO_READ && vm_page_lookup(obj, idx) == NULL &&
+	VM_OBJECT_WLOCK(obj);
+	m = vm_page_lookup(obj, idx);
+	if (uio->uio_rw == UIO_READ && m == NULL &&
 	    !vm_pager_has_page(obj, idx, NULL, NULL)) {
 		VM_OBJECT_WUNLOCK(obj);
 		return (uiomove(__DECONST(void *, zero_region), tlen, uio));
 	}
 
 	/*
-	 * Parallel reads of the page content from disk are prevented
-	 * by exclusive busy.
-	 *
 	 * Although the tmpfs vnode lock is held here, it is
 	 * nonetheless safe to sleep waiting for a free page.  The
 	 * pageout daemon does not need to acquire the tmpfs vnode
@@ -206,6 +210,8 @@ uiomove_object_page(vm_object_t obj, size_t len, struct uio *uio)
 		return (EIO);
 	}
 	VM_OBJECT_WUNLOCK(obj);
+
+found:
 	error = uiomove_fromphys(&m, offset, tlen, uio);
 	if (uio->uio_rw == UIO_WRITE && error == 0)
 		vm_page_set_dirty(m);
@@ -502,8 +508,12 @@ retry:
 				    VM_ALLOC_NORMAL | VM_ALLOC_WAITFAIL);
 				if (m == NULL)
 					goto retry;
+				vm_object_pip_add(object, 1);
+				VM_OBJECT_WUNLOCK(object);
 				rv = vm_pager_get_pages(object, &m, 1, NULL,
 				    NULL);
+				VM_OBJECT_WLOCK(object);
+				vm_object_pip_wakeup(object);
 				if (rv == VM_PAGER_OK) {
 					/*
 					 * Since the page was not resident,
@@ -951,7 +961,7 @@ sys_shm_unlink(struct thread *td, struct shm_unlink_args *uap)
 	sx_xlock(&shm_dict_lock);
 	error = shm_remove(path, fnv, td->td_ucred);
 	sx_xunlock(&shm_dict_lock);
-	free(path, M_TEMP);
+	free(path, M_SHMFD);
 
 	return (error);
 }
@@ -1435,6 +1445,42 @@ shm_get_seals(struct file *fp, int *seals)
 	shmfd = fp->f_data;
 	*seals = shmfd->shm_seals;
 	return (0);
+}
+
+static int
+shm_fallocate(struct file *fp, off_t offset, off_t len, struct thread *td)
+{
+	void *rl_cookie;
+	struct shmfd *shmfd;
+	size_t size;
+	int error;
+
+	/* This assumes that the caller already checked for overflow. */
+	error = 0;
+	shmfd = fp->f_data;
+	size = offset + len;
+
+	/*
+	 * Just grab the rangelock for the range that we may be attempting to
+	 * grow, rather than blocking read/write for regions we won't be
+	 * touching while this (potential) resize is in progress.  Other
+	 * attempts to resize the shmfd will have to take a write lock from 0 to
+	 * OFF_MAX, so this being potentially beyond the current usable range of
+	 * the shmfd is not necessarily a concern.  If other mechanisms are
+	 * added to grow a shmfd, this may need to be re-evaluated.
+	 */
+	rl_cookie = rangelock_wlock(&shmfd->shm_rl, offset, size,
+	    &shmfd->shm_mtx);
+	if (size > shmfd->shm_size) {
+		VM_OBJECT_WLOCK(shmfd->shm_object);
+		error = shm_dotruncate_locked(shmfd, size, rl_cookie);
+		VM_OBJECT_WUNLOCK(shmfd->shm_object);
+	}
+	rangelock_unlock(&shmfd->shm_rl, rl_cookie, &shmfd->shm_mtx);
+	/* Translate to posix_fallocate(2) return value as needed. */
+	if (error == ENOMEM)
+		error = ENOSPC;
+	return (error);
 }
 
 static int

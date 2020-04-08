@@ -103,6 +103,7 @@ static fo_kqfilter_t	vn_kqfilter;
 static fo_stat_t	vn_statfile;
 static fo_close_t	vn_closefile;
 static fo_mmap_t	vn_mmap;
+static fo_fallocate_t	vn_fallocate;
 
 struct 	fileops vnops = {
 	.fo_read = vn_io_fault,
@@ -119,6 +120,7 @@ struct 	fileops vnops = {
 	.fo_seek = vn_seek,
 	.fo_fill_kinfo = vn_fill_kinfo,
 	.fo_mmap = vn_mmap,
+	.fo_fallocate = vn_fallocate,
 	.fo_flags = DFLAG_PASSABLE | DFLAG_SEEKABLE
 };
 
@@ -1291,7 +1293,6 @@ vn_io_fault_pgmove(vm_page_t ma[], vm_offset_t offset, int xfersize,
 	return (0);
 }
 
-
 /*
  * File table truncate routine.
  */
@@ -1476,7 +1477,7 @@ vn_stat(struct vnode *vp, struct stat *sb, struct ucred *active_cred,
 	sb->st_blksize = max(PAGE_SIZE, vap->va_blocksize);
 	
 	sb->st_flags = vap->va_flags;
-	if (priv_check(td, PRIV_VFS_GENERATION))
+	if (priv_check_cred_vfs_generation(td->td_ucred))
 		sb->st_gen = 0;
 	else
 		sb->st_gen = vap->va_gen;
@@ -1565,7 +1566,8 @@ vn_poll(struct file *fp, int events, struct ucred *active_cred,
  * permits vn_lock to return doomed vnodes.
  */
 static int __noinline
-_vn_lock_fallback(struct vnode *vp, int flags, char *file, int line, int error)
+_vn_lock_fallback(struct vnode *vp, int flags, const char *file, int line,
+    int error)
 {
 
 	KASSERT((flags & LK_RETRY) == 0 || error == 0,
@@ -1601,12 +1603,13 @@ _vn_lock_fallback(struct vnode *vp, int flags, char *file, int line, int error)
 }
 
 int
-_vn_lock(struct vnode *vp, int flags, char *file, int line)
+_vn_lock(struct vnode *vp, int flags, const char *file, int line)
 {
 	int error;
 
-	VNASSERT((flags & LK_TYPE_MASK) != 0, vp, ("vn_lock: no locktype"));
-	VNASSERT(vp->v_holdcnt != 0, vp, ("vn_lock: zero hold count"));
+	VNASSERT((flags & LK_TYPE_MASK) != 0, vp,
+	    ("vn_lock: no locktype (%d passed)", flags));
+	VNPASS(vp->v_holdcnt > 0, vp);
 	error = VOP_LOCK1(vp, flags, file, line);
 	if (__predict_false(error != 0 || VN_IS_DOOMED(vp)))
 		return (_vn_lock_fallback(vp, flags, file, line, error));
@@ -1639,13 +1642,6 @@ vn_closefile(struct file *fp, struct thread *td)
 		vrele(vp);
 	}
 	return (error);
-}
-
-static bool
-vn_suspendable(struct mount *mp)
-{
-
-	return (mp->mnt_op->vfs_susp_clean != NULL);
 }
 
 /*
@@ -1727,12 +1723,6 @@ vn_start_write(struct vnode *vp, struct mount **mpp, int flags)
 	if ((mp = *mpp) == NULL)
 		return (0);
 
-	if (!vn_suspendable(mp)) {
-		if (vp != NULL || (flags & V_MNTREF) != 0)
-			vfs_rel(mp);
-		return (0);
-	}
-
 	/*
 	 * VOP_GETWRITEMOUNT() returns with the mp refcount held through
 	 * a vfs_ref().
@@ -1778,12 +1768,6 @@ vn_start_secondary_write(struct vnode *vp, struct mount **mpp, int flags)
 	if ((mp = *mpp) == NULL)
 		return (0);
 
-	if (!vn_suspendable(mp)) {
-		if (vp != NULL || (flags & V_MNTREF) != 0)
-			vfs_rel(mp);
-		return (0);
-	}
-
 	/*
 	 * VOP_GETWRITEMOUNT() returns with the mp refcount held through
 	 * a vfs_ref().
@@ -1827,7 +1811,7 @@ vn_finished_write(struct mount *mp)
 {
 	int c;
 
-	if (mp == NULL || !vn_suspendable(mp))
+	if (mp == NULL)
 		return;
 
 	if (vfs_op_thread_enter(mp)) {
@@ -1853,7 +1837,6 @@ vn_finished_write(struct mount *mp)
 	MNT_IUNLOCK(mp);
 }
 
-
 /*
  * Filesystem secondary write operation has completed. If we are
  * suspending and this operation is the last one, notify the suspender
@@ -1862,7 +1845,7 @@ vn_finished_write(struct mount *mp)
 void
 vn_finished_secondary_write(struct mount *mp)
 {
-	if (mp == NULL || !vn_suspendable(mp))
+	if (mp == NULL)
 		return;
 	MNT_ILOCK(mp);
 	MNT_REL(mp);
@@ -1875,8 +1858,6 @@ vn_finished_secondary_write(struct mount *mp)
 	MNT_IUNLOCK(mp);
 }
 
-
-
 /*
  * Request a filesystem to suspend write operations.
  */
@@ -1884,8 +1865,6 @@ int
 vfs_write_suspend(struct mount *mp, int flags)
 {
 	int error;
-
-	MPASS(vn_suspendable(mp));
 
 	vfs_op_enter(mp);
 
@@ -1935,8 +1914,6 @@ void
 vfs_write_resume(struct mount *mp, int flags)
 {
 
-	MPASS(vn_suspendable(mp));
-
 	MNT_ILOCK(mp);
 	if ((mp->mnt_kern_flag & MNTK_SUSPEND) != 0) {
 		KASSERT(mp->mnt_susp_owner == curthread, ("mnt_susp_owner"));
@@ -1971,7 +1948,6 @@ vfs_write_suspend_umnt(struct mount *mp)
 {
 	int error;
 
-	MPASS(vn_suspendable(mp));
 	KASSERT((curthread->td_pflags & TDP_IGNSUSP) == 0,
 	    ("vfs_write_suspend_umnt: recursed"));
 
@@ -3148,5 +3124,62 @@ vn_generic_copy_file_range(struct vnode *invp, off_t *inoffp,
 out:
 	*lenp = savlen - len;
 	free(dat, M_TEMP);
+	return (error);
+}
+
+static int
+vn_fallocate(struct file *fp, off_t offset, off_t len, struct thread *td)
+{
+	struct mount *mp;
+	struct vnode *vp;
+	off_t olen, ooffset;
+	int error;
+#ifdef AUDIT
+	int audited_vnode1 = 0;
+#endif
+
+	vp = fp->f_vnode;
+	if (vp->v_type != VREG)
+		return (ENODEV);
+
+	/* Allocating blocks may take a long time, so iterate. */
+	for (;;) {
+		olen = len;
+		ooffset = offset;
+
+		bwillwrite();
+		mp = NULL;
+		error = vn_start_write(vp, &mp, V_WAIT | PCATCH);
+		if (error != 0)
+			break;
+		error = vn_lock(vp, LK_EXCLUSIVE);
+		if (error != 0) {
+			vn_finished_write(mp);
+			break;
+		}
+#ifdef AUDIT
+		if (!audited_vnode1) {
+			AUDIT_ARG_VNODE1(vp);
+			audited_vnode1 = 1;
+		}
+#endif
+#ifdef MAC
+		error = mac_vnode_check_write(td->td_ucred, fp->f_cred, vp);
+		if (error == 0)
+#endif
+			error = VOP_ALLOCATE(vp, &offset, &len);
+		VOP_UNLOCK(vp);
+		vn_finished_write(mp);
+
+		if (olen + ooffset != offset + len) {
+			panic("offset + len changed from %jx/%jx to %jx/%jx",
+			    ooffset, olen, offset, len);
+		}
+		if (error != 0 || len == 0)
+			break;
+		KASSERT(olen > len, ("Iteration did not make progress?"));
+		maybe_yield();
+	}
+
 	return (error);
 }

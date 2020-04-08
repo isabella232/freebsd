@@ -222,10 +222,8 @@ vm_imgact_hold_page(vm_object_t object, vm_ooffset_t offset)
 	vm_pindex_t pindex;
 
 	pindex = OFF_TO_IDX(offset);
-	VM_OBJECT_WLOCK(object);
-	(void)vm_page_grab_valid(&m, object, pindex,
+	(void)vm_page_grab_valid_unlocked(&m, object, pindex,
 	    VM_ALLOC_NORMAL | VM_ALLOC_NOBUSY | VM_ALLOC_WIRED);
-	VM_OBJECT_WUNLOCK(object);
 	return (m);
 }
 
@@ -281,9 +279,9 @@ sysctl_kstack_cache_size(SYSCTL_HANDLER_ARGS)
 		uma_zone_set_maxcache(kstack_cache, kstack_cache_size);
 	return (error);
 }
-SYSCTL_PROC(_vm, OID_AUTO, kstack_cache_size, CTLTYPE_INT|CTLFLAG_RW,
-	&kstack_cache_size, 0, sysctl_kstack_cache_size, "IU",
-	"Maximum number of cached kernel stacks");
+SYSCTL_PROC(_vm, OID_AUTO, kstack_cache_size,
+    CTLTYPE_INT|CTLFLAG_MPSAFE|CTLFLAG_RW, &kstack_cache_size, 0,
+    sysctl_kstack_cache_size, "IU", "Maximum number of cached kernel stacks");
 
 /*
  * Create the kernel stack (including pcb for i386) for a new thread.
@@ -340,10 +338,10 @@ vm_thread_stack_create(struct domainset *ds, vm_object_t *ksobjp, int pages)
 	 * page of stack.
 	 */
 	VM_OBJECT_WLOCK(ksobj);
-	(void)vm_page_grab_pages(ksobj, 0, VM_ALLOC_NORMAL | VM_ALLOC_NOBUSY |
-	    VM_ALLOC_WIRED, ma, pages);
+	(void)vm_page_grab_pages(ksobj, 0, VM_ALLOC_NORMAL | VM_ALLOC_WIRED,
+	    ma, pages);
 	for (i = 0; i < pages; i++)
-		ma[i]->valid = VM_PAGE_BITS_ALL;
+		vm_page_valid(ma[i]);
 	VM_OBJECT_WUNLOCK(ksobj);
 	pmap_qenter(ks, ma, pages);
 	*ksobjp = ksobj;
@@ -363,7 +361,7 @@ vm_thread_stack_dispose(vm_object_t ksobj, vm_offset_t ks, int pages)
 		m = vm_page_lookup(ksobj, i);
 		if (m == NULL)
 			panic("%s: kstack already missing?", __func__);
-		vm_page_busy_acquire(m, 0);
+		vm_page_xbusy_claim(m);
 		vm_page_unwire_noq(m);
 		vm_page_free(m);
 	}

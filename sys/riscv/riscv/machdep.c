@@ -77,27 +77,30 @@ __FBSDID("$FreeBSD$");
 #include <vm/vm_map.h>
 #include <vm/vm_pager.h>
 
-#include <machine/riscvreg.h>
 #include <machine/cpu.h>
+#include <machine/intr.h>
 #include <machine/kdb.h>
 #include <machine/machdep.h>
+#include <machine/metadata.h>
 #include <machine/pcb.h>
 #include <machine/reg.h>
+#include <machine/riscvreg.h>
+#include <machine/sbi.h>
 #include <machine/trap.h>
 #include <machine/vmparam.h>
-#include <machine/intr.h>
-#include <machine/sbi.h>
-
-#include <machine/asm.h>
 
 #ifdef FPE
 #include <machine/fpe.h>
 #endif
 
 #ifdef FDT
+#include <contrib/libfdt/libfdt.h>
 #include <dev/fdt/fdt_common.h>
 #include <dev/ofw/openfirm.h>
 #endif
+
+static void get_fpcontext(struct thread *td, mcontext_t *mcp);
+static void set_fpcontext(struct thread *td, mcontext_t *mcp);
 
 struct pcpu __pcpu[MAXCPU];
 
@@ -352,6 +355,7 @@ get_mcontext(struct thread *td, mcontext_t *mcp, int clear_ret)
 	mcp->mc_gpregs.gp_tp = tf->tf_tp;
 	mcp->mc_gpregs.gp_sepc = tf->tf_sepc;
 	mcp->mc_gpregs.gp_sstatus = tf->tf_sstatus;
+	get_fpcontext(td, mcp);
 
 	return (0);
 }
@@ -363,6 +367,19 @@ set_mcontext(struct thread *td, mcontext_t *mcp)
 
 	tf = td->td_frame;
 
+	/*
+	 * Permit changes to the USTATUS bits of SSTATUS.
+	 *
+	 * Ignore writes to read-only bits (SD, XS).
+	 *
+	 * Ignore writes to the FS field as set_fpcontext() will set
+	 * it explicitly.
+	 */
+	if (((mcp->mc_gpregs.gp_sstatus ^ tf->tf_sstatus) &
+	    ~(SSTATUS_SD | SSTATUS_XS_MASK | SSTATUS_FS_MASK | SSTATUS_UPIE |
+	    SSTATUS_UIE)) != 0)
+		return (EINVAL);
+
 	memcpy(tf->tf_t, mcp->mc_gpregs.gp_t, sizeof(tf->tf_t));
 	memcpy(tf->tf_s, mcp->mc_gpregs.gp_s, sizeof(tf->tf_s));
 	memcpy(tf->tf_a, mcp->mc_gpregs.gp_a, sizeof(tf->tf_a));
@@ -372,6 +389,7 @@ set_mcontext(struct thread *td, mcontext_t *mcp)
 	tf->tf_gp = mcp->mc_gpregs.gp_gp;
 	tf->tf_sepc = mcp->mc_gpregs.gp_sepc;
 	tf->tf_sstatus = mcp->mc_gpregs.gp_sstatus;
+	set_fpcontext(td, mcp);
 
 	return (0);
 }
@@ -413,7 +431,12 @@ set_fpcontext(struct thread *td, mcontext_t *mcp)
 {
 #ifdef FPE
 	struct pcb *curpcb;
+#endif
 
+	td->td_frame->tf_sstatus &= ~SSTATUS_FS_MASK;
+	td->td_frame->tf_sstatus |= SSTATUS_FS_OFF;
+
+#ifdef FPE
 	critical_enter();
 
 	if ((mcp->mc_flags & _MC_FP_VALID) != 0) {
@@ -423,6 +446,7 @@ set_fpcontext(struct thread *td, mcontext_t *mcp)
 		    sizeof(mcp->mc_fpregs));
 		curpcb->pcb_fcsr = mcp->mc_fpregs.fp_fcsr;
 		curpcb->pcb_fpflags = mcp->mc_fpregs.fp_flags & PCB_FP_USERMASK;
+		td->td_frame->tf_sstatus |= SSTATUS_FS_CLEAN;
 	}
 
 	critical_exit();
@@ -518,29 +542,15 @@ struct sigreturn_args {
 int
 sys_sigreturn(struct thread *td, struct sigreturn_args *uap)
 {
-	uint64_t sstatus;
 	ucontext_t uc;
 	int error;
 
-	if (uap == NULL)
-		return (EFAULT);
 	if (copyin(uap->sigcntxp, &uc, sizeof(uc)))
 		return (EFAULT);
-
-	/*
-	 * Make sure the processor mode has not been tampered with and
-	 * interrupts have not been disabled.
-	 * Supervisor interrupts in user mode are always enabled.
-	 */
-	sstatus = uc.uc_mcontext.mc_gpregs.gp_sstatus;
-	if ((sstatus & SSTATUS_SPP) != 0)
-		return (EINVAL);
 
 	error = set_mcontext(td, &uc.uc_mcontext);
 	if (error != 0)
 		return (error);
-
-	set_fpcontext(td, &uc.uc_mcontext);
 
 	/* Restore signal mask. */
 	kern_sigprocmask(td, SIG_SETMASK, &uc.uc_sigmask, NULL, 0);
@@ -559,15 +569,12 @@ void
 makectx(struct trapframe *tf, struct pcb *pcb)
 {
 
-	memcpy(pcb->pcb_t, tf->tf_t, sizeof(tf->tf_t));
 	memcpy(pcb->pcb_s, tf->tf_s, sizeof(tf->tf_s));
-	memcpy(pcb->pcb_a, tf->tf_a, sizeof(tf->tf_a));
 
-	pcb->pcb_ra = tf->tf_ra;
+	pcb->pcb_ra = tf->tf_sepc;
 	pcb->pcb_sp = tf->tf_sp;
 	pcb->pcb_gp = tf->tf_gp;
 	pcb->pcb_tp = tf->tf_tp;
-	pcb->pcb_sepc = tf->tf_sepc;
 }
 
 void
@@ -612,7 +619,6 @@ sendsig(sig_t catcher, ksiginfo_t *ksi, sigset_t *mask)
 	/* Fill in the frame to copy out */
 	bzero(&frame, sizeof(frame));
 	get_mcontext(td, &frame.sf_uc.uc_mcontext, 0);
-	get_fpcontext(td, &frame.sf_uc.uc_mcontext);
 	frame.sf_si = ksi->ksi_info;
 	frame.sf_uc.uc_sigmask = *mask;
 	frame.sf_uc.uc_stack = td->td_sigstk;
@@ -737,11 +743,19 @@ add_physmap_entry(uint64_t base, uint64_t length, vm_paddr_t *physmap,
 
 #ifdef FDT
 static void
-try_load_dtb(caddr_t kmdp, vm_offset_t dtbp)
+try_load_dtb(caddr_t kmdp)
 {
+	vm_offset_t dtbp;
+
+	dtbp = MD_FETCH(kmdp, MODINFOMD_DTBP, vm_offset_t);
 
 #if defined(FDT_DTB_STATIC)
-	dtbp = (vm_offset_t)&fdt_static_dtb;
+	/*
+	 * In case the device tree blob was not retrieved (from metadata) try
+	 * to use the statically embedded one.
+	 */
+	if (dtbp == (vm_offset_t)NULL)
+		dtbp = (vm_offset_t)&fdt_static_dtb;
 #endif
 
 	if (dtbp == (vm_offset_t)NULL) {
@@ -773,13 +787,14 @@ cache_setup(void)
  * RISCVTODO: This needs to be done via loader (when it's available).
  */
 vm_offset_t
-fake_preload_metadata(struct riscv_bootparams *rvbp __unused)
+fake_preload_metadata(struct riscv_bootparams *rvbp)
 {
 	static uint32_t fake_preload[35];
 #ifdef DDB
 	vm_offset_t zstart = 0, zend = 0;
 #endif
 	vm_offset_t lastaddr;
+	size_t dtb_size;
 	int i;
 
 	i = 0;
@@ -820,9 +835,22 @@ fake_preload_metadata(struct riscv_bootparams *rvbp __unused)
 #endif
 #endif
 		lastaddr = (vm_offset_t)&end;
+
+	/* Copy the DTB to KVA space. */
+	lastaddr = roundup(lastaddr, sizeof(int));
+	fake_preload[i++] = MODINFO_METADATA | MODINFOMD_DTBP;
+	fake_preload[i++] = sizeof(vm_offset_t);
+	*(vm_offset_t *)&fake_preload[i] = (vm_offset_t)lastaddr;
+	i += sizeof(vm_offset_t) / sizeof(uint32_t);
+	dtb_size = fdt_totalsize(rvbp->dtbp_virt);
+	memmove((void *)lastaddr, (const void *)rvbp->dtbp_virt, dtb_size);
+	lastaddr = roundup(lastaddr + dtb_size, sizeof(int));
+
 	fake_preload[i++] = 0;
 	fake_preload[i] = 0;
 	preload_metadata = (void *)fake_preload;
+
+	KASSERT(i < nitems(fake_preload), ("Too many fake_preload items"));
 
 	return (lastaddr);
 }
@@ -832,8 +860,6 @@ initriscv(struct riscv_bootparams *rvbp)
 {
 	struct mem_region mem_regions[FDT_MEM_REGIONS];
 	struct pcpu *pcpup;
-	vm_offset_t rstart, rend;
-	vm_offset_t s, e;
 	int mem_regions_sz;
 	vm_offset_t lastaddr;
 	vm_size_t kernlen;
@@ -869,7 +895,7 @@ initriscv(struct riscv_bootparams *rvbp)
 	kern_envp = NULL;
 
 #ifdef FDT
-	try_load_dtb(kmdp, rvbp->dtbp_virt);
+	try_load_dtb(kmdp);
 #endif
 
 	/* Load the physical memory ranges */
@@ -880,21 +906,9 @@ initriscv(struct riscv_bootparams *rvbp)
 	if (fdt_get_mem_regions(mem_regions, &mem_regions_sz, NULL) != 0)
 		panic("Cannot get physical memory regions");
 
-	s = rvbp->dtbp_phys;
-	e = s + DTB_SIZE_MAX;
-
 	for (i = 0; i < mem_regions_sz; i++) {
-		rstart = mem_regions[i].mr_start;
-		rend = (mem_regions[i].mr_start + mem_regions[i].mr_size);
-
-		if ((rstart < s) && (rend > e)) {
-			/* Exclude DTB region. */
-			add_physmap_entry(rstart, (s - rstart), physmap, &physmap_idx);
-			add_physmap_entry(e, (rend - e), physmap, &physmap_idx);
-		} else {
-			add_physmap_entry(mem_regions[i].mr_start,
-			    mem_regions[i].mr_size, physmap, &physmap_idx);
-		}
+		add_physmap_entry(mem_regions[i].mr_start,
+		    mem_regions[i].mr_size, physmap, &physmap_idx);
 	}
 #endif
 
