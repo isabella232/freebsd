@@ -3,7 +3,6 @@
 # and set env variable LIB9P_LOGGING to stderr or to
 # the (preferably full path name of) the debug log file.
 
-.PATH:		${.CURDIR}
 CFLAGS+=	-DWITH_CASPER -I${.CURDIR}
 DEBUG_FLAGS=	-DL9P_DEBUG=L9P_DEBUG -DACE_DEBUG -g -O0
 
