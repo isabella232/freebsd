@@ -3,7 +3,7 @@
 #
 
 .include <src.opts.mk>
-CFLAGS+=-I${SRCTOP}/lib/lib9p
+CFLAGS+=-I${.CURDIR}/../../contrib/lib9p
 CFLAGS+=-I${SRCTOP}/sys
 .PATH:  ${SRCTOP}/sys/cam/ctl
 
