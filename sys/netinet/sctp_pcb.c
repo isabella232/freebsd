@@ -544,9 +544,13 @@ sctp_add_addr_to_vrf(uint32_t vrf_id, void *ifn, uint32_t ifn_index,
 		atomic_add_int(&vrf->refcount, 1);
 		sctp_ifnp->ifn_mtu = SCTP_GATHER_MTU_FROM_IFN_INFO(ifn, ifn_index, addr->sa_family);
 		if (if_name != NULL) {
-			snprintf(sctp_ifnp->ifn_name, SCTP_IFNAMSIZ, "%s", if_name);
+			if (snprintf(sctp_ifnp->ifn_name, SCTP_IFNAMSIZ, "%s", if_name) < 0) {
+				sctp_ifnp->ifn_name[0] = '\0';
+			}
 		} else {
-			snprintf(sctp_ifnp->ifn_name, SCTP_IFNAMSIZ, "%s", "unknown");
+			if (snprintf(sctp_ifnp->ifn_name, SCTP_IFNAMSIZ, "%s", "unknown") < 0) {
+				sctp_ifnp->ifn_name[0] = '\0';
+			}
 		}
 		hash_ifn_head = &SCTP_BASE_INFO(vrf_ifn_hash)[(ifn_index & SCTP_BASE_INFO(vrf_ifn_hashmark))];
 		LIST_INIT(&sctp_ifnp->ifalist);
@@ -3976,17 +3980,9 @@ sctp_add_remote_addr(struct sctp_tcb *stcb, struct sockaddr *newaddr,
 			} else {
 				imtu = 0;
 			}
-			rmtu = SCTP_GATHER_MTU_FROM_ROUTE(net->ro._s_addr, &net->ro._l_addr.sa, net->ro.ro_rt);
+			rmtu = SCTP_GATHER_MTU_FROM_ROUTE(net->ro._s_addr, &net->ro._l_addr.sa, net->ro.ro_nh);
 			hcmtu = sctp_hc_get_mtu(&net->ro._l_addr, stcb->sctp_ep->fibnum);
 			net->mtu = sctp_min_mtu(hcmtu, rmtu, imtu);
-			if (rmtu == 0) {
-				/*
-				 * Start things off to match mtu of
-				 * interface please.
-				 */
-				SCTP_SET_MTU_OF_ROUTE(&net->ro._l_addr.sa,
-				    net->ro.ro_rt, net->mtu);
-			}
 		}
 	}
 	if (net->mtu == 0) {
@@ -4067,19 +4063,19 @@ sctp_add_remote_addr(struct sctp_tcb *stcb, struct sockaddr *newaddr,
 		*netp = net;
 	}
 	netfirst = TAILQ_FIRST(&stcb->asoc.nets);
-	if (net->ro.ro_rt == NULL) {
+	if (net->ro.ro_nh == NULL) {
 		/* Since we have no route put it at the back */
 		TAILQ_INSERT_TAIL(&stcb->asoc.nets, net, sctp_next);
 	} else if (netfirst == NULL) {
 		/* We are the first one in the pool. */
 		TAILQ_INSERT_HEAD(&stcb->asoc.nets, net, sctp_next);
-	} else if (netfirst->ro.ro_rt == NULL) {
+	} else if (netfirst->ro.ro_nh == NULL) {
 		/*
 		 * First one has NO route. Place this one ahead of the first
 		 * one.
 		 */
 		TAILQ_INSERT_HEAD(&stcb->asoc.nets, net, sctp_next);
-	} else if (net->ro.ro_rt->rt_ifp != netfirst->ro.ro_rt->rt_ifp) {
+	} else if (net->ro.ro_nh->nh_ifp != netfirst->ro.ro_nh->nh_ifp) {
 		/*
 		 * This one has a different interface than the one at the
 		 * top of the list. Place it ahead.
@@ -4100,11 +4096,11 @@ sctp_add_remote_addr(struct sctp_tcb *stcb, struct sockaddr *newaddr,
 				/* End of the list */
 				TAILQ_INSERT_TAIL(&stcb->asoc.nets, net, sctp_next);
 				break;
-			} else if (netlook->ro.ro_rt == NULL) {
+			} else if (netlook->ro.ro_nh == NULL) {
 				/* next one has NO route */
 				TAILQ_INSERT_BEFORE(netfirst, net, sctp_next);
 				break;
-			} else if (netlook->ro.ro_rt->rt_ifp != net->ro.ro_rt->rt_ifp) {
+			} else if (netlook->ro.ro_nh->nh_ifp != net->ro.ro_nh->nh_ifp) {
 				TAILQ_INSERT_AFTER(&stcb->asoc.nets, netlook,
 				    net, sctp_next);
 				break;
@@ -4117,8 +4113,8 @@ sctp_add_remote_addr(struct sctp_tcb *stcb, struct sockaddr *newaddr,
 	/* got to have a primary set */
 	if (stcb->asoc.primary_destination == 0) {
 		stcb->asoc.primary_destination = net;
-	} else if ((stcb->asoc.primary_destination->ro.ro_rt == NULL) &&
-		    (net->ro.ro_rt) &&
+	} else if ((stcb->asoc.primary_destination->ro.ro_nh == NULL) &&
+		    (net->ro.ro_nh) &&
 	    ((net->dest_state & SCTP_ADDR_UNCONFIRMED) == 0)) {
 		/* No route to current primary adopt new primary */
 		stcb->asoc.primary_destination = net;
@@ -5207,16 +5203,12 @@ sctp_free_assoc(struct sctp_inpcb *inp, struct sctp_tcb *stcb, int from_inpcbfre
 			    SCTP_FREE_SHOULD_USE_GRACEFUL_CLOSE,
 			    SCTP_CALLED_DIRECTLY_NOCMPSET);
 			SCTP_INP_DECR_REF(inp);
-			goto out_of;
 		} else {
 			/* The socket is still open. */
 			SCTP_INP_DECR_REF(inp);
+			SCTP_INP_RUNLOCK(inp);
 		}
 	}
-	if (from_inpcbfree == SCTP_NORMAL_PROC) {
-		SCTP_INP_RUNLOCK(inp);
-	}
-out_of:
 	/* destroyed the asoc */
 #ifdef SCTP_LOG_CLOSING
 	sctp_log_closing(inp, NULL, 11);
@@ -5459,14 +5451,7 @@ sctp_del_local_addr_ep(struct sctp_inpcb *inp, struct sctp_ifa *ifa)
 			TAILQ_FOREACH(net, &stcb->asoc.nets, sctp_next) {
 				if (net->ro._s_addr == laddr->ifa) {
 					/* Yep, purge src address selected */
-					sctp_rtentry_t *rt;
-
-					/* delete this address if cached */
-					rt = net->ro.ro_rt;
-					if (rt != NULL) {
-						RTFREE(rt);
-						net->ro.ro_rt = NULL;
-					}
+					RO_NHFREE(&net->ro);
 					sctp_free_ifa(net->ro._s_addr);
 					net->ro._s_addr = NULL;
 					net->src_addr_selected = 0;
@@ -6236,8 +6221,10 @@ sctp_load_addresses_from_init(struct sctp_tcb *stcb, struct mbuf *m,
 							 * in setup state we
 							 * abort this guy
 							 */
-							snprintf(msg, sizeof(msg),
-							    "%s:%d at %s", __FILE__, __LINE__, __func__);
+							if (snprintf(msg, sizeof(msg),
+							    "%s:%d at %s", __FILE__, __LINE__, __func__) < 0) {
+								msg[0] = '\0';
+							}
 							op_err = sctp_generate_cause(SCTP_BASE_SYSCTL(sctp_diag_info_code),
 							    msg);
 							sctp_abort_an_association(stcb_tmp->sctp_ep,
@@ -6336,8 +6323,10 @@ sctp_load_addresses_from_init(struct sctp_tcb *stcb, struct mbuf *m,
 							 * in setup state we
 							 * abort this guy
 							 */
-							snprintf(msg, sizeof(msg),
-							    "%s:%d at %s", __FILE__, __LINE__, __func__);
+							if (snprintf(msg, sizeof(msg),
+							    "%s:%d at %s", __FILE__, __LINE__, __func__) < 0) {
+								msg[0] = '\0';
+							}
 							op_err = sctp_generate_cause(SCTP_BASE_SYSCTL(sctp_diag_info_code),
 							    msg);
 							sctp_abort_an_association(stcb_tmp->sctp_ep,

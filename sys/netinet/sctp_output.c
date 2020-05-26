@@ -3387,13 +3387,13 @@ sctp_source_address_selection(struct sctp_inpcb *inp,
 	 *   addresses. If the bound set is NOT assigned to the interface then
 	 *   we must use rotation amongst the bound addresses..
 	 */
-	if (ro->ro_rt == NULL) {
+	if (ro->ro_nh == NULL) {
 		/*
 		 * Need a route to cache.
 		 */
 		SCTP_RTALLOC(ro, vrf_id, inp->fibnum);
 	}
-	if (ro->ro_rt == NULL) {
+	if (ro->ro_nh == NULL) {
 		return (NULL);
 	}
 	fam = ro->ro_dst.sa_family;
@@ -4131,10 +4131,7 @@ sctp_lowlevel_chunk_output(struct sctp_inpcb *inp,
 					sctp_free_ifa(net->ro._s_addr);
 					net->ro._s_addr = NULL;
 					net->src_addr_selected = 0;
-					if (ro->ro_rt) {
-						RTFREE(ro->ro_rt);
-						ro->ro_rt = NULL;
-					}
+					RO_NHFREE(ro);
 				}
 				if (net->src_addr_selected == 0) {
 					/* Cache the source address */
@@ -4206,7 +4203,7 @@ sctp_lowlevel_chunk_output(struct sctp_inpcb *inp,
 			 * catch that somewhere and abort the association
 			 * right away (assuming this is an INIT being sent).
 			 */
-			if (ro->ro_rt == NULL) {
+			if (ro->ro_nh == NULL) {
 				/*
 				 * src addr selection failed to find a route
 				 * (or valid source addr), so we can't get
@@ -4225,7 +4222,7 @@ sctp_lowlevel_chunk_output(struct sctp_inpcb *inp,
 			SCTPDBG(SCTP_DEBUG_OUTPUT3, "Destination is %x\n",
 			    (uint32_t)(ntohl(ip->ip_dst.s_addr)));
 			SCTPDBG(SCTP_DEBUG_OUTPUT3, "RTP route is %p through\n",
-			    (void *)ro->ro_rt);
+			    (void *)ro->ro_nh);
 
 			if (SCTP_GET_HEADER_FOR_OUTPUT(o_pak)) {
 				/* failed to prepend data, give up */
@@ -4278,13 +4275,13 @@ sctp_lowlevel_chunk_output(struct sctp_inpcb *inp,
 			SCTPDBG(SCTP_DEBUG_OUTPUT3, "IP output returns %d\n", ret);
 			if (net == NULL) {
 				/* free tempy routes */
-				RO_RTFREE(ro);
+				RO_NHFREE(ro);
 			} else {
-				if ((ro->ro_rt != NULL) && (net->ro._s_addr) &&
+				if ((ro->ro_nh != NULL) && (net->ro._s_addr) &&
 				    ((net->dest_state & SCTP_ADDR_NO_PMTUD) == 0)) {
 					uint32_t mtu;
 
-					mtu = SCTP_GATHER_MTU_FROM_ROUTE(net->ro._s_addr, &net->ro._l_addr.sa, ro->ro_rt);
+					mtu = SCTP_GATHER_MTU_FROM_ROUTE(net->ro._s_addr, &net->ro._l_addr.sa, ro->ro_nh);
 					if (mtu > 0) {
 						if (net->port) {
 							mtu -= sizeof(struct udphdr);
@@ -4296,7 +4293,7 @@ sctp_lowlevel_chunk_output(struct sctp_inpcb *inp,
 							net->mtu = mtu;
 						}
 					}
-				} else if (ro->ro_rt == NULL) {
+				} else if (ro->ro_nh == NULL) {
 					/* route was freed */
 					if (net->ro._s_addr &&
 					    net->src_addr_selected) {
@@ -4426,10 +4423,7 @@ sctp_lowlevel_chunk_output(struct sctp_inpcb *inp,
 					sctp_free_ifa(net->ro._s_addr);
 					net->ro._s_addr = NULL;
 					net->src_addr_selected = 0;
-					if (ro->ro_rt) {
-						RTFREE(ro->ro_rt);
-						ro->ro_rt = NULL;
-					}
+					RO_NHFREE(ro);
 				}
 				if (net->src_addr_selected == 0) {
 					sin6 = (struct sockaddr_in6 *)&net->ro._l_addr;
@@ -4489,7 +4483,7 @@ sctp_lowlevel_chunk_output(struct sctp_inpcb *inp,
 			}
 			lsa6->sin6_port = inp->sctp_lport;
 
-			if (ro->ro_rt == NULL) {
+			if (ro->ro_nh == NULL) {
 				/*
 				 * src addr selection failed to find a route
 				 * (or valid source addr), so we can't get
@@ -4625,13 +4619,13 @@ sctp_lowlevel_chunk_output(struct sctp_inpcb *inp,
 			}
 			if (net == NULL) {
 				/* Now if we had a temp route free it */
-				RO_RTFREE(ro);
+				RO_NHFREE(ro);
 			} else {
 				/*
 				 * PMTU check versus smallest asoc MTU goes
 				 * here
 				 */
-				if (ro->ro_rt == NULL) {
+				if (ro->ro_nh == NULL) {
 					/* Route was freed */
 					if (net->ro._s_addr &&
 					    net->src_addr_selected) {
@@ -4640,11 +4634,11 @@ sctp_lowlevel_chunk_output(struct sctp_inpcb *inp,
 					}
 					net->src_addr_selected = 0;
 				}
-				if ((ro->ro_rt != NULL) && (net->ro._s_addr) &&
+				if ((ro->ro_nh != NULL) && (net->ro._s_addr) &&
 				    ((net->dest_state & SCTP_ADDR_NO_PMTUD) == 0)) {
 					uint32_t mtu;
 
-					mtu = SCTP_GATHER_MTU_FROM_ROUTE(net->ro._s_addr, &net->ro._l_addr.sa, ro->ro_rt);
+					mtu = SCTP_GATHER_MTU_FROM_ROUTE(net->ro._s_addr, &net->ro._l_addr.sa, ro->ro_nh);
 					if (mtu > 0) {
 						if (net->port) {
 							mtu -= sizeof(struct udphdr);
@@ -5587,7 +5581,9 @@ do_a_abort:
 		if (op_err == NULL) {
 			char msg[SCTP_DIAG_INFO_LEN];
 
-			snprintf(msg, sizeof(msg), "%s:%d at %s", __FILE__, __LINE__, __func__);
+			if (snprintf(msg, sizeof(msg), "%s:%d at %s", __FILE__, __LINE__, __func__) < 0) {
+				msg[0] = '\0';
+			}
 			op_err = sctp_generate_cause(SCTP_BASE_SYSCTL(sctp_diag_info_code),
 			    msg);
 		}
@@ -6205,13 +6201,13 @@ sctp_prune_prsctp(struct sctp_tcb *stcb,
 				 * This one is PR-SCTP AND buffer space
 				 * limited type
 				 */
-				if (chk->rec.data.timetodrop.tv_sec >= (long)srcv->sinfo_timetolive) {
+				if (chk->rec.data.timetodrop.tv_sec > (long)srcv->sinfo_timetolive) {
 					/*
 					 * Lower numbers equates to higher
-					 * priority so if the one we are
-					 * looking at has a larger or equal
-					 * priority we want to drop the data
-					 * and NOT retransmit it.
+					 * priority. So if the one we are
+					 * looking at has a larger priority,
+					 * we want to drop the data and NOT
+					 * retransmit it.
 					 */
 					if (chk->data) {
 						/*
@@ -6240,7 +6236,7 @@ sctp_prune_prsctp(struct sctp_tcb *stcb,
 		TAILQ_FOREACH_SAFE(chk, &asoc->send_queue, sctp_next, nchk) {
 			/* Here we must move to the sent queue and mark */
 			if (PR_SCTP_BUF_ENABLED(chk->flags)) {
-				if (chk->rec.data.timetodrop.tv_sec >= (long)srcv->sinfo_timetolive) {
+				if (chk->rec.data.timetodrop.tv_sec > (long)srcv->sinfo_timetolive) {
 					if (chk->data) {
 						/*
 						 * We release the book_size
@@ -6764,8 +6760,10 @@ sctp_sendall_iterator(struct sctp_inpcb *inp, struct sctp_tcb *stcb, void *ptr,
 						char msg[SCTP_DIAG_INFO_LEN];
 
 				abort_anyway:
-						snprintf(msg, sizeof(msg),
-						    "%s:%d at %s", __FILE__, __LINE__, __func__);
+						if (snprintf(msg, sizeof(msg),
+						    "%s:%d at %s", __FILE__, __LINE__, __func__) < 0) {
+							msg[0] = '\0';
+						}
 						op_err = sctp_generate_cause(SCTP_BASE_SYSCTL(sctp_diag_info_code),
 						    msg);
 						atomic_add_int(&stcb->asoc.refcnt, 1);
@@ -7769,7 +7767,11 @@ sctp_fill_outqueue(struct sctp_tcb *stcb,
 		}
 		strq = stcb->asoc.ss_functions.sctp_ss_select_stream(stcb, net, asoc);
 		total_moved += moved;
-		space_left -= moved;
+		if (space_left >= moved) {
+			space_left -= moved;
+		} else {
+			space_left = 0;
+		}
 		if (space_left >= SCTP_DATA_CHUNK_OVERHEAD(stcb)) {
 			space_left -= SCTP_DATA_CHUNK_OVERHEAD(stcb);
 		} else {
@@ -9628,8 +9630,10 @@ sctp_chunk_retransmission(struct sctp_inpcb *inp,
 			struct mbuf *op_err;
 			char msg[SCTP_DIAG_INFO_LEN];
 
-			snprintf(msg, sizeof(msg), "TSN %8.8x retransmitted %d times, giving up",
-			    chk->rec.data.tsn, chk->snd_count);
+			if (snprintf(msg, sizeof(msg), "TSN %8.8x retransmitted %d times, giving up",
+			    chk->rec.data.tsn, chk->snd_count) < 0) {
+				msg[0] = '\0';
+			}
 			op_err = sctp_generate_cause(SCTP_BASE_SYSCTL(sctp_diag_info_code),
 			    msg);
 			atomic_add_int(&stcb->asoc.refcnt, 1);
@@ -10719,7 +10723,7 @@ sctp_send_sack(struct sctp_tcb *stcb, int so_locked
 		if (highest_tsn > asoc->mapping_array_base_tsn) {
 			siz = (((highest_tsn - asoc->mapping_array_base_tsn) + 1) + 7) / 8;
 		} else {
-			siz = (((MAX_TSN - highest_tsn) + 1) + highest_tsn + 7) / 8;
+			siz = (((MAX_TSN - asoc->mapping_array_base_tsn) + 1) + highest_tsn + 7) / 8;
 		}
 	} else {
 		sack = NULL;
@@ -12619,7 +12623,7 @@ sctp_lower_sosend(struct socket *so,
 		top = SCTP_HEADER_TO_CHAIN(i_pak);
 		sndlen = SCTP_HEADER_LEN(i_pak);
 	}
-	SCTPDBG(SCTP_DEBUG_OUTPUT1, "Send called addr:%p send length %zu\n",
+	SCTPDBG(SCTP_DEBUG_OUTPUT1, "Send called addr:%p send length %zd\n",
 	    (void *)addr,
 	    sndlen);
 	if ((inp->sctp_flags & SCTP_PCB_FLAGS_TCPTYPE) &&
@@ -13612,8 +13616,10 @@ dataless_eof:
 						atomic_add_int(&stcb->asoc.refcnt, -1);
 						free_cnt_applied = 0;
 					}
-					snprintf(msg, sizeof(msg),
-					    "%s:%d at %s", __FILE__, __LINE__, __func__);
+					if (snprintf(msg, sizeof(msg),
+					    "%s:%d at %s", __FILE__, __LINE__, __func__) < 0) {
+						msg[0] = '\0';
+					}
 					op_err = sctp_generate_cause(SCTP_BASE_SYSCTL(sctp_diag_info_code),
 					    msg);
 					NET_EPOCH_ENTER(et);
@@ -13838,7 +13844,7 @@ sctp_v6src_match_nexthop(struct sockaddr_in6 *src6, sctp_route_t *ro)
 	struct nd_pfxrouter *pfxrtr = NULL;
 	struct sockaddr_in6 gw6;
 
-	if (ro == NULL || ro->ro_rt == NULL || src6->sin6_family != AF_INET6)
+	if (ro == NULL || ro->ro_nh == NULL || src6->sin6_family != AF_INET6)
 		return (0);
 
 	/* get prefix entry of address */
@@ -13871,8 +13877,8 @@ sctp_v6src_match_nexthop(struct sockaddr_in6 *src6, sctp_route_t *ro)
 		SCTPDBG(SCTP_DEBUG_OUTPUT2, "prefix router is ");
 		SCTPDBG_ADDR(SCTP_DEBUG_OUTPUT2, (struct sockaddr *)&gw6);
 		SCTPDBG(SCTP_DEBUG_OUTPUT2, "installed router is ");
-		SCTPDBG_ADDR(SCTP_DEBUG_OUTPUT2, ro->ro_rt->rt_gateway);
-		if (sctp_cmpaddr((struct sockaddr *)&gw6, ro->ro_rt->rt_gateway)) {
+		SCTPDBG_ADDR(SCTP_DEBUG_OUTPUT2, &ro->ro_nh->gw_sa);
+		if (sctp_cmpaddr((struct sockaddr *)&gw6, &ro->ro_nh->gw_sa)) {
 			ND6_RUNLOCK();
 			SCTPDBG(SCTP_DEBUG_OUTPUT2, "pfxrouter is installed\n");
 			return (1);
@@ -13892,7 +13898,7 @@ sctp_v4src_match_nexthop(struct sctp_ifa *sifa, sctp_route_t *ro)
 	struct ifaddr *ifa;
 	struct in_addr srcnetaddr, gwnetaddr;
 
-	if (ro == NULL || ro->ro_rt == NULL ||
+	if (ro == NULL || ro->ro_nh == NULL ||
 	    sifa->address.sa.sa_family != AF_INET) {
 		return (0);
 	}
@@ -13904,10 +13910,10 @@ sctp_v4src_match_nexthop(struct sctp_ifa *sifa, sctp_route_t *ro)
 	SCTPDBG_ADDR(SCTP_DEBUG_OUTPUT2, &sifa->address.sa);
 	SCTPDBG(SCTP_DEBUG_OUTPUT1, "network address is %x\n", srcnetaddr.s_addr);
 
-	sin = (struct sockaddr_in *)ro->ro_rt->rt_gateway;
+	sin = &ro->ro_nh->gw4_sa;
 	gwnetaddr.s_addr = (sin->sin_addr.s_addr & mask->sin_addr.s_addr);
 	SCTPDBG(SCTP_DEBUG_OUTPUT1, "match_nexthop4: nexthop is ");
-	SCTPDBG_ADDR(SCTP_DEBUG_OUTPUT2, ro->ro_rt->rt_gateway);
+	SCTPDBG_ADDR(SCTP_DEBUG_OUTPUT2, &ro->ro_nh->gw_sa);
 	SCTPDBG(SCTP_DEBUG_OUTPUT1, "network address is %x\n", gwnetaddr.s_addr);
 	if (srcnetaddr.s_addr == gwnetaddr.s_addr) {
 		return (1);
