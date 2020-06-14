@@ -266,7 +266,7 @@ crypto_cursor_copyback(struct crypto_buffer_cursor *cc, int size,
 			remain = cc->cc_mbuf->m_len - cc->cc_offset;
 			todo = MIN(remain, size);
 			memcpy(dst, src, todo);
-			dst += todo;
+			src += todo;
 			if (todo < remain) {
 				cc->cc_offset += todo;
 				break;
@@ -284,7 +284,7 @@ crypto_cursor_copyback(struct crypto_buffer_cursor *cc, int size,
 			remain = cc->cc_iov->iov_len - cc->cc_offset;
 			todo = MIN(remain, size);
 			memcpy(dst, src, todo);
-			dst += todo;
+			src += todo;
 			if (todo < remain) {
 				cc->cc_offset += todo;
 				break;
@@ -385,8 +385,8 @@ crypto_cursor_copydata_noadv(struct crypto_buffer_cursor *cc, int size,
  * the beginning, continuing for "len" bytes.
  */
 static int
-cuio_apply(struct uio *uio, int off, int len, int (*f)(void *, void *, u_int),
-    void *arg)
+cuio_apply(struct uio *uio, int off, int len,
+    int (*f)(void *, const void *, u_int), void *arg)
 {
 	struct iovec *iov = uio->uio_iov;
 	int iol = uio->uio_iovcnt;
@@ -461,13 +461,14 @@ crypto_copydata(struct cryptop *crp, int off, int size, void *dst)
 
 int
 crypto_apply_buf(struct crypto_buffer *cb, int off, int len,
-    int (*f)(void *, void *, u_int), void *arg)
+    int (*f)(void *, const void *, u_int), void *arg)
 {
 	int error;
 
 	switch (cb->cb_type) {
 	case CRYPTO_BUF_MBUF:
-		error = m_apply(cb->cb_mbuf, off, len, f, arg);
+		error = m_apply(cb->cb_mbuf, off, len,
+		    (int (*)(void *, void *, u_int))f, arg);
 		break;
 	case CRYPTO_BUF_UIO:
 		error = cuio_apply(cb->cb_uio, off, len, f, arg);
@@ -488,7 +489,7 @@ crypto_apply_buf(struct crypto_buffer *cb, int off, int len,
 
 int
 crypto_apply(struct cryptop *crp, int off, int len,
-    int (*f)(void *, void *, u_int), void *arg)
+    int (*f)(void *, const void *, u_int), void *arg)
 {
 	return (crypto_apply_buf(&crp->crp_buf, off, len, f, arg));
 }
