@@ -1,5 +1,6 @@
 # $FreeBSD$
 
+.PATH:		${.CURDIR}/../../contrib/lib9p
 CFLAGS+=	-DWITH_CASPER -I${.CURDIR}
 CFLAGS+=	-I${.CURDIR}/../../contrib/lib9p
 CFLAGS+=	-DWITH_CASPER
