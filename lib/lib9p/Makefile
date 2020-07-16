@@ -1,10 +1,9 @@
 # $FreeBSD$
 
 .PATH:		${.CURDIR}/../../contrib/lib9p
-CFLAGS+=	-DWITH_CASPER -I${.CURDIR}
-CFLAGS+=	-I${.CURDIR}/../../contrib/lib9p
 CFLAGS+=	-DWITH_CASPER
-DEBUG_FLAGS=	-DL9P_DEBUG=L9P_DEBUG -DACE_DEBUG -g -O0
+CFLAGS+=	-I${.CURDIR}
+CFLAGS+=	-I${.CURDIR}/../../contrib/lib9p
 
 LIB=		9p
 PACKAGE=	lib${LIB}
